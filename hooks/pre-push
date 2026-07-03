@@ -1,0 +1,151 @@
+#!/usr/bin/env bash
+#
+# PRE-PUSH GUARD — Agent Guard Core
+# Prevents accidental pushes by AI agents to protected branches or branches
+# belonging to other identities. Sends worktree origin notes.
+#
+# Configuration is read from agent-guard.yaml (SSOT) via agent-guard-config.
+
+set -e
+
+REPO_ROOT="$(git rev-parse --show-toplevel)"
+AGENT_GUARD_BIN="${REPO_ROOT}/packages/agent-guard-core/bin/agent-guard-config"
+
+if [[ ! -f "${AGENT_GUARD_BIN}" ]]; then
+    echo "❌ agent-guard-config not found at ${AGENT_GUARD_BIN}" >&2
+    exit 1
+fi
+
+_get_config() {
+    bash "${AGENT_GUARD_BIN}" get "$@"
+}
+
+_get_domain() {
+    for name in $(bash "${AGENT_GUARD_BIN}" keys identities); do
+        template="$(_get_config "identities.${name}.author_email" '')"
+        if [[ "${template}" =~ @([^[:space:]]+)$ ]]; then
+            echo "${BASH_REMATCH[1]}"
+            return 0
+        fi
+    done
+    echo ""
+}
+
+BRANCH="$(git branch --show-current)"
+
+AUTHOR_IDENT="$(git var GIT_AUTHOR_IDENT)"
+AUTHOR_EMAIL="$(echo "${AUTHOR_IDENT}" | sed -n 's/.*<\(.*\)>.*/\1/p')"
+
+DOMAIN="$(_get_domain)"
+PROTECTED_BRANCHES="$(_get_config git.protected_branches 'main master develop')"
+NOTES_REF="$(_get_config git.notes_ref 'refs/notes/agent-guard-worktree')"
+BASE_BRANCH="$(_get_config git.base_branch 'develop')"
+
+is_protected_branch() {
+    local branch="$1"
+    for protected in ${PROTECTED_BRANCHES}; do
+        if [[ "${branch}" == "${protected}" ]]; then
+            return 0
+        fi
+    done
+    return 1
+}
+
+# -------------------------------------------------------------------------
+# Case 1: AI agent with slot identity (agent-<base><n>@<domain>)
+# -------------------------------------------------------------------------
+IDENTITY=""
+IDENTITY_NAME=""
+IDENTITY_SLOT=""
+
+if [[ -n "${DOMAIN}" ]]; then
+    for name in $(bash "${AGENT_GUARD_BIN}" keys identities); do
+        template="$(_get_config "identities.${name}.author_email" '')"
+        if [[ -z "${template}" ]]; then
+            continue
+        fi
+
+        if [[ ! "${template}" =~ ^agent-(.+)\{n\}@${DOMAIN}$ ]]; then
+            continue
+        fi
+        base="${BASH_REMATCH[1]}"
+
+        regex="^agent-${base}([0-9]+)@${DOMAIN}$"
+        if [[ "${AUTHOR_EMAIL}" =~ ${regex} ]]; then
+            IDENTITY_NAME="${name}"
+            IDENTITY_SLOT="${BASH_REMATCH[1]}"
+            IDENTITY="${name}${IDENTITY_SLOT}"
+            break
+        fi
+    done
+fi
+
+if [[ -n "${IDENTITY}" ]]; then
+    echo "🔒 [GUARD] Validating push for AI agent: ${IDENTITY} (${AUTHOR_EMAIL})"
+
+    # Block direct push to protected branches.
+    if is_protected_branch "${BRANCH}"; then
+        echo ""
+        echo "❌❌❌ PUSH BLOCKED ❌❌❌"
+        echo ""
+        echo "AI agents are forbidden from pushing directly to protected branch '${BRANCH}'."
+        echo "Open a Pull Request to integrate your changes."
+        echo ""
+        exit 1
+    fi
+
+    # Ensure branch matches identity prefix.
+    if [[ ! "${BRANCH}" =~ ^ia-${IDENTITY}/ ]]; then
+        echo ""
+        echo "❌❌❌ PUSH BLOCKED: BRANCH INCOMPATIBLE ❌❌❌"
+        echo ""
+        echo "Agent identity: ${IDENTITY}"
+        echo "Current branch: ${BRANCH}"
+        echo ""
+        echo "You may only push branches under 'ia-${IDENTITY}/'."
+        echo ""
+        exit 1
+    fi
+
+    # Anti-stale check against configured base branch.
+    git fetch "origin" "${BASE_BRANCH}" >/dev/null 2>&1 || true
+    if git rev-parse --verify "origin/${BASE_BRANCH}" >/dev/null 2>&1; then
+        BEHIND_COUNT="$(git rev-list --count "HEAD..origin/${BASE_BRANCH}" 2>/dev/null || echo "0")"
+        if [[ -n "${BEHIND_COUNT}" && "${BEHIND_COUNT}" -gt 10 ]]; then
+            echo ""
+            echo "❌❌❌ PUSH BLOCKED: BRANCH STALE ❌❌❌"
+            echo ""
+            echo "Branch '${BRANCH}' is ${BEHIND_COUNT} commits behind origin/${BASE_BRANCH}."
+            echo "Rebase before pushing:"
+            echo "  git fetch origin"
+            echo "  git rebase origin/${BASE_BRANCH}"
+            echo "  git push --force-with-lease"
+            echo ""
+            exit 1
+        fi
+    fi
+
+    echo "✅ [GUARD] Push authorized for AI agent: ${IDENTITY} (${BRANCH})"
+fi
+
+# -------------------------------------------------------------------------
+# Case 2: Human developer
+# -------------------------------------------------------------------------
+if [[ -z "${IDENTITY}" ]]; then
+    if is_protected_branch "${BRANCH}"; then
+        echo ""
+        echo "❌❌❌ PUSH BLOCKED ❌❌❌"
+        echo ""
+        echo "Direct pushes to protected branch '${BRANCH}' are forbidden."
+        echo "Open a Pull Request."
+        echo ""
+        exit 1
+    fi
+fi
+
+# -------------------------------------------------------------------------
+# Send worktree origin notes
+# -------------------------------------------------------------------------
+git push origin "${NOTES_REF}" --no-verify >/dev/null 2>&1 || true
+
+exit 0

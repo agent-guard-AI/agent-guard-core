@@ -1,0 +1,53 @@
+#!/usr/bin/env bash
+#
+# Hook pre-checkout — bloqueia troca de branch com working tree dirty.
+#
+# Em ambiente multi-IA com working tree compartilhada, trocar de branch
+# mantendo alterações não commitadas é a principal causa de perda de
+# trabalho. Este hook força stash/commit antes de qualquer checkout.
+#
+# Parâmetros do Git:
+#   $1 = ref anterior (HEAD anterior)
+#   $2 = novo ref
+#   $3 = 1 se for troca de branch, 0 se for checkout de arquivo
+
+set -euo pipefail
+
+# Permite checkout de arquivos individuais (git checkout -- <arquivo>)
+# sem bloquear, desde que não haja outras mudanças em staged/untracked.
+if [ "${3:-0}" = "0" ]; then
+    exit 0
+fi
+
+# Verifica working tree dirty, incluindo untracked
+if git diff --quiet HEAD && [ -z "$(git status --porcelain)" ]; then
+    exit 0
+fi
+
+cat >&2 <<'EOF'
+❌❌❌ PRE-CHECKOUT BLOQUEADO ❌❌❌
+
+Tentativa de trocar de branch com alterações não commitadas.
+Em ambiente multi-IA com working tree compartilhada, isso causa:
+  • perda silenciosa de trabalho de outras IAs
+  • vazamento de código entre branches
+  • merge conflicts fantasmas
+
+Resolva ANTES de trocar de branch:
+
+  Opção A (recomendada — preserva tudo, incluindo untracked):
+    git stash save -u "checkpoint-<identidade>-$(date +%s)"
+
+  Opção B (se for seguro descartar):
+    git reset --hard HEAD
+    git clean -fd
+
+  Opção C (se o trabalho já deve ser salvo):
+    git add .
+    git commit -m "chore(checkpoint): progresso parcial <identidade>"
+
+Sempre stash ou commit antes de trocar de branch.
+Nunca ignore este bloqueio.
+EOF
+
+exit 1

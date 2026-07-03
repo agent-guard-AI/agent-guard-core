@@ -1,0 +1,115 @@
+#!/usr/bin/env bash
+#
+# agent-guard — CLI principal do agent-guard-core
+#
+# Modos de chamada:
+#   source agent-guard init <identidade> <papel> [--impact ...]
+#   source agent-guard status
+#   source agent-guard release
+#   source agent-guard attach <branch>
+#   source agent-guard triage <prefixo>
+#   source agent-guard journal [--limit N] [--identity id] [--since ISO] [--action action]
+#   source agent-guard resume [--last | --nth N | --branch branch]
+#   source agent-guard checkpoint "<mensagem>"
+#   source agent-guard <prefix> <role>        # legado
+#   source agent-guard --status               # legado
+#   source agent-guard --release              # legado
+#   source agent-guard --attach <branch>      # legado
+#   source agent-guard --triage <prefix>      # legado
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+INIT_SCRIPT="${SCRIPT_DIR}/src/init.sh"
+JOURNAL_SCRIPT="${SCRIPT_DIR}/src/journal.sh"
+
+if [[ ! -f "${INIT_SCRIPT}" ]]; then
+    echo "❌ agent-guard init script not found: ${INIT_SCRIPT}" >&2
+    return 1 2>/dev/null || exit 1
+fi
+
+if [[ -f "${JOURNAL_SCRIPT}" ]]; then
+    source "${JOURNAL_SCRIPT}"
+fi
+
+if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
+    echo "❌ agent-guard must be sourced, not executed directly." >&2
+    exit 1
+fi
+
+KNOWN_IDENTITIES="kimi claude gemini grok"
+FIRST_ARG="${1:-}"
+
+if [[ -z "${FIRST_ARG}" ]]; then
+    # No args: let init.sh decide (reuse current worktree branch or show help).
+    source "${INIT_SCRIPT}"
+    return $? 2>/dev/null || exit $?
+fi
+
+if [[ "${FIRST_ARG}" == --* ]]; then
+    source "${INIT_SCRIPT}" "$@"
+    return $? 2>/dev/null || exit $?
+fi
+
+if [[ " ${KNOWN_IDENTITIES} " =~ \ ${FIRST_ARG%%[0-9]*}\  ]]; then
+    source "${INIT_SCRIPT}" "$@"
+    return $? 2>/dev/null || exit $?
+fi
+
+COMMAND="${FIRST_ARG}"
+shift 2>/dev/null || true
+
+case "${COMMAND}" in
+    init|lease|l)
+        source "${INIT_SCRIPT}" "$@"
+        return $? 2>/dev/null || exit $?
+        ;;
+    status|s)
+        source "${INIT_SCRIPT}" --status
+        return $? 2>/dev/null || exit $?
+        ;;
+    release|r)
+        source "${INIT_SCRIPT}" --release
+        return $? 2>/dev/null || exit $?
+        ;;
+    attach|a)
+        if [[ $# -lt 1 ]]; then
+            echo "❌ attach requires a branch name." >&2
+            return 1 2>/dev/null || exit 1
+        fi
+        source "${INIT_SCRIPT}" --attach "$@"
+        return $? 2>/dev/null || exit $?
+        ;;
+    triage|t)
+        if [[ $# -lt 1 ]]; then
+            echo "❌ triage requires a prefix." >&2
+            return 1 2>/dev/null || exit 1
+        fi
+        source "${INIT_SCRIPT}" --triage "$@"
+        return $? 2>/dev/null || exit $?
+        ;;
+    journal|j)
+        _journal_list "$@"
+        return $? 2>/dev/null || exit $?
+        ;;
+    resume|res)
+        _journal_resume "$@"
+        return $? 2>/dev/null || exit $?
+        ;;
+    checkpoint|cp)
+        msg="${*:-checkpoint}"
+        if [[ -z "${msg}" ]]; then
+            echo "❌ checkpoint requires a message." >&2
+            return 1 2>/dev/null || exit 1
+        fi
+        _journal_checkpoint "${msg}"
+        echo "📝 Checkpoint recorded."
+        return 0 2>/dev/null || exit 0
+        ;;
+    *)
+        echo "❌ Unknown command or identity: ${COMMAND}" >&2
+        echo "   Commands: init, status, release, attach, triage, journal, resume, checkpoint" >&2
+        echo "   Legacy:   <kimi|claude|gemini|grok> <role>" >&2
+        return 1 2>/dev/null || exit 1
+        ;;
+esac

@@ -1,0 +1,63 @@
+---
+# Agent Guard configuration example.
+# Copy this file to the root of your repository as agent-guard.yaml and adjust
+# the values to your project.
+
+project:
+  name: my-project
+  domain: example.dev
+
+paths:
+  main_repo: /home/user/projects/my-project
+  base_dir: /home/user/projects
+  package_root: packages/agent-guard-core
+  session_storage: .agent-guard/sessions
+  init_script: .agent-guard-init
+
+identities:
+  kimi:
+    slots: 4
+    worktree_prefix: myproject-ia-kimi
+    author_email: agent-kimi{n}@example.dev
+    author_name: MyProject Kimi{n} Agent
+  claude:
+    slots: 2
+    worktree_prefix: myproject-ia-claude
+    author_email: agent-claude{n}@example.dev
+    author_name: MyProject Claude{n} Agent
+  gemini:
+    slots: 2
+    worktree_prefix: myproject-ia-gemini
+    author_email: agent-gemini{n}@example.dev
+    author_name: MyProject Gemini{n} Agent
+  grok:
+    slots: 2
+    worktree_prefix: myproject-ia-grok
+    author_email: agent-grok{n}@example.dev
+    author_name: MyProject Grok{n} Agent
+
+git:
+  protected_branches:
+    - main
+    - master
+    - develop
+    - staging
+  notes_ref: refs/notes/agent-guard-worktree
+  hooks_path: .githooks
+  base_branch: develop
+
+commit:
+  author_template: agent-{identity}@{domain}
+  message_pattern: '^(feat|fix|docs|refactor|chore|test|ci|hotfix)(\(.+\))?: .+'
+  require_conventional: true
+  identity_env_var: AGENT_GUARD_IDENTITY
+  generic_agent_email_template: agent@{domain}
+
+journal:
+  path: .agent-guard/journal/agent-guard.jsonl
+  retention_days: 90
+
+wrappers:
+  kimi:
+    bin_dir: /home/user/.kimi-code/bin
+    real_bin: kimi.real

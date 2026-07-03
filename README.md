@@ -1,0 +1,260 @@
+# agent-guard-core
+
+Protocolo open source de governança multi-IA para repositórios Git.
+
+Permite que múltiplos agentes de IA CLI — como Kimi, Claude, Gemini e Grok — colaborem no mesmo repositório sem colidir em branches, worktrees ou commits.
+
+## Por que usar
+
+Quando vários agentes de IA trabalham no mesmo repo, problemas comuns aparecem:
+
+- Dois agentes no mesmo worktree sobrescrevendo o trabalho um do outro.
+- Commits feitos no repo principal em vez de worktree isolado.
+- Commits em branch de outra identidade.
+- Pushes acidentais para `main`/`develop`.
+- Impossibilidade de auditar de qual máquina/worktree um commit de IA veio.
+
+`agent-guard-core` resolve isso com:
+
+1. **Identidade e lease atômico**: cada sessão de IA aluga um slot/worktree exclusivo.
+2. **Worktree isolation**: cada identidade trabalha em seu próprio worktree Git.
+3. **Git hooks de identidade**: validam autor, branch, mensagem e worktree origin.
+4. **CI audit via git notes**: todo commit de IA carrega metadados de origem auditáveis.
+5. **Anti-regressão e triage**: protege contra reversões acidentais e acumulo de branches mortas.
+
+## Componentes
+
+```
+agent-guard-core/
+├── bin/
+│   ├── agent-guard              # CLI principal
+│   ├── agent-guard-config       # Leitor de agent-guard.yaml (SSOT)
+│   └── agent-guard-status       # Atalho para status
+├── src/
+│   ├── init.sh                  # Aluguel de identidade e worktree
+│   ├── journal.sh               # Session journal para recuperação de contexto
+│   └── Config.php               # Loader PHP para agent-guard.yaml
+├── hooks/
+│   ├── install.sh               # Instala hooks no repo consumidor
+│   ├── post-commit              # Adiciona git note de origem
+│   ├── pre-push                 # Valida push e envia notes
+│   ├── pre-commit               # Valida autor e branch
+│   ├── pre-checkout             # Bloqueia checkout com working tree dirty
+│   └── commit-msg               # Valida mensagem de commit
+├── ci/
+│   ├── worktree-origin-audit.php # Audita origem dos commits no CI
+│   ├── add-worktree-note.sh     # Cria git note de origem
+│   └── branch-triage.sh         # Limpeza de branches por identidade
+├── wrappers/
+│   └── kimi/
+│       ├── wrapper.sh           # Wrapper do Kimi CLI
+│       └── recovery.sh          # Restaura wrapper após updates
+├── adapters/
+│   └── kimi.sh                  # Adapter para Kimi Code CLI (futuro)
+├── tests/
+│   └── run-all.sh               # Testes funcionais básicos
+└── examples/
+    └── agent-guard.json         # Configuração de exemplo
+```
+
+> **Estado atual:** Fase 3 — pacote independente e instalável em qualquer repositório Git. Todos os componentes leem a configuração de `agent-guard.yaml` (SSOT) via `agent-guard-config`, com fallback para `.hmvip-agent-guard.json`. Não há hardcodes de projeto no núcleo.
+
+## Instalação rápida
+
+1. Copie este diretório para o seu repositório (ex: `packages/agent-guard-core/`) ou execute:
+   ```bash
+   bash /path/to/agent-guard-core/install.sh --target /path/to/your/repo
+   ```
+2. Edite `agent-guard.yaml` na raiz do seu repo (criado a partir do exemplo).
+3. Commit o pacote e a configuração.
+4. Configure o wrapper da ferramenta de IA que você usa (ver `wrappers/kimi/`).
+5. Para instalar apenas os hooks: `./packages/agent-guard-core/hooks/install.sh`.
+
+## Configuração
+
+Crie `agent-guard.yaml` na raiz do repositório:
+
+```yaml
+project:
+  name: meu-projeto
+  main_repo: /caminho/absoluto/do/repo
+  domain: exemplo.dev
+
+identities:
+  - name: kimi
+    slots: 4
+    worktree_prefix: "myproject-ia-kimi"
+    author_email: "agent-kimi{n}@example.dev"
+    author_name: "Kimi{n} Agent"
+  - name: claude
+    slots: 2
+    worktree_prefix: "myproject-ia-claude"
+    author_email: "agent-claude{n}@example.dev"
+    author_name: "Claude{n} Agent"
+
+git:
+  protected_branches: [main, master, develop, staging]
+  notes_ref: refs/notes/agent-guard-worktree
+  hooks_path: .githooks
+  base_branch: develop
+
+commit:
+  author_template: "agent-{identity}@{domain}"
+  message_pattern: '^(feat|fix|docs|refactor|chore|test|ci|hotfix)(\(.+\))?: .+'
+  require_conventional: true
+  identity_env_var: AGENT_GUARD_IDENTITY
+  generic_agent_email_template: agent@{domain}
+
+wrappers:
+  kimi:
+    bin_dir: /home/user/.kimi-code/bin
+    real_bin: kimi.real
+```
+
+## Uso
+
+### Iniciar uma sessão
+
+```bash
+source agent-guard init <identidade> <papel>
+# exemplo:
+source agent-guard init kimi feature-x
+```
+
+O comando:
+- Encontra um slot livre.
+- Cria ou reusa o worktree correspondente.
+- Cria ou reusa a branch `ia-kimi/<papel>/task-YYYYMMDD-HHMM`.
+- Configura o autor Git.
+- Instala os hooks no worktree.
+- Escreve o lease atômico.
+
+### Verificar status
+
+```bash
+source agent-guard status
+```
+
+### Liberar sessão
+
+```bash
+source agent-guard release
+```
+
+> **Nota de implementação:** o release deve validar que a worktree está em uma branch base neutra (ex: `develop` ou `main`), que não há arquivos pendentes e que não há stashes antes de liberar o lease. Isso evita que outro agente reutilize o mesmo slot herdando estado deixado pelo anterior.
+
+### Reentrar em sessão existente
+
+```bash
+source agent-guard attach <identidade>/<papel>/<branch>
+```
+
+## Session Journal — recuperação após crash
+
+O `agent-guard-core` mantém um journal append-only em `.agent-guard/journal/agent-guard.jsonl` (caminho configurável) com eventos de sessão (`init`, `attach`, `release`, `commit`, `checkpoint`). Isso permite que uma nova sessão de IA descubra o que estava sendo feito antes, mesmo após crash da IDE ou troca de slot.
+
+### Listar trabalhos recentes
+
+```bash
+source agent-guard journal --limit 10
+source agent-guard journal --identity kimi1 --since 2026-07-01T00:00:00Z
+```
+
+### Retomar o último trabalho
+
+```bash
+source agent-guard resume --last
+```
+
+Saída típica:
+
+```text
+# Resume context
+timestamp: 2026-07-02T16:24:00.123Z
+identity:  kimi3
+role:      ia-c
+branch:    ia-kimi3/ia-c/agent-guard-session-journal
+worktree:  /home/user/projects/my-project-ia-kimi3
+message:   checkpoint: ADR-0014 escrito
+
+To resume:
+  cd /home/user/projects/my-project-ia-kimi3
+  source .agent-guard-init --attach ia-kimi3/ia-c/agent-guard-session-journal
+```
+
+### Gravar checkpoint manual
+
+```bash
+source agent-guard checkpoint "Refatoração do tier selector em 80%"
+```
+
+### Configuração
+
+No `agent-guard.yaml` (ou `.hmvip-agent-guard.json`):
+
+```yaml
+journal:
+  path: .agent-guard/journal/agent-guard.jsonl
+  retention_days: 90
+```
+
+## Git hooks
+
+Os hooks garantem:
+
+- `pre-commit`: autor da sessão compatível com identidade; branch sob prefixo correto.
+- `commit-msg`: mensagem em conventional commits (se habilitado).
+- `post-commit`: adiciona `git note` com `worktree`, `identity` e `branch`.
+- `pre-push`: bloqueia push em branch protegida ou de outra identidade; envia notes.
+
+## CI audit
+
+No GitHub Actions (ou similar), execute o script de audit:
+
+```bash
+php packages/agent-guard-core/ci/worktree-origin-audit.php origin/main HEAD
+```
+
+O script rejeita commits de IA que não carreguem metadados de worktree ou cujo worktree não corresponda à identidade declarada.
+
+## Adapters e wrappers
+
+Adapters são thin wrappers que interceptam a chamada da ferramenta de IA e redirecionam para um worktree livre antes de delegar ao binário real. Veja exemplos em `adapters/`.
+
+### Wrapper Kimi (`wrappers/kimi/`)
+
+O wrapper `wrappers/kimi/wrapper.sh` substitui o binário `kimi` do Kimi Code CLI. Ele:
+
+- Detecta automaticamente o repositório via `git rev-parse --show-toplevel`.
+- Lê `agent-guard.yaml` para descobrir caminhos, identidades e o binário real do Kimi.
+- Impede execução no repo principal e redireciona para um worktree livre.
+- Bloqueia worktrees sujos ou já em uso por outro processo.
+- Instalação:
+  ```bash
+  mv <bin_dir>/kimi <bin_dir>/kimi.real
+  cp packages/agent-guard-core/wrappers/kimi/wrapper.sh <bin_dir>/kimi
+  chmod +x <bin_dir>/kimi
+  ```
+- Recuperação automática após updates do Kimi CLI:
+  ```bash
+  bash packages/agent-guard-core/wrappers/kimi/recovery.sh
+  ```
+
+## Testes
+
+```bash
+cd packages/agent-guard-core
+bash tests/run-all.sh
+```
+
+## Origem
+
+O `agent-guard-core` nasceu como protocolo interno de governança multi-IA em um projeto privado, depois foi refatorado para ser genérico e reutilizável em qualquer repositório Git. Mantenha o núcleo livre de regras de domínio específicas — adapters e hooks extras devem viver no projeto consumidor.
+
+## Licença
+
+MIT
+
+## Contribuição
+
+Contribuições são bem-vindas. Abra uma issue ou PR descrevendo o problema ou melhoria. Mantenha o escopo do núcleo: regras universais multi-IA, não regras de domínio de projeto específico.

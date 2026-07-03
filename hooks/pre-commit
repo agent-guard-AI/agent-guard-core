@@ -1,0 +1,147 @@
+#!/usr/bin/env bash
+#
+# PRE-COMMIT GUARD — Agent Guard Core
+# Validates that the commit author and active branch match the AI agent
+# identity lease. Prevents commits with generic or mismatched agent emails.
+#
+# Configuration is read from agent-guard.yaml (SSOT) via agent-guard-config.
+
+set -e
+
+REPO_ROOT="$(git rev-parse --show-toplevel)"
+AGENT_GUARD_BIN="${REPO_ROOT}/packages/agent-guard-core/bin/agent-guard-config"
+
+if [[ ! -f "${AGENT_GUARD_BIN}" ]]; then
+    exit 0
+fi
+
+BRANCH="$(git branch --show-current)"
+
+AUTHOR_IDENT="$(git var GIT_AUTHOR_IDENT)"
+AUTHOR_EMAIL="$(echo "${AUTHOR_IDENT}" | sed -n 's/.*<\(.*\)>.*/\1/p')"
+
+# -------------------------------------------------------------------------
+# Resolve the canonical agent domain from the first configured identity.
+# -------------------------------------------------------------------------
+DOMAIN=""
+for name in $(bash "${AGENT_GUARD_BIN}" keys identities); do
+    template="$(bash "${AGENT_GUARD_BIN}" get "identities.${name}.author_email" '')"
+    if [[ "${template}" =~ @([^[:space:]]+)$ ]]; then
+        DOMAIN="${BASH_REMATCH[1]}"
+        break
+    fi
+done
+
+if [[ -z "${DOMAIN}" ]]; then
+    echo "⚠️  [GUARD] Could not resolve agent domain from agent-guard.yaml; skipping identity checks."
+    exit 0
+fi
+
+# -------------------------------------------------------------------------
+# Resolve the generic agent email template.
+# -------------------------------------------------------------------------
+GENERIC_TEMPLATE="$(bash "${AGENT_GUARD_BIN}" get commit.generic_agent_email_template 'agent@{domain}')"
+GENERIC_AGENT_EMAIL="${GENERIC_TEMPLATE//\{domain\}/${DOMAIN}}"
+
+# -------------------------------------------------------------------------
+# Case 1: Generic agent email is blocked.
+# -------------------------------------------------------------------------
+if [[ "${AUTHOR_EMAIL}" == "${GENERIC_AGENT_EMAIL}" ]]; then
+    echo ""
+    echo "❌❌❌ COMMIT REJECTED (NO AGENT IDENTITY) ❌❌❌"
+    echo ""
+    echo "AI agents cannot use the generic email '${GENERIC_AGENT_EMAIL}'."
+    echo "Acquire a unique agent identity before committing:"
+    echo "  source agent-guard init <identity> <role>"
+    echo ""
+    exit 1
+fi
+
+# -------------------------------------------------------------------------
+# Case 2: AI agent with slot identity.
+# -------------------------------------------------------------------------
+IDENTITY=""
+IDENTITY_NAME=""
+for name in $(bash "${AGENT_GUARD_BIN}" keys identities); do
+    template="$(bash "${AGENT_GUARD_BIN}" get "identities.${name}.author_email" '')"
+    if [[ -z "${template}" ]]; then
+        continue
+    fi
+
+    # Extract the identity base prefix (e.g. "kimi" from "agent-kimi{n}@hmvip.dev").
+    if [[ ! "${template}" =~ ^agent-(.+)\{n\}@${DOMAIN}$ ]]; then
+        continue
+    fi
+    base="${BASH_REMATCH[1]}"
+
+    regex="^agent-${base}([0-9]+)@${DOMAIN}$"
+    if [[ "${AUTHOR_EMAIL}" =~ ${regex} ]]; then
+        IDENTITY_NAME="${name}"
+        IDENTITY="${name}${BASH_REMATCH[1]}"
+        break
+    fi
+done
+
+if [[ -n "${IDENTITY}" ]]; then
+    echo "🔒 [GUARD] Validating commit for AI agent: ${IDENTITY} (${AUTHOR_EMAIL})"
+
+    # Validate branch prefix.
+    if [[ ! "${BRANCH}" =~ ^ia-${IDENTITY}/ ]]; then
+        echo ""
+        echo "❌❌❌ COMMIT BLOCKED: BRANCH INCOMPATIBLE ❌❌❌"
+        echo ""
+        echo "Agent identity: ${IDENTITY}"
+        echo "Current branch: ${BRANCH}"
+        echo ""
+        echo "You may only commit to branches starting with 'ia-${IDENTITY}/'."
+        echo ""
+        exit 1
+    fi
+
+    # Validate environment identity variable consistency.
+    IDENTITY_ENV_VAR="$(bash "${AGENT_GUARD_BIN}" get commit.identity_env_var 'AGENT_GUARD_IDENTITY')"
+    env_identity="${!IDENTITY_ENV_VAR:-}"
+    if [[ -n "${env_identity}" && "${env_identity}" != "${IDENTITY}" ]]; then
+        echo ""
+        echo "❌❌❌ COMMIT BLOCKED: ENVIRONMENT IDENTITY MISMATCH ❌❌❌"
+        echo ""
+        echo "Author identity: ${IDENTITY}"
+        echo "${IDENTITY_ENV_VAR}: ${env_identity}"
+        echo ""
+        echo "Restart the session with: source agent-guard init <identity> <role>"
+        echo ""
+        exit 1
+    fi
+fi
+
+# -------------------------------------------------------------------------
+# Case 3: Human developer
+# -------------------------------------------------------------------------
+if [[ ! "${AUTHOR_EMAIL}" =~ @${DOMAIN}$ ]]; then
+    # Block direct commits on protected branches.
+    protected_branches="$(bash "${AGENT_GUARD_BIN}" get git.protected_branches '')"
+    for protected in ${protected_branches}; do
+        if [[ "${BRANCH}" == "${protected}" ]]; then
+            echo ""
+            echo "❌❌❌ DIRECT COMMIT BLOCKED ❌❌❌"
+            echo ""
+            echo "Direct commits to protected branch '${BRANCH}' are forbidden."
+            echo "Please create a feature branch:"
+            echo "  git checkout -b feat/your-task"
+            echo ""
+            exit 1
+        fi
+    done
+
+    # Block humans from committing on AI branches.
+    if [[ "${BRANCH}" =~ ^ia-[a-z0-9]+/ ]]; then
+        echo ""
+        echo "⚠️  WARNING: You are trying to commit on an AI branch (${BRANCH})."
+        echo "To avoid regressions and collisions, please create your own branch."
+        echo ""
+        exit 1
+    fi
+fi
+
+echo "✅ [GUARD] Commit validated for ${AUTHOR_EMAIL} on '${BRANCH}'"
+exit 0
