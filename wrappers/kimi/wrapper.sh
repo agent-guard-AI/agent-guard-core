@@ -374,6 +374,13 @@ if ! _ag_have_lease; then
     export _AG_WORKTREE="${AG_WORKTREE_PATH:-${AGENT_GUARD_WORKTREE_PATH:-}}"
     export _AG_IDENTITY="${_AG_IDENTITY_VALUE:-${AGENT_GUARD_IDENTITY:-}}"
     export _AG_BRANCH="${AG_BRANCH:-${AGENT_GUARD_BRANCH:-}}"
+
+    # Legacy aliases used by older Kimi CLI builds and by the Kimi Status
+    # Indicator extension. Keeping them avoids regressions in consumers that
+    # expect the old HMVIP-specific variable names.
+    export _HMVIP_WORKTREE="${_AG_WORKTREE}"
+    export _HMVIP_IDENTITY="${_AG_IDENTITY}"
+    export _HMVIP_BRANCH="${_AG_BRANCH}"
 fi
 
 # ---------------------------------------------------------------------------
