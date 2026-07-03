@@ -1,6 +1,9 @@
 MIT License
 
-Copyright (c) 2026 HMVIP Team
+Copyright (c) 2026 Agent Guard AI Contributors
+
+Originally developed as an internal multi-IA governance protocol and later
+extracted into an independent, open-source package.
 
 Permission is hereby granted, free of charge, to any person obtaining a copy
 of this software and associated documentation files (the "Software"), to deal
