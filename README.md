@@ -49,8 +49,6 @@ agent-guard-core/
 │   └── kimi/
 │       ├── wrapper.sh           # Wrapper do Kimi CLI
 │       └── recovery.sh          # Restaura wrapper após updates
-├── adapters/
-│   └── kimi.sh                  # Adapter para Kimi Code CLI (futuro)
 ├── tests/
 │   └── run-all.sh               # Testes funcionais básicos
 └── examples/
