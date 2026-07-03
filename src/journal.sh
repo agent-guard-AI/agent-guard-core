@@ -42,13 +42,10 @@ _journal_get_repo_root() {
     fi
 }
 
-# Read a config value using agent-guard-config if available, otherwise fall back
-# to the legacy JSON config. This keeps journal generic across projects.
+# Read a config value using agent-guard-config.
 _journal_get_config() {
     local key="${1:-}"
     local default_value="${2:-}"
-    local repo_root
-    repo_root="$(_journal_get_repo_root)"
 
     local config_bin="${_JOURNAL_CORE_DIR}/bin/agent-guard-config"
     if [[ -f "${config_bin}" ]]; then
@@ -60,27 +57,7 @@ _journal_get_config() {
         fi
     fi
 
-    # Fallback to legacy JSON config.
-    local guard_file="${repo_root}/.hmvip-agent-guard.json"
-    if [[ -f "${guard_file}" ]]; then
-        python3 -c "
-import json, sys
-key = sys.argv[1]
-default = sys.argv[2]
-try:
-    d = json.load(open('${guard_file}'))
-    for part in key.split('.'):
-        if not isinstance(d, dict) or part not in d:
-            print(default)
-            sys.exit(0)
-        d = d[part]
-    print(d if d is not None else default)
-except Exception:
-    print(default)
-" "${key}" "${default_value}" 2>/dev/null || echo "${default_value}"
-    else
-        echo "${default_value}"
-    fi
+    echo "${default_value}"
 }
 
 # Retorna o caminho absoluto do journal.
@@ -125,9 +102,9 @@ _journal_write_event() {
     local timestamp
     timestamp="$(date -u +%Y-%m-%dT%H:%M:%S.%3NZ)"
 
-    local identity="${AGENT_GUARD_IDENTITY:-${HMVIP_IA_IDENTITY:-}}"
-    local branch="${AGENT_GUARD_BRANCH:-${HMVIP_IA_BRANCH:-}}"
-    local worktree="${AGENT_GUARD_WORKTREE_PATH:-${HMVIP_IA_WORKTREE_PATH:-}}"
+    local identity="${AGENT_GUARD_IDENTITY:-${AGENT_GUARD_IDENTITY:-}}"
+    local branch="${AGENT_GUARD_BRANCH:-${AGENT_GUARD_BRANCH:-}}"
+    local worktree="${AGENT_GUARD_WORKTREE_PATH:-${AGENT_GUARD_WORKTREE_PATH:-}}"
     local role="${AGENT_GUARD_ROLE:-}"
 
     # Fallbacks from git worktree when env vars are not set (e.g. manual

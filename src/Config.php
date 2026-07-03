@@ -4,8 +4,7 @@ declare(strict_types=1);
 /**
  * Agent Guard configuration loader.
  *
- * Reads agent-guard.yaml as the SSOT, falling back to .hmvip-agent-guard.json
- * when the YAML file is missing or cannot be parsed.
+ * Reads agent-guard.yaml as the single source of truth.
  */
 
 namespace AgentGuard\Core;
@@ -148,17 +147,6 @@ final class Config
             $parsed = $this->parseYaml($yamlPath);
             if ($parsed !== null) {
                 return $parsed;
-            }
-        }
-
-        $jsonPath = $this->repoRoot . '/.hmvip-agent-guard.json';
-        if (is_file($jsonPath)) {
-            $content = file_get_contents($jsonPath);
-            if ($content !== false) {
-                $parsed = json_decode($content, true);
-                if (is_array($parsed)) {
-                    return $parsed;
-                }
             }
         }
 

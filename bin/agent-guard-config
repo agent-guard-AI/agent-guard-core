@@ -36,14 +36,10 @@ _load_config_json() {
     local repo_root
     repo_root="$(_detect_repo_root)"
     local yaml_path="${repo_root}/agent-guard.yaml"
-    local json_path="${repo_root}/.hmvip-agent-guard.json"
 
     local config_json=""
     if [[ -f "${yaml_path}" ]]; then
         config_json="$(python3 -c 'import json, sys, yaml; json.dump(yaml.safe_load(open(sys.argv[1])), sys.stdout)' "${yaml_path}" 2>/dev/null || true)"
-    fi
-    if [[ -z "${config_json}" && -f "${json_path}" ]]; then
-        config_json="$(cat "${json_path}" 2>/dev/null || true)"
     fi
     echo "${config_json}"
 }

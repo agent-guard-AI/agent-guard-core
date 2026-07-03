@@ -51,7 +51,7 @@ fi
 
 # Load Agent Guard configuration from agent-guard.yaml.
 PACKAGE_ROOT="packages/agent-guard-core"
-KIMI_BIN_DIR="${AG_KIMI_BIN_DIR:-${HMVIP_KIMI_BIN_DIR:-${HOME}/.kimi-code/bin}}"
+KIMI_BIN_DIR="${AG_KIMI_BIN_DIR:-${AG_KIMI_BIN_DIR:-${HOME}/.kimi-code/bin}}"
 
 AGENT_GUARD_CONFIG="${REPO_ROOT}/${PACKAGE_ROOT}/bin/agent-guard-config"
 if [[ -f "${AGENT_GUARD_CONFIG}" ]]; then

@@ -55,7 +55,7 @@ agent-guard-core/
     └── agent-guard.json         # Configuração de exemplo
 ```
 
-> **Estado atual:** Fase 3 — pacote independente e instalável em qualquer repositório Git. Todos os componentes leem a configuração de `agent-guard.yaml` (SSOT) via `agent-guard-config`, com fallback para `.hmvip-agent-guard.json`. Não há hardcodes de projeto no núcleo.
+> **Estado atual:** Fase 3 — pacote independente e instalável em qualquer repositório Git. Todos os componentes leem a configuração de `agent-guard.yaml` (SSOT) via `agent-guard-config`. Não há hardcodes de projeto no núcleo.
 
 ## Instalação rápida
 
@@ -188,7 +188,7 @@ source agent-guard checkpoint "Refatoração do tier selector em 80%"
 
 ### Configuração
 
-No `agent-guard.yaml` (ou `.hmvip-agent-guard.json`):
+No `agent-guard.yaml`:
 
 ```yaml
 journal:

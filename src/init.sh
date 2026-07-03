@@ -45,12 +45,12 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 # The guard config lives at the repository root. The init script is shipped
 # inside packages/agent-guard-core/src, so we walk up from SCRIPT_DIR until we
-# find a git repository that owns agent-guard.yaml or .hmvip-agent-guard.json.
+# find a git repository that owns agent-guard.yaml.
 _resolve_repo_root() {
     local dir="$1"
     while [[ "${dir}" != "/" && -n "${dir}" ]]; do
         if [[ -d "${dir}/.git" || -f "${dir}/.git" ]]; then
-            if [[ -f "${dir}/agent-guard.yaml" || -f "${dir}/.hmvip-agent-guard.json" ]]; then
+            if [[ -f "${dir}/agent-guard.yaml" ]]; then
                 echo "${dir}"
                 return 0
             fi
@@ -93,7 +93,7 @@ _detect_config_root() {
         candidates+=("${cwd_root}")
     fi
     for candidate in "${candidates[@]}"; do
-        if [[ -f "${candidate}/agent-guard.yaml" || -f "${candidate}/.hmvip-agent-guard.json" ]]; then
+        if [[ -f "${candidate}/agent-guard.yaml" ]]; then
             echo "${candidate}"
             return 0
         fi
@@ -101,7 +101,7 @@ _detect_config_root() {
     # Last resort: walk up from current dir looking for the config file.
     local dir="$(pwd)"
     while [[ "${dir}" != "/" && -n "${dir}" ]]; do
-        if [[ -f "${dir}/agent-guard.yaml" || -f "${dir}/.hmvip-agent-guard.json" ]]; then
+        if [[ -f "${dir}/agent-guard.yaml" ]]; then
             echo "${dir}"
             return 0
         fi
@@ -437,15 +437,12 @@ _set_git_author() {
     export GIT_COMMITTER_EMAIL="${author_email}"
 
     # Export the identity to the configured environment variable. The canonical
-    # default is AGENT_GUARD_IDENTITY; HMVIP_IA_IDENTITY is kept as a legacy
-    # alias for projects that migrated from the original HMVIP protocol.
+    # default is AGENT_GUARD_IDENTITY.
     local identity_env_var
     identity_env_var="$(_guard_get_str "commit.identity_env_var" "AGENT_GUARD_IDENTITY")"
-    if [[ -n "${identity_env_var}" && "${identity_env_var}" != "HMVIP_IA_IDENTITY" ]]; then
+    if [[ -n "${identity_env_var}" ]]; then
         eval "export ${identity_env_var}=\"${identity}\""
     fi
-    export AGENT_GUARD_IDENTITY="${identity}"
-    export HMVIP_IA_IDENTITY="${identity}"
 
     # Persistir identidade no config do proprio worktree para agentes CLI
     # cujo shell nao persiste entre tool calls (variaveis de ambiente morrem).
@@ -459,9 +456,7 @@ _set_git_author() {
     fi
 }
 
-# Export session environment variables. Uses AGENT_GUARD_* as the canonical
-# names and keeps HMVIP_IA_* aliases for backward compatibility with legacy
-# HMVIP-based projects.
+# Export session environment variables using AGENT_GUARD_* canonical names.
 _export_session_env() {
     local worktree_path="$1"
     local branch="$2"
@@ -470,11 +465,6 @@ _export_session_env() {
     export AGENT_GUARD_WORKTREE_PATH="${worktree_path}"
     export AGENT_GUARD_BRANCH="${branch}"
     export AGENT_GUARD_IMPACT_PLUGINS="${impact_plugins}"
-
-    # Legacy HMVIP aliases for backward compatibility.
-    export HMVIP_IA_WORKTREE_PATH="${worktree_path}"
-    export HMVIP_IA_BRANCH="${branch}"
-    export HMVIP_IA_IMPACT_PLUGINS="${impact_plugins}"
 }
 
 # Ensure the Git worktreeConfig extension is enabled in the main repository.

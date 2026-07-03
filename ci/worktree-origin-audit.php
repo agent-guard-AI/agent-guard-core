@@ -7,8 +7,7 @@ declare(strict_types=1);
  * Validates that AI agent commits carry worktree origin metadata via git notes.
  * Rejects commits created in the main repository or without metadata.
  *
- * Configuration is read from agent-guard.yaml (SSOT), falling back to
- * .hmvip-agent-guard.json for legacy repositories.
+ * Configuration is read from agent-guard.yaml (SSOT).
  *
  * Usage:
  *   php packages/agent-guard-core/ci/worktree-origin-audit.php <base-ref> <head-ref>

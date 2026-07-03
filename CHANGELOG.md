@@ -2,18 +2,18 @@
 
 ## 0.5.0 — Fase 3: Pacote independente e instalável em qualquer repo Git
 
-- Criação de `agent-guard.yaml` como SSOT moderno (mantém fallback para `.hmvip-agent-guard.json`).
+- Criação de `agent-guard.yaml` como SSOT moderno.
 - `agent-guard.yaml.example` atualizado para o schema real usado por `Config.php` e `src/init.sh` (`paths.*`, `git.*`, `commit.*`, `wrappers.*`).
 - `src/init.sh`:
   - Removeu regex hardcoded de prefixo de worktree; detecção de identidade a partir do nome do worktree agora usa `identities.*.worktree_prefix` da config.
   - Removeu hardcodes de caminhos absolutos de projeto.
   - Resolve base branch configurado (`git.base_branch`) com fallback para branch local quando `origin/<base>` não existe (suporta repos sem remote).
-  - Renomeou variáveis/funções internas `_HMVIP_S_*` para `_AG_S_*`.
-  - Exporta variáveis canônicas `AGENT_GUARD_*` mantendo aliases `HMVIP_IA_*` para compatibilidade com projetos legados.
+  - Renomeou variáveis/funções internas legadas para `_AG_S_*`.
+  - Exporta variáveis canônicas `AGENT_GUARD_*`.
   - Mensagens de uso respeitam `AGENT_GUARD_INIT_NAME` (setado pelo stub).
 - Stub de init exporta `AGENT_GUARD_INIT_NAME` para mensagens consistentes.
 - `wrappers/kimi/wrapper.sh` e `wrappers/kimi/recovery.sh`:
-  - Usam `paths.init_script` da config em vez de hardcoded `.hmvip-agent-init`.
+  - Usam `paths.init_script` da config em vez de nome hardcoded.
   - `recovery.sh` removeu fallback de caminho absoluto; exige `--repo-root`, git repo ou `AG_REPO_ROOT`.
 - `bin/agent-guard-status` reescrito para detectar repo root e ler config; funciona em qualquer projeto.
 - `hooks/install.sh` suporta `--target <repo-root>` para instalação não-interativa.
@@ -47,8 +47,7 @@
 - `wrappers/kimi/wrapper.sh`:
   - Totalmente genérico: lê `agent-guard.yaml` para resolver repo, base_dir, package_root, identidades e caminhos do binário Kimi.
   - Removeu hardcodes de caminhos absolutos e padrões de worktree.
-  - Renomeou variáveis/funções internas de `_HMVIP_*` para `_AG_*`.
-  - Mantém compatibilidade reversa com variáveis `HMVIP_WRAPPER_BYPASS` e `HMVIP_ALLOW_DIRTY_WORKTREE`.
+  - Renomeou variáveis/funções internas de nomes legados para `_AG_*`.
 - `wrappers/kimi/recovery.sh`:
   - Usa `paths.package_root` do YAML para localizar o wrapper do pacote.
   - Usa `wrappers.kimi.bin_dir` para instalar/restaurar o wrapper.
@@ -62,26 +61,25 @@
   - Adicionadas chaves `git.base_branch`, `commit.identity_env_var` e `commit.generic_agent_email_template`.
   - Padronizado o uso de `worktree_prefix` (em vez de `worktree_pattern`) para manter consistência com os hooks e `src/init.sh`.
 - `hooks/pre-commit`:
-  - Totalmente parametrizado via `agent-guard.yaml`; não há mais menções hardcoded a `HMVIP_IA_IDENTITY` ou `.hmvip-agent-init`.
+  - Totalmente parametrizado via `agent-guard.yaml`.
   - Removeu quality checks específicos de linguagem do projeto de origem (deverão viver em gates/hooks do projeto consumidor).
 - `hooks/pre-push`:
   - Refatorado para usar `agent-guard-config` na identificação de identidades e na leitura de `git.base_branch`.
   - Removeu parser Python embarcado; agora usa shell puro com base nas configurações declarativas.
 - `src/init.sh`:
   - Exporta a variável de ambiente configurada em `commit.identity_env_var` (fallback `AGENT_GUARD_IDENTITY`).
-  - Removeu hardcode `HMVIP_IA_IDENTITY`; projetos passam a obtê-lo via configuração no próprio `agent-guard.yaml`.
 - `agent-guard.yaml.example` e `README.md` atualizados para refletir as novas chaves e o formato `worktree_prefix`.
 
 ## 0.2.0 — Fase 2: Configuração parametrizável via `agent-guard.yaml`
 
-- Criação de `src/Config.php`: loader PHP para `agent-guard.yaml` com fallback para `.hmvip-agent-guard.json`.
+- Criação de `src/Config.php`: loader PHP para `agent-guard.yaml`.
 - Criação de `bin/agent-guard-config`: helper shell para hooks e scripts lerem valores do YAML.
 - Parametrização dos hooks:
   - `pre-commit`: valida domínio, identidades e branches a partir de `agent-guard.yaml`.
   - `pre-push`: valida push e identidade usando configurações do YAML.
   - `post-commit`: adiciona git notes parametrizado por `git.notes_ref`.
 - Parametrização de `ci/worktree-origin-audit.php`: usa `Config.php` para ler identidades e regras.
-- Parametrização de `src/init.sh`: lê `agent-guard.yaml` via `agent-guard-config`, mantendo fallback JSON.
+- Parametrização de `src/init.sh`: lê `agent-guard.yaml` via `agent-guard-config`.
 - Atualização do `README.md` com o novo estado e componentes.
 
 ## 0.1.0 — Fase 0: Mirror funcional

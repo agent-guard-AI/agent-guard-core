@@ -21,17 +21,17 @@
 #
 # Emergency bypass (use only for debugging/recovery):
 #   AG_WRAPPER_BYPASS=1 kimi ...
-#   HMVIP_WRAPPER_BYPASS=1 kimi ...  # legacy alias
+#   AG_WRAPPER_BYPASS=1 kimi ...  # legacy alias
 #
 set -euo pipefail
 
 # ---------------------------------------------------------------------------
 # 0. Emergency bypass (canonical env var + legacy alias)
 # ---------------------------------------------------------------------------
-if [[ "${AG_WRAPPER_BYPASS:-}" == "1" || "${HMVIP_WRAPPER_BYPASS:-}" == "1" ]]; then
+if [[ "${AG_WRAPPER_BYPASS:-}" == "1" || "${AG_WRAPPER_BYPASS:-}" == "1" ]]; then
     # REAL_KIMI is resolved later; bypass is handled after config load.
     # We need it now, so perform a minimal resolution.
-    _AG_REAL_KIMI="${AG_KIMI_REAL:-${HMVIP_KIMI_REAL:-}}"
+    _AG_REAL_KIMI="${AG_KIMI_REAL:-${AG_KIMI_REAL:-}}"
     if [[ -z "${_AG_REAL_KIMI}" ]]; then
         # Try common locations.
         _AG_REAL_KIMI_CANDIDATES=("${HOME}/.kimi-code/bin/kimi.real" "$(command -v kimi.real 2>/dev/null || true)")
@@ -121,7 +121,7 @@ _ag_load_config() {
 if ! _ag_load_config; then
     # Not in an Agent Guard managed repository; pass through unchanged.
     # We still need a real binary. Try to find it.
-    _AG_REAL_KIMI="${AG_KIMI_REAL:-${HMVIP_KIMI_REAL:-}}"
+    _AG_REAL_KIMI="${AG_KIMI_REAL:-${AG_KIMI_REAL:-}}"
     if [[ -z "${_AG_REAL_KIMI}" ]]; then
         for candidate in "${HOME}/.kimi-code/bin/kimi.real" "$(command -v kimi.real 2>/dev/null || true)" "$(command -v kimi 2>/dev/null || true)"; do
             if [[ -n "${candidate}" && -x "${candidate}" ]]; then
@@ -236,7 +236,7 @@ _ag_check_worktree_clean() {
         return 0
     fi
 
-    if [[ "${AG_ALLOW_DIRTY_WORKTREE:-}" != "1" && "${HMVIP_ALLOW_DIRTY_WORKTREE:-}" != "1" ]]; then
+    if [[ "${AG_ALLOW_DIRTY_WORKTREE:-}" != "1" && "${AG_ALLOW_DIRTY_WORKTREE:-}" != "1" ]]; then
         echo "❌ AG WRAPPER: worktree ${worktree} has uncommitted changes." >&2
         echo "   Identity: ${identity}" >&2
         echo "   Resolve before starting a new session (commit, stash, or run with AG_ALLOW_DIRTY_WORKTREE=1 for recovery)." >&2
@@ -369,11 +369,11 @@ if ! _ag_have_lease; then
     set -- "${ORIGINAL_ARGS[@]}"
 
     # In reuse mode the init script exports the configured identity variable
-    # (and legacy HMVIP_IA_IDENTITY alias for older projects).
+    # (and legacy AGENT_GUARD_IDENTITY alias for older projects).
     _AG_IDENTITY_VALUE="$(eval echo "\${${_AG_IDENTITY_VAR}:-}")"
-    export _AG_WORKTREE="${AG_WORKTREE_PATH:-${HMVIP_IA_WORKTREE_PATH:-}}"
-    export _AG_IDENTITY="${_AG_IDENTITY_VALUE:-${HMVIP_IA_IDENTITY:-}}"
-    export _AG_BRANCH="${AG_BRANCH:-${HMVIP_IA_BRANCH:-}}"
+    export _AG_WORKTREE="${AG_WORKTREE_PATH:-${AGENT_GUARD_WORKTREE_PATH:-}}"
+    export _AG_IDENTITY="${_AG_IDENTITY_VALUE:-${AGENT_GUARD_IDENTITY:-}}"
+    export _AG_BRANCH="${AG_BRANCH:-${AGENT_GUARD_BRANCH:-}}"
 fi
 
 # ---------------------------------------------------------------------------
