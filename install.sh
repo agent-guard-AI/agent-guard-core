@@ -21,6 +21,10 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
+# Resolve a usable Python interpreter (handles Windows/Git Bash placeholders).
+AG_PYTHON="$(bash "${SCRIPT_DIR}/bin/agent-guard-python" 2>/dev/null || echo "python3")"
+export AG_PYTHON
+
 TARGET_DIR="$(pwd)"
 PACKAGE_ROOT="packages/agent-guard-core"
 INIT_NAME=".agent-guard-init"
@@ -100,7 +104,7 @@ fi
 
 echo "📦 Installing Agent Guard Core into ${DEST_DIR}..."
 mkdir -p "${DEST_DIR}"
-cp -R "${SCRIPT_DIR}/"bin "${SCRIPT_DIR}/"src "${SCRIPT_DIR}/"hooks "${SCRIPT_DIR}/"ci "${SCRIPT_DIR}/"wrappers "${SCRIPT_DIR}/"shell "${SCRIPT_DIR}/"templates "${SCRIPT_DIR}/"examples "${SCRIPT_DIR}/"README.md "${SCRIPT_DIR}/"LICENSE "${SCRIPT_DIR}/"CHANGELOG.md "${DEST_DIR}/"
+cp -R "${SCRIPT_DIR}/"bin "${SCRIPT_DIR}/"src "${SCRIPT_DIR}/"hooks "${SCRIPT_DIR}/"ci "${SCRIPT_DIR}/"wrappers "${SCRIPT_DIR}/"templates "${SCRIPT_DIR}/"examples "${SCRIPT_DIR}/"README.md "${SCRIPT_DIR}/"LICENSE "${SCRIPT_DIR}/"CHANGELOG.md "${DEST_DIR}/"
 
 # Generate agent-guard.yaml from example if it does not exist.
 YAML_PATH="${TARGET_DIR}/agent-guard.yaml"
@@ -115,7 +119,7 @@ fi
 # Generate the init stub at the repo root.
 INIT_STUB="${TARGET_DIR}/${INIT_NAME}"
 echo "🔧 Creating init stub ${INIT_STUB}..."
-sed "s/{{INIT_SCRIPT_NAME}}/${INIT_NAME}/g" "${SCRIPT_DIR}/templates/init_stub.sh" > "${INIT_STUB}"
+sed "s/{{INIT_SCRIPT_NAME}}/${INIT_NAME}/g; s|{{PACKAGE_ROOT}}|${PACKAGE_ROOT}|g" "${SCRIPT_DIR}/templates/init_stub.sh" > "${INIT_STUB}"
 chmod +x "${INIT_STUB}"
 
 # Install Git hooks if requested.
@@ -128,24 +132,71 @@ fi
 if [[ "${INSTALL_WRAPPER}" == "true" ]]; then
     KIMI_BIN_DIR="${HOME}/.kimi-code/bin"
     if [[ -f "${TARGET_DIR}/agent-guard.yaml" ]]; then
-        KIMI_BIN_DIR="$(python3 -c "import yaml,sys; d=yaml.safe_load(open(sys.argv[1])); print(d.get('wrappers',{}).get('kimi',{}).get('bin_dir','${KIMI_BIN_DIR}'))" "${TARGET_DIR}/agent-guard.yaml" 2>/dev/null || echo "${KIMI_BIN_DIR}")"
+        KIMI_BIN_DIR="$(${AG_PYTHON} -c "import yaml,sys; d=yaml.safe_load(open(sys.argv[1])); print(d.get('wrappers',{}).get('kimi',{}).get('bin_dir','${KIMI_BIN_DIR}'))" "${TARGET_DIR}/agent-guard.yaml" 2>/dev/null || echo "${KIMI_BIN_DIR}")"
     fi
     KIMI_BIN="${KIMI_BIN_DIR}/kimi"
     KIMI_REAL="${KIMI_BIN_DIR}/kimi.real"
 
     if [[ -f "${KIMI_BIN}" ]]; then
-        if [[ ! -f "${KIMI_REAL}" ]]; then
-            echo "💾 Backing up current Kimi binary to ${KIMI_REAL}..."
-            cp "${KIMI_BIN}" "${KIMI_REAL}"
-            chmod +x "${KIMI_REAL}"
+        # Detect if the current Kimi binary is running (common on Windows/Git Bash).
+        local bin_in_use="false"
+        if command -v lsof >/dev/null 2>&1; then
+            if lsof "${KIMI_BIN}" >/dev/null 2>&1; then
+                bin_in_use="true"
+            fi
+        elif [[ -d /proc ]]; then
+            for pid_dir in /proc/[0-9]*; do
+                [[ -d "${pid_dir}" ]] || continue
+                if [[ "$(readlink "${pid_dir}/exe" 2>/dev/null || true)" == "${KIMI_BIN}" ]]; then
+                    bin_in_use="true"
+                    break
+                fi
+            done
         fi
-        echo "🛡️  Installing Kimi CLI wrapper at ${KIMI_BIN}..."
-        cp "${DEST_DIR}/wrappers/kimi/wrapper.sh" "${KIMI_BIN}"
-        chmod +x "${KIMI_BIN}"
+
+        if [[ "${bin_in_use}" == "true" ]]; then
+            echo "⚠️  Kimi CLI binary is currently running: ${KIMI_BIN}" >&2
+            echo "   The wrapper cannot be installed while the binary is in use." >&2
+            echo "   After closing all Kimi sessions, run:" >&2
+            echo "     bash ${DEST_DIR}/wrappers/kimi/recovery.sh --repo-root ${TARGET_DIR}" >&2
+        else
+            if [[ ! -f "${KIMI_REAL}" ]]; then
+                echo "💾 Backing up current Kimi binary to ${KIMI_REAL}..."
+                cp "${KIMI_BIN}" "${KIMI_REAL}"
+                chmod +x "${KIMI_REAL}"
+            fi
+            echo "🛡️  Installing Kimi CLI wrapper at ${KIMI_BIN}..."
+            cp "${DEST_DIR}/wrappers/kimi/wrapper.sh" "${KIMI_BIN}"
+            chmod +x "${KIMI_BIN}"
+        fi
     else
         echo "⚠️  Kimi CLI binary not found at ${KIMI_BIN}; wrapper not installed."
         echo "   Install Kimi CLI and run: bash ${DEST_DIR}/wrappers/kimi/recovery.sh --repo-root ${TARGET_DIR}"
     fi
+fi
+
+# Ensure runtime artifacts are ignored by Git.
+if [[ ! -f "${TARGET_DIR}/.gitignore" ]] || ! grep -qxF ".agent-guard/" "${TARGET_DIR}/.gitignore" 2>/dev/null; then
+    echo "📝 Adding Agent Guard runtime artifacts to ${TARGET_DIR}/.gitignore..."
+    {
+        echo ""
+        echo "# Agent Guard runtime"
+        echo ".agent-guard/"
+        echo ".githooks/"
+    } >> "${TARGET_DIR}/.gitignore"
+fi
+
+# Ensure shell scripts keep LF line endings on Windows.
+if [[ ! -f "${TARGET_DIR}/.gitattributes" ]]; then
+    echo "📝 Creating ${TARGET_DIR}/.gitattributes for LF line endings..."
+    cat > "${TARGET_DIR}/.gitattributes" <<'EOF'
+* text=auto
+*.sh text eol=lf
+*.php text eol=lf
+*.yaml text eol=lf
+*.yml text eol=lf
+*.json text eol=lf
+EOF
 fi
 
 echo ""

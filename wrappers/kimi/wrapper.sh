@@ -54,6 +54,11 @@ fi
 # ---------------------------------------------------------------------------
 CWD="$(pwd -P 2>/dev/null || pwd)"
 
+# Resolve a usable Python interpreter cross-platform.
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+AG_PYTHON="$(bash "${SCRIPT_DIR}/bin/agent-guard-python" 2>/dev/null || echo "python3")"
+export AG_PYTHON
+
 # ---------------------------------------------------------------------------
 # 2. Load repository configuration from agent-guard.yaml
 # ---------------------------------------------------------------------------
@@ -83,6 +88,12 @@ _ag_load_config() {
     local git_root
     git_root="$(git -C "${CWD}" rev-parse --show-toplevel 2>/dev/null || true)"
     if [[ -z "${git_root}" ]]; then
+        return 1
+    fi
+
+    # The SSOT configuration file must exist. Without it we cannot determine
+    # main repo, base dir, identities or wrapper paths safely.
+    if [[ ! -f "${git_root}/agent-guard.yaml" ]]; then
         return 1
     fi
 
@@ -118,7 +129,43 @@ _ag_load_config() {
     return 0
 }
 
+# Heuristic: is CWD a git repository that looks like an Agent Guard main repo
+# but whose config could not be loaded? This usually means the main repo is on
+# a detached/neutral branch (e.g. _released/*) or is missing agent-guard.yaml.
+_ag_looks_like_main_repo() {
+    if ! git -C "${CWD}" rev-parse --show-toplevel >/dev/null 2>&1; then
+        return 1
+    fi
+    # Presence of the package or init stubs strongly indicates the main repo.
+    if [[ -d "${CWD}/packages/agent-guard-core" || -f "${CWD}/.agent-guard-init" || -f "${CWD}/.hmvip-agent-init" ]]; then
+        return 0
+    fi
+    return 1
+}
+
 if ! _ag_load_config; then
+    if _ag_looks_like_main_repo; then
+        echo "❌❌❌ AG WRAPPER: main repository is not in a leasable state." >&2
+        echo "" >&2
+        echo "   The wrapper could not load agent-guard.yaml from:" >&2
+        echo "     ${CWD}" >&2
+        echo "" >&2
+        echo "   Common causes:" >&2
+        echo "     - The main repo is on a neutral branch (e.g. _released/*)." >&2
+        echo "     - The main repo is outdated and missing agent-guard.yaml." >&2
+        echo "     - agent-guard.yaml was deleted or renamed." >&2
+        echo "" >&2
+        echo "   Required actions (run as the repo owner, not as an AI agent):" >&2
+        echo "     cd ${CWD}" >&2
+        echo "     git checkout develop" >&2
+        echo "     git pull origin develop" >&2
+        echo "     # ensure agent-guard.yaml exists" >&2
+        echo "" >&2
+        echo "   Emergency bypass (use only for recovery):" >&2
+        echo "     AG_WRAPPER_BYPASS=1 kimi ..." >&2
+        exit 1
+    fi
+
     # Not in an Agent Guard managed repository; pass through unchanged.
     # We still need a real binary. Try to find it.
     _AG_REAL_KIMI="${AG_KIMI_REAL:-${AG_KIMI_REAL:-}}"
@@ -309,8 +356,8 @@ _ag_find_free_kimi_worktree() {
             local is_free=true
             if [[ -f "${session_file}" ]]; then
                 local status pid
-                status="$(python3 -c "import json,sys; d=json.load(open('${session_file}')); print(d.get('status','free'))" 2>/dev/null || echo free)"
-                pid="$(python3 -c "import json,sys; d=json.load(open('${session_file}')); print(d.get('pid',''))" 2>/dev/null || echo '')"
+                status="$(${AG_PYTHON} -c "import json,sys; d=json.load(open('${session_file}')); print(d.get('status','free'))" 2>/dev/null || echo free)"
+                pid="$(${AG_PYTHON} -c "import json,sys; d=json.load(open('${session_file}')); print(d.get('pid',''))" 2>/dev/null || echo '')"
                 if [[ "${status}" == "active" && -n "${pid}" && -d "/proc/${pid}" ]]; then
                     is_free=false
                 fi

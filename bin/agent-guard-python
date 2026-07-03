@@ -1,0 +1,53 @@
+#!/usr/bin/env bash
+#
+# agent-guard-python — resolve a usable Python interpreter cross-platform.
+#
+# Returns the path/invocation of a Python interpreter that can run the
+# Agent Guard Python snippets (yaml, json, sys). Falls back to "python3"
+# if no better option is found.
+#
+# Usage:
+#   bash agent-guard-python
+#   PYTHON_CMD="$(bash agent-guard-python)"
+
+set -euo pipefail
+
+# Allow explicit override from the environment.
+if [[ -n "${AGENT_GUARD_PYTHON:-}" ]]; then
+    echo "${AGENT_GUARD_PYTHON}"
+    exit 0
+fi
+
+# Test whether a candidate is a usable Python with yaml support.
+_is_valid_python() {
+    local candidate="$1"
+    [[ -z "${candidate}" ]] && return 1
+    # Reject Windows Store placeholder and non-existent executables.
+    if [[ "${candidate}" == *"WindowsApps"* ]] || [[ "${candidate}" == *"AppData\\Local\\Microsoft"* ]]; then
+        return 1
+    fi
+    if ! command -v "${candidate}" >/dev/null 2>&1; then
+        return 1
+    fi
+    "${candidate}" -c "import yaml, json, sys" >/dev/null 2>&1
+}
+
+# Ordered list of candidates. Kimi's bundled Python is preferred on Windows.
+_candidates=(
+    "${HOME}/.kimi/python312/python"
+    "${HOME}/.kimi/python311/python"
+    "${HOME}/.kimi/python310/python"
+    "python"
+    "py"
+    "python3"
+)
+
+for candidate in "${_candidates[@]}"; do
+    if _is_valid_python "${candidate}"; then
+        echo "${candidate}"
+        exit 0
+    fi
+done
+
+# Last resort: return python3 and let the caller handle errors.
+echo "python3"

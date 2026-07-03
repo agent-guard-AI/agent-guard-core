@@ -158,8 +158,13 @@ final class Config
      */
     private function parseYaml(string $path): ?array
     {
+        $python = $this->resolvePython();
+        if ($python === null) {
+            return null;
+        }
         $command = sprintf(
-            'python3 -c %s %s 2>/dev/null',
+            '%s -c %s %s 2>/dev/null',
+            escapeshellarg($python),
             escapeshellarg('import json, sys, yaml; json.dump(yaml.safe_load(open(sys.argv[1])), sys.stdout)'),
             escapeshellarg($path)
         );
@@ -169,6 +174,57 @@ final class Config
         }
         $decoded = json_decode($output, true);
         return is_array($decoded) ? $decoded : null;
+    }
+
+    /**
+     * Resolve a usable Python interpreter cross-platform.
+     */
+    private function resolvePython(): ?string
+    {
+        $override = getenv('AGENT_GUARD_PYTHON');
+        if ($override !== false && $override !== '') {
+            if ($this->isValidPython($override)) {
+                return $override;
+            }
+        }
+
+        $home = getenv('HOME') ?: (getenv('USERPROFILE') ?: '');
+        $candidates = array(
+            $home . '/.kimi/python312/python',
+            $home . '/.kimi/python311/python',
+            $home . '/.kimi/python310/python',
+            'python',
+            'py',
+            'python3',
+        );
+
+        foreach ($candidates as $candidate) {
+            if ($this->isValidPython($candidate)) {
+                return $candidate;
+            }
+        }
+
+        return null;
+    }
+
+    /**
+     * Check whether a Python candidate exists and can import yaml/json/sys.
+     */
+    private function isValidPython(string $candidate): bool
+    {
+        if ($candidate === '') {
+            return false;
+        }
+        // Reject Windows Store placeholder.
+        if (strpos($candidate, 'WindowsApps') !== false) {
+            return false;
+        }
+        $output = shell_exec(sprintf(
+            '%s -c %s 2>/dev/null',
+            escapeshellarg($candidate),
+            escapeshellarg('import yaml, json, sys; print("ok")')
+        ));
+        return trim((string) $output) === 'ok';
     }
 
     private function detectRepoRoot(): string

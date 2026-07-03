@@ -18,6 +18,10 @@ set -euo pipefail
 # This script lives in packages/agent-guard-core/src/; walk up to agent-guard-core root.
 _JOURNAL_CORE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
+# Resolve a usable Python interpreter cross-platform.
+AG_PYTHON="$(bash "${_JOURNAL_CORE_DIR}/bin/agent-guard-python" 2>/dev/null || echo "python3")"
+export AG_PYTHON
+
 # -----------------------------------------------------------------------------
 # Configuração
 # -----------------------------------------------------------------------------
@@ -124,7 +128,7 @@ _journal_write_event() {
     fi
 
     local entry
-    entry="$(python3 -c "
+    entry="$(${AG_PYTHON} -c "
 import json, os
 entry = {
     'timestamp': '${timestamp}',
@@ -138,16 +142,26 @@ entry = {
 print(json.dumps(entry, ensure_ascii=False))
 " 2>/dev/null || echo "{\"timestamp\":\"${timestamp}\",\"action\":\"${action}\",\"error\":\"json_encode_failed\"}")"
 
-    local lock_fd=201
     local lock_file="${journal_dir}/.agent-guard-journal.lock"
     touch "${lock_file}"
 
     # flock exclusivo para serializar writes entre processos.
-    {
-        flock -x "${lock_fd}"
+    # Fallback para lock atomico via mkdir no Git Bash/Windows.
+    if command -v flock >/dev/null 2>&1; then
+        local lock_fd=201
+        {
+            flock -x "${lock_fd}"
+            printf '%s\n' "${entry}" >> "${journal_path}"
+            flock -u "${lock_fd}"
+        } {lock_fd}>"${lock_file}"
+    else
+        local lock_dir="${lock_file}.dir"
+        while ! mkdir "${lock_dir}" 2>/dev/null; do
+            sleep 0.1
+        done
         printf '%s\n' "${entry}" >> "${journal_path}"
-        flock -u "${lock_fd}"
-    } {lock_fd}>"${lock_file}"
+        rmdir "${lock_dir}" 2>/dev/null || true
+    fi
 }
 
 # Alias semânticos para eventos comuns.
@@ -167,7 +181,7 @@ _journal_release() {
 _journal_checkpoint() {
     local message="${1:-}"
     local payload
-    payload="$(python3 -c "import json,sys; print(json.dumps({'message': sys.argv[1]}))" "${message}" 2>/dev/null || echo "{}")"
+    payload="$(${AG_PYTHON} -c "import json,sys; print(json.dumps({'message': sys.argv[1]}))" "${message}" 2>/dev/null || echo "{}")"
     _journal_write_event "checkpoint" "${payload}"
 }
 
@@ -175,14 +189,14 @@ _journal_commit() {
     local sha="${1:-}"
     local message="${2:-}"
     local payload
-    payload="$(python3 -c "import json,sys; print(json.dumps({'sha': sys.argv[1], 'message': sys.argv[2]}))" "${sha}" "${message}" 2>/dev/null || echo "{}")"
+    payload="$(${AG_PYTHON} -c "import json,sys; print(json.dumps({'sha': sys.argv[1], 'message': sys.argv[2]}))" "${sha}" "${message}" 2>/dev/null || echo "{}")"
     _journal_write_event "commit" "${payload}"
 }
 
 _journal_error() {
     local message="${1:-}"
     local payload
-    payload="$(python3 -c "import json,sys; print(json.dumps({'message': sys.argv[1]}))" "${message}" 2>/dev/null || echo "{}")"
+    payload="$(${AG_PYTHON} -c "import json,sys; print(json.dumps({'message': sys.argv[1]}))" "${message}" 2>/dev/null || echo "{}")"
     _journal_write_event "error" "${payload}"
 }
 
@@ -229,7 +243,7 @@ _journal_list() {
         return 0
     fi
 
-    python3 - "${journal_path}" "${limit}" "${identity}" "${since}" "${action}" <<'PY'
+    ${AG_PYTHON} - "${journal_path}" "${limit}" "${identity}" "${since}" "${action}" <<'PY'
 import json, sys
 from datetime import datetime, timezone
 
@@ -313,7 +327,7 @@ _journal_resume() {
         return 1
     fi
 
-    python3 - "${journal_path}" "${mode}" "${value}" <<'PY'
+    ${AG_PYTHON} - "${journal_path}" "${mode}" "${value}" <<'PY'
 import json, sys
 path, mode, value = sys.argv[1:4]
 
@@ -375,7 +389,7 @@ _journal_rotate() {
     local tmp_file
     tmp_file="${journal_path}.tmp"
 
-    python3 - "${journal_path}" "${tmp_file}" "${cutoff}" <<'PY'
+    ${AG_PYTHON} - "${journal_path}" "${tmp_file}" "${cutoff}" <<'PY'
 import json, sys
 from datetime import datetime, timezone
 src, dst, cutoff = sys.argv[1:4]

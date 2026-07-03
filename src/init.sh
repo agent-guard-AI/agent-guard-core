@@ -43,6 +43,41 @@ fi
 # ---------------------------------------------------------------------------
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
+# Resolve a usable Python interpreter cross-platform.
+AG_PYTHON="$(bash "${SCRIPT_DIR}/../bin/agent-guard-python" 2>/dev/null || echo "python3")"
+export AG_PYTHON
+
+# Cross-platform lock helper. Uses flock(1) when available; otherwise falls
+# back to an atomic mkdir-based lock (e.g. Git Bash on Windows).
+_AG_LOCK_DIR=""
+_ag_flock_acquire() {
+    local lock_file="$1"
+    if command -v flock >/dev/null 2>&1; then
+        local lock_fd=200
+        eval "exec ${lock_fd}>\"${lock_file}\""
+        flock -x "${lock_fd}"
+        echo "${lock_fd}"
+    else
+        _AG_LOCK_DIR="${lock_file}.dir"
+        while ! mkdir "${_AG_LOCK_DIR}" 2>/dev/null; do
+            sleep 0.1
+        done
+        echo "mkdir"
+    fi
+}
+
+_ag_flock_release() {
+    local lock_mode="$1"
+    if [[ "${lock_mode}" == "mkdir" ]]; then
+        rmdir "${_AG_LOCK_DIR}" 2>/dev/null || true
+        _AG_LOCK_DIR=""
+    else
+        local lock_fd="${lock_mode}"
+        flock -u "${lock_fd}"
+        eval "exec ${lock_fd}>&-"
+    fi
+}
+
 # The guard config lives at the repository root. The init script is shipped
 # inside packages/agent-guard-core/src, so we walk up from SCRIPT_DIR until we
 # find a git repository that owns agent-guard.yaml.
@@ -266,7 +301,7 @@ _load_session_field() {
     local session_file
     session_file="$(_get_session_file "${identity}")"
     if [[ -f "${session_file}" ]]; then
-        python3 -c "import json,sys; d=json.load(open('${session_file}')); print(d.get('${field}',''))" 2>/dev/null || echo ""
+        ${AG_PYTHON} -c "import json,sys; d=json.load(open('${session_file}')); print(d.get('${field}',''))" 2>/dev/null || echo ""
     else
         echo ""
     fi
@@ -296,7 +331,7 @@ _save_session() {
     export _AG_S_IMPACT="${impact_plugins}"
     export _AG_S_SESSION_FILE="${session_file}"
 
-    python3 -c "
+    ${AG_PYTHON} -c "
 import json, os
 role = os.environ.get('_AG_S_ROLE') or None
 data = {
@@ -322,7 +357,7 @@ _clear_session() {
     local session_file
     session_file="$(_get_session_file "${identity}")"
     if [[ -f "${session_file}" ]]; then
-        python3 -c "
+        ${AG_PYTHON} -c "
 import json
 with open('${session_file}') as f:
     d = json.load(f)
@@ -353,11 +388,8 @@ _acquire_slot() {
     touch "${global_lock}"
 
     local selected_identity=""
-    local lock_fd=200
-
-    # Acquire exclusive lock
-    eval "exec ${lock_fd}>\"${global_lock}\""
-    flock -x "${lock_fd}"
+    local lock_mode
+    lock_mode="$(_ag_flock_acquire "${global_lock}")"
 
     # Clean stale sessions while locked
     for i in $(seq 1 "${max_slots}"); do
@@ -391,8 +423,7 @@ _acquire_slot() {
         fi
     done
 
-    flock -u "${lock_fd}"
-    eval "exec ${lock_fd}>&-"
+    _ag_flock_release "${lock_mode}"
 
     if [[ -z "${selected_identity}" ]]; then
         echo "❌ No free slots available for '${prefix}' (all ${max_slots} in use)." >&2
@@ -699,6 +730,23 @@ while [[ $# -gt 0 ]]; do
 done
 
 # ---------------------------------------------------------------------------
+# Helper: check whether the current branch belongs to the agent identity that
+# owns this worktree. This allows release directly from a task branch without
+# forcing a checkout to develop, which is impossible when develop is already
+# checked out in another worktree (e.g. the main repository).
+_branch_is_current_agent_task() {
+    local worktree_path="$1"
+    local current_branch
+    current_branch="$(git -C "${worktree_path}" branch --show-current 2>/dev/null || echo "")"
+    local wt_name identity expected_prefix
+    wt_name="$(basename "${worktree_path}")"
+    identity="$(_detect_identity_from_worktree_name "${wt_name}" | awk '{print $1 $2}')"
+    [[ -n "${identity}" ]] || return 1
+    expected_prefix="ia-${identity}/"
+    [[ "${current_branch}" == "${expected_prefix}"* ]]
+}
+
+# ---------------------------------------------------------------------------
 # Helper: validate worktree is in a neutral state before release
 # ---------------------------------------------------------------------------
 _validate_worktree_release_ready() {
@@ -716,17 +764,19 @@ _validate_worktree_release_ready() {
 
     local current_branch
     current_branch="$(git -C "${worktree_path}" branch --show-current 2>/dev/null || echo "")"
-    if [[ "${current_branch}" != "develop" ]]; then
+    if [[ "${current_branch}" != "develop" ]] && ! _branch_is_current_agent_task "${worktree_path}"; then
         echo "" >&2
-        echo "❌❌❌ ERROR: WORKTREE NOT ON 'develop' ❌❌❌" >&2
+        echo "❌❌❌ ERROR: WORKTREE NOT RELEASABLE ❌❌❌" >&2
         echo "" >&2
         echo "   Current branch: ${current_branch:-<detached>}" >&2
-        echo "   Release is only allowed when the worktree is on 'develop'." >&2
+        echo "   Release is only allowed when the worktree is on 'develop'," >&2
+        echo "   or on its own agent task branch (ia-<identity>/...)." >&2
         echo "" >&2
         echo "   Required actions before release:" >&2
         echo "     1. Commit or stash any unfinished work on your task branch." >&2
         echo "     2. Push your branch and ensure PR is open/merged." >&2
-        echo "     3. Run: git checkout develop" >&2
+        echo "     3. If the branch was already merged via squash, release directly" >&2
+        echo "        from the task branch — do not force a checkout to develop." >&2
         echo "" >&2
         return 1
     fi
@@ -772,6 +822,25 @@ if [[ "${MODE}" == "release" ]]; then
         CURRENT_WORKTREE="$(git -C "${CURRENT_DIR}" rev-parse --show-toplevel 2>/dev/null || echo "")"
         wt_name="$(basename "${CURRENT_WORKTREE}")"
         CURRENT_IDENTITY="$(_detect_identity_from_worktree_name "${wt_name}" | awk '{print $1 $2}')"
+    fi
+
+    if [[ "${CURRENT_WORKTREE}" == "${MAIN_REPO}" ]]; then
+        echo "❌❌❌ ERROR: RELEASE BLOCKED ON MAIN REPOSITORY ❌❌❌" >&2
+        echo "" >&2
+        echo "   You are trying to release a session from the main repository:" >&2
+        echo "     ${MAIN_REPO}" >&2
+        echo "" >&2
+        echo "   AI agents must NEVER operate on or release from the main repo." >&2
+        echo "   If you intended to release an agent session, run --release from" >&2
+        echo "   the agent's own worktree (e.g. /home/hmvip-dev/hmvip-ia-kimi1)." >&2
+        echo "" >&2
+        echo "   If the main repo ended up on a neutral branch (_released/*)," >&2
+        echo "   switch it back to develop manually as the repo owner:" >&2
+        echo "     cd ${MAIN_REPO}" >&2
+        echo "     git checkout develop" >&2
+        echo "     git pull origin develop" >&2
+        echo "" >&2
+        return 1 2>/dev/null || exit 1
     fi
 
     if [[ -z "${CURRENT_IDENTITY}" ]]; then
@@ -919,7 +988,7 @@ if [[ "${MODE}" == "attach" ]]; then
     _anti_stale_check "${WORKTREE_PATH}"
     _session_audit "${WORKTREE_PATH}"
 
-    impact_json="$(echo "${IMPACT_PLUGINS}" | python3 -c "import sys,json; print(json.dumps([p.strip() for p in sys.stdin.read().split(',') if p.strip()]))" 2>/dev/null || echo "[]")"
+    impact_json="$(echo "${IMPACT_PLUGINS}" | ${AG_PYTHON} -c "import sys,json; print(json.dumps([p.strip() for p in sys.stdin.read().split(',') if p.strip()]))" 2>/dev/null || echo "[]")"
     _save_session "${IDENTITY_FROM_BRANCH}" "active" "${ROLE}" "${ATTACH_BRANCH}" "$$" "${WORKTREE_PATH}" "${impact_json}"
 
     if command -v _journal_attach >/dev/null 2>&1; then
@@ -1000,7 +1069,7 @@ if [[ -n "${CURRENT_IDENTITY}" && -n "${CURRENT_BRANCH}" ]]; then
     _anti_stale_check "${CURRENT_WORKTREE}"
     _session_audit "${CURRENT_WORKTREE}"
 
-    impact_json="$(echo "${IMPACT_PLUGINS}" | python3 -c "import sys,json; print(json.dumps([p.strip() for p in sys.stdin.read().split(',') if p.strip()]))" 2>/dev/null || echo "[]")"
+    impact_json="$(echo "${IMPACT_PLUGINS}" | ${AG_PYTHON} -c "import sys,json; print(json.dumps([p.strip() for p in sys.stdin.read().split(',') if p.strip()]))" 2>/dev/null || echo "[]")"
     _save_session "${CURRENT_IDENTITY}" "active" "${ROLE}" "${CURRENT_BRANCH}" "$$" "${CURRENT_WORKTREE}" "${impact_json}"
 
     if command -v _journal_init >/dev/null 2>&1; then
@@ -1076,7 +1145,7 @@ fi
 _set_git_author "${IDENTITY}" "${WORKTREE_PATH}"
 _export_session_env "${WORKTREE_PATH}" "${BRANCH_NAME}" "${IMPACT_PLUGINS}"
 
-impact_json="$(echo "${IMPACT_PLUGINS}" | python3 -c "import sys,json; print(json.dumps([p.strip() for p in sys.stdin.read().split(',') if p.strip()]))" 2>/dev/null || echo "[]")"
+impact_json="$(echo "${IMPACT_PLUGINS}" | ${AG_PYTHON} -c "import sys,json; print(json.dumps([p.strip() for p in sys.stdin.read().split(',') if p.strip()]))" 2>/dev/null || echo "[]")"
 _save_session "${IDENTITY}" "active" "${ROLE}" "${BRANCH_NAME}" "$$" "${WORKTREE_PATH}" "${impact_json}"
 
 

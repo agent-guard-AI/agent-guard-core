@@ -54,8 +54,8 @@ if [[ -f "${JOURNAL_SCRIPT}" ]]; then
     source "${JOURNAL_SCRIPT}"
     COMMIT_SHA="$(git rev-parse HEAD 2>/dev/null || echo "")"
     COMMIT_MSG="$(git log -1 --pretty=%s 2>/dev/null || echo "")"
-    export HMVIP_IA_IDENTITY="${IDENTITY}"
-    export HMVIP_IA_BRANCH="${BRANCH}"
-    export HMVIP_IA_WORKTREE_PATH="${WORKTREE_PATH}"
+    export AGENT_GUARD_IDENTITY="${IDENTITY}"
+    export AGENT_GUARD_BRANCH="${BRANCH}"
+    export AGENT_GUARD_WORKTREE_PATH="${WORKTREE_PATH}"
     _journal_commit "${COMMIT_SHA}" "${COMMIT_MSG}"
 fi

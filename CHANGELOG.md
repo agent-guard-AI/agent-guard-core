@@ -1,5 +1,48 @@
 # Changelog — agent-guard-core
 
+## 0.5.3 — Compatibilidade Windows/Git Bash e instalação robusta
+
+- `install.sh`:
+  - Remove referência ao diretório `shell` inexistente.
+  - Detecta Python válido cross-platform via `bin/agent-guard-python` (ignora placeholder `WindowsApps`).
+  - Detecta quando o binário Kimi está em uso e instrui a rodar `recovery.sh` após reiniciar, em vez de falhar.
+  - Adiciona `.agent-guard/` e `.githooks/` ao `.gitignore` do repo consumidor.
+  - Cria `.gitattributes` com regras LF para scripts, PHP, YAML/JSON.
+- Novo `bin/agent-guard-python`:
+  - Resolve interpretador Python válido considerando `${HOME}/.kimi/python*/python`, `python`, `py` e `python3`.
+  - Respeita override `AGENT_GUARD_PYTHON`.
+- `src/init.sh`, `src/journal.sh`, `wrappers/kimi/wrapper.sh`, `bin/agent-guard-config`, `templates/init_stub.sh`, `src/Config.php`:
+  - Substitui hardcodes de `python3` por resolução via `bin/agent-guard-python` (shell) ou `resolvePython()` (PHP).
+- `src/init.sh` e `src/journal.sh`:
+  - Implementam fallback de lock atômico via `mkdir` quando `flock(1)` não está disponível (Git Bash/Windows).
+- `templates/init_stub.sh`:
+  - Suporta `{{PACKAGE_ROOT}}` substituído pelo `install.sh`.
+- Novos testes funcionais:
+  - `tests/agent-guard/agent-guard-python-test.sh`
+  - `tests/agent-guard/install-test.sh`
+
+## 0.5.2 — Release a partir de task branch sem forçar develop
+
+- `src/init.sh`:
+  - `_validate_worktree_release_ready` agora aceita release do worktree quando ele está na própria branch de tarefa do agente (`ia-<identity>/...`), além de `develop`.
+  - Remove a heurística `merge-base --is-ancestor HEAD develop`, que falhava após squash merges e impedia liberação do slot.
+  - Após release, o worktree continua sendo movido para `_released/<identity>`, liberando `develop` para outros worktrees.
+  - Mensagem de erro atualizada para refletir as novas regras.
+- `tests/agent-guard/agent-init-test.sh`:
+  - Adiciona cenário de release bloqueado em branch não-agente (`feature/other-task`).
+  - Adiciona cenário de release permitido diretamente da task branch `ia-kimi1/...`.
+  - Mantém validações de dirty/stash e release a partir de `develop`.
+
+## 0.5.1 — Proteção contra operação no repositório principal
+
+- `wrappers/kimi/wrapper.sh`:
+  - Exige `agent-guard.yaml` para carregar configuração; sem ele, o wrapper não faz pass-through.
+  - Detecta repositórios que parecem ser o main repo (presença de `packages/agent-guard-core` ou stubs de init) e falha com mensagem de recuperação em vez de executar no repo principal.
+- `src/init.sh`:
+  - Bloqueia `--release` quando executado a partir do repositório principal (`paths.main_repo`).
+  - Mensagem de erro orienta o usuário a voltar para `develop` e atualizar o repo principal.
+- Novo teste funcional: `tests/agent-guard/main-repo-protection-test.sh`.
+
 ## 0.5.0 — Fase 3: Pacote independente e instalável em qualquer repo Git
 
 - Criação de `agent-guard.yaml` como SSOT moderno.

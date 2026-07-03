@@ -23,10 +23,14 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 export AGENT_GUARD_FROM_STUB=1
 export AGENT_GUARD_INIT_NAME="{{INIT_SCRIPT_NAME}}"
 
+# Resolve a usable Python interpreter cross-platform.
+AG_PYTHON="$(bash "${SCRIPT_DIR}/{{PACKAGE_ROOT}}/bin/agent-guard-python" 2>/dev/null || echo "python3")"
+export AG_PYTHON
+
 # Resolve package root from agent-guard.yaml when available.
 PACKAGE_ROOT="packages/agent-guard-core"
 if [[ -f "${SCRIPT_DIR}/agent-guard.yaml" ]]; then
-    PACKAGE_ROOT="$(python3 -c "import yaml,sys; d=yaml.safe_load(open(sys.argv[1])); print(d.get('paths',{}).get('package_root','packages/agent-guard-core'))" "${SCRIPT_DIR}/agent-guard.yaml" 2>/dev/null || echo 'packages/agent-guard-core')"
+    PACKAGE_ROOT="$(${AG_PYTHON} -c "import yaml,sys; d=yaml.safe_load(open(sys.argv[1])); print(d.get('paths',{}).get('package_root','packages/agent-guard-core'))" "${SCRIPT_DIR}/agent-guard.yaml" 2>/dev/null || echo 'packages/agent-guard-core')"
 fi
 
 AGENT_GUARD_BIN="${SCRIPT_DIR}/${PACKAGE_ROOT}/bin/agent-guard"
