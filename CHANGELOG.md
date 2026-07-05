@@ -1,5 +1,16 @@
 # Changelog — agent-guard-core
 
+## 0.5.4 — Wrapper não-invasivo, base_branch configurável e rotação automática de journal
+
+- `install.sh`:
+  - Wrapper Kimi agora é **não-invasivo por padrão**; instalação invasiva requer `--install-wrapper`.
+  - Exibe orientação quando o wrapper não é instalado, indicando como ativar o modo invasivo.
+- `wrappers/kimi/recovery.sh`:
+  - Adicionada flag `--remove-wrapper` para remover o wrapper invasivo e restaurar o binário real do Kimi, mantendo backup timestamped para forense.
+- `src/init.sh`:
+  - `_anti_stale_check` e `--release` agora usam `git.base_branch` configurado em `agent-guard.yaml` em vez de `develop` hardcoded.
+  - `_journal_rotate` é chamado automaticamente em `init`, `--attach` e `--release`, evitando crescimento ilimitado do journal.
+
 ## 0.5.3 — Compatibilidade Windows/Git Bash e instalação robusta
 
 - `install.sh`:

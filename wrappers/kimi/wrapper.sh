@@ -98,7 +98,15 @@ _ag_load_config() {
     fi
 
     local package_root
-    package_root="$(bash "${git_root}/packages/agent-guard-core/bin/agent-guard-config" get paths.package_root 'packages/agent-guard-core' 2>/dev/null || echo 'packages/agent-guard-core')"
+    # Support both nested installations (packages/agent-guard-core) and
+    # standalone repositories where Agent Guard lives at the repo root.
+    if [[ -f "${git_root}/packages/agent-guard-core/bin/agent-guard-config" ]]; then
+        package_root="$(bash "${git_root}/packages/agent-guard-core/bin/agent-guard-config" get paths.package_root 'packages/agent-guard-core' 2>/dev/null || echo 'packages/agent-guard-core')"
+    elif [[ -f "${git_root}/bin/agent-guard-config" ]]; then
+        package_root="$(bash "${git_root}/bin/agent-guard-config" get paths.package_root '.' 2>/dev/null || echo '.')"
+    else
+        return 1
+    fi
     local config_bin="${git_root}/${package_root}/bin/agent-guard-config"
     if [[ ! -f "${config_bin}" ]]; then
         return 1
@@ -353,26 +361,60 @@ _ag_find_free_kimi_worktree() {
 
             [[ ! -d "${worktree}" ]] && continue
 
-            local is_free=true
-            if [[ -f "${session_file}" ]]; then
-                local status pid
-                status="$(${AG_PYTHON} -c "import json,sys; d=json.load(open('${session_file}')); print(d.get('status','free'))" 2>/dev/null || echo free)"
-                pid="$(${AG_PYTHON} -c "import json,sys; d=json.load(open('${session_file}')); print(d.get('pid',''))" 2>/dev/null || echo '')"
-                if [[ "${status}" == "active" && -n "${pid}" && -d "/proc/${pid}" ]]; then
-                    is_free=false
-                fi
-            fi
-
-            if [[ "${is_free}" == "true" ]] && _ag_worktree_is_dirty "${worktree}"; then
-                is_free=false
-            fi
-
-            if [[ "${is_free}" == "true" ]] && _ag_worktree_has_live_agent "${worktree}"; then
-                is_free=false
-            fi
-
-            if [[ "${is_free}" == "true" ]]; then
+            if _ag_kimi_slot_is_free "${identity}" "${session_file}" && \
+               ! _ag_worktree_is_dirty "${worktree}" && \
+               ! _ag_worktree_has_live_agent "${worktree}"; then
                 echo "${worktree}"
+                return 0
+            fi
+        done
+    done
+    return 1
+}
+
+# Check whether a kimi identity slot is free at the lease level, ignoring
+# worktree dirtiness. Used as a fallback when no existing worktree is clean
+# enough to reuse — in that case the init script will create a fresh worktree
+# for the free slot.
+_ag_kimi_slot_is_free() {
+    local identity="$1"
+    local session_file="$2"
+
+    if [[ ! -f "${session_file}" ]]; then
+        return 0
+    fi
+
+    local status pid
+    status="$(${AG_PYTHON} -c "import json,sys; d=json.load(open('${session_file}')); print(d.get('status','free'))" 2>/dev/null || echo free)"
+    pid="$(${AG_PYTHON} -c "import json,sys; d=json.load(open('${session_file}')); print(d.get('pid',''))" 2>/dev/null || echo '')"
+
+    if [[ "${status}" != "active" ]]; then
+        return 0
+    fi
+
+    if [[ -n "${pid}" && ! -d "/proc/${pid}" ]]; then
+        return 0
+    fi
+
+    return 1
+}
+
+# Return 0 if at least one kimi slot is free at the lease level, even if no
+# clean worktree exists to reuse.
+_ag_has_free_kimi_slot() {
+    local session_dir
+    session_dir="${_AG_MAIN_REPO}/$(bash "${_AG_CONFIG_BIN}" get paths.session_storage ".agent-guard/sessions")"
+    for prefix in ${_AG_KNOWN_IDENTITIES}; do
+        [[ "${prefix}" == "kimi" ]] || continue
+        local wt_prefix
+        wt_prefix="$(bash "${_AG_CONFIG_BIN}" get "identities.${prefix}.worktree_prefix" '' 2>/dev/null || true)"
+        [[ -z "${wt_prefix}" ]] && continue
+        local slots
+        slots="$(bash "${_AG_CONFIG_BIN}" get "identities.${prefix}.slots" '1' 2>/dev/null || echo '1')"
+        for n in $(seq 1 "${slots}"); do
+            local identity="${prefix}${n}"
+            local session_file="${session_dir}/${identity}.json"
+            if _ag_kimi_slot_is_free "${identity}" "${session_file}"; then
                 return 0
             fi
         done
@@ -389,13 +431,19 @@ if ! _ag_have_lease; then
 
     if [[ "${CWD}" == "${_AG_MAIN_REPO}" ]]; then
         _AG_FREE_WORKTREE="$(_ag_find_free_kimi_worktree 2>/dev/null || true)"
-        if [[ -z "${_AG_FREE_WORKTREE}" ]]; then
-            echo "❌ AG WRAPPER: no free kimi worktree available." >&2
+        if [[ -n "${_AG_FREE_WORKTREE}" ]]; then
+            # Reuse an existing clean worktree.
+            cd "${_AG_FREE_WORKTREE}" || exit 1
+            CWD="${_AG_FREE_WORKTREE}"
+        elif _ag_has_free_kimi_slot; then
+            # No clean worktree to reuse, but a slot is free at the lease level.
+            # Let the init script create a fresh worktree for it.
+            :
+        else
+            echo "❌ AG WRAPPER: no free kimi worktree or slot available." >&2
             echo "   Release an existing session with: source agent-guard release" >&2
             exit 1
         fi
-        cd "${_AG_FREE_WORKTREE}" || exit 1
-        CWD="${_AG_FREE_WORKTREE}"
     else
         if _ag_worktree_has_live_agent "${CWD}"; then
             echo "❌ AG WRAPPER: worktree '${CWD}' already has a live agent session." >&2
