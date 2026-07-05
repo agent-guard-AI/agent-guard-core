@@ -455,7 +455,20 @@ if ! _ag_have_lease; then
 
     ORIGINAL_ARGS=("$@")
     set --
-    if ! source "${_AG_INIT_SCRIPT}" >/tmp/ag-wrapper-lease.log 2>&1; then
+
+    # When the wrapper is installed as a replacement for a specific AI CLI
+    # binary (e.g. ~/.kimi-code/bin/kimi), derive the default identity from the
+    # wrapper filename so the init stub can allocate a slot automatically.
+    _AG_WRAPPER_IDENTITY="$(basename "${BASH_SOURCE[0]}")"
+    _AG_INIT_ARGS=()
+    if [[ -n "${_AG_WRAPPER_IDENTITY}" ]]; then
+        _AG_WRAPPER_PREFIX="${_AG_WRAPPER_IDENTITY%%[0-9]*}"
+        if echo " ${_AG_KNOWN_IDENTITIES} " | grep -q " ${_AG_WRAPPER_PREFIX} "; then
+            _AG_INIT_ARGS=("${_AG_WRAPPER_PREFIX}" "ia-a")
+        fi
+    fi
+
+    if ! source "${_AG_INIT_SCRIPT}" "${_AG_INIT_ARGS[@]}" >/tmp/ag-wrapper-lease.log 2>&1; then
         echo "❌ AG WRAPPER: failed to acquire agent lease." >&2
         echo "   Log: /tmp/ag-wrapper-lease.log" >&2
         cat /tmp/ag-wrapper-lease.log >&2
