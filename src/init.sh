@@ -408,7 +408,7 @@ _acquire_slot() {
         fi
     done
 
-    # Find a free slot
+    # Find a free slot whose worktree is not dirty (or does not exist yet).
     for i in $(seq 1 "${max_slots}"); do
         local identity="${prefix}${i}"
         local session_file
@@ -417,10 +417,26 @@ _acquire_slot() {
         if [[ -f "${session_file}" ]]; then
             current_status="$(_load_session_field "${identity}" "status")"
         fi
-        if [[ "${current_status}" != "active" ]]; then
-            selected_identity="${identity}"
-            break
+        if [[ "${current_status}" == "active" ]]; then
+            continue
         fi
+
+        # Skip slots whose existing worktree is dirty. The init script would
+        # reuse the worktree and fail later anyway; prefer a slot with no
+        # worktree or a clean one.
+        local worktree_prefix
+        worktree_prefix="$(_guard_get_str "identities.${prefix}.worktree_prefix")"
+        local worktree_path="${BASE_DIR}/${worktree_prefix}${i}"
+        if [[ -e "${worktree_path}/.git" ]]; then
+            local dirty_output
+            dirty_output="$(git -C "${worktree_path}" status --porcelain 2>/dev/null || true)"
+            if [[ -n "${dirty_output}" ]]; then
+                continue
+            fi
+        fi
+
+        selected_identity="${identity}"
+        break
     done
 
     _ag_flock_release "${lock_mode}"
