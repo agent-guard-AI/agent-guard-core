@@ -531,22 +531,24 @@ _anti_stale_check() {
     local worktree_path="$1"
     local current_branch
     current_branch="$(git -C "${worktree_path}" branch --show-current 2>/dev/null || echo "")"
-    if [[ -z "${current_branch}" || "${current_branch}" == "develop" ]]; then
+    local base_branch
+    base_branch="$(_guard_get_str "git.base_branch" "develop")"
+    if [[ -z "${current_branch}" || "${current_branch}" == "${base_branch}" ]]; then
         return 0
     fi
-    git -C "${worktree_path}" fetch origin develop >/dev/null 2>&1 || true
+    git -C "${worktree_path}" fetch origin "${base_branch}" >/dev/null 2>&1 || true
     local behind_count
-    behind_count="$(git -C "${worktree_path}" rev-list --count "HEAD..origin/develop" 2>/dev/null || echo "0")"
+    behind_count="$(git -C "${worktree_path}" rev-list --count "HEAD..origin/${base_branch}" 2>/dev/null || echo "0")"
     if [[ -n "${behind_count}" && "${behind_count}" -gt 10 ]]; then
         echo "" >&2
-        echo "⚠️⚠️⚠️  ALERT: BRANCH STALE (>10 commits behind origin/develop)  ⚠️⚠️⚠️" >&2
+        echo "⚠️⚠️⚠️  ALERT: BRANCH STALE (>10 commits behind origin/${base_branch})  ⚠️⚠️⚠️" >&2
         echo "" >&2
-        echo "   Branch '${current_branch}' is ${behind_count} commits behind origin/develop." >&2
+        echo "   Branch '${current_branch}' is ${behind_count} commits behind origin/${base_branch}." >&2
         echo "   Rule: rebase before continuing." >&2
         echo "" >&2
         echo "   Run:" >&2
         echo "     git fetch origin" >&2
-        echo "     git rebase origin/develop" >&2
+        echo "     git rebase origin/${base_branch}" >&2
         echo "     git push --force-with-lease" >&2
         echo "" >&2
     fi
@@ -795,12 +797,12 @@ _validate_worktree_release_ready() {
     fi
 
     local stash_count
-    stash_count="$(git -C "${worktree_path}" stash list 2>/dev/null | grep -c '^stash@{' || true)"
+    stash_count="$(git -C "${worktree_path}" stash list 2>/dev/null | grep -c "On ${current_branch}:" || true)"
     if [[ "${stash_count}" -gt 0 ]]; then
         echo "" >&2
-        echo "❌❌❌ ERROR: WORKTREE HAS STASHES ❌❌❌" >&2
+        echo "❌❌❌ ERROR: BRANCH HAS STASHES ❌❌❌" >&2
         echo "" >&2
-        git -C "${worktree_path}" stash list | sed 's/^/   /' >&2
+        git -C "${worktree_path}" stash list | grep "On ${current_branch}:" | sed 's/^/   /' >&2
         echo "" >&2
         echo "   Apply, drop, or move these stashes before releasing." >&2
         echo "   Stash is not a trash can — inspect with: git stash show -p stash@{<n>}" >&2
@@ -859,17 +861,21 @@ if [[ "${MODE}" == "release" ]]; then
     if command -v _journal_release >/dev/null 2>&1; then
         _journal_release
     fi
+    if command -v _journal_rotate >/dev/null 2>&1; then
+        _journal_rotate
+    fi
 
     # After releasing the lease, move the worktree to a neutral branch so
-    # that 'develop' is not held by an idle worktree. Git does not allow the
-    # same branch to be checked out in multiple worktrees; leaving 'develop'
-    # behind blocks other agents from releasing their sessions.
+    # that the configured base branch is not held by an idle worktree. Git does
+    # not allow the same branch to be checked out in multiple worktrees; leaving
+    # the base branch behind blocks other agents from releasing their sessions.
     NEUTRAL_BRANCH="_released/${CURRENT_IDENTITY}"
     BASE_REF=""
-    if git -C "${CURRENT_WORKTREE}" rev-parse --verify --quiet "origin/develop" >/dev/null 2>&1; then
-        BASE_REF="origin/develop"
-    elif git -C "${CURRENT_WORKTREE}" rev-parse --verify --quiet "develop" >/dev/null 2>&1; then
-        BASE_REF="develop"
+    RELEASE_BASE_BRANCH="$(_guard_get_str "git.base_branch" "develop")"
+    if git -C "${CURRENT_WORKTREE}" rev-parse --verify --quiet "origin/${RELEASE_BASE_BRANCH}" >/dev/null 2>&1; then
+        BASE_REF="origin/${RELEASE_BASE_BRANCH}"
+    elif git -C "${CURRENT_WORKTREE}" rev-parse --verify --quiet "${RELEASE_BASE_BRANCH}" >/dev/null 2>&1; then
+        BASE_REF="${RELEASE_BASE_BRANCH}"
     fi
 
     if [[ -n "${BASE_REF}" ]]; then
@@ -994,6 +1000,9 @@ if [[ "${MODE}" == "attach" ]]; then
     if command -v _journal_attach >/dev/null 2>&1; then
         _journal_attach "${ATTACH_BRANCH}"
     fi
+    if command -v _journal_rotate >/dev/null 2>&1; then
+        _journal_rotate
+    fi
 
     echo "🛡️  Agent Guard: attached to ${ATTACH_BRANCH}"
     echo "   Identity: ${IDENTITY_FROM_BRANCH}"
@@ -1075,6 +1084,9 @@ if [[ -n "${CURRENT_IDENTITY}" && -n "${CURRENT_BRANCH}" ]]; then
     if command -v _journal_init >/dev/null 2>&1; then
         _journal_init
     fi
+    if command -v _journal_rotate >/dev/null 2>&1; then
+        _journal_rotate
+    fi
 
     echo "✅ Git author set to ${GIT_AUTHOR_EMAIL}"
     return 0 2>/dev/null || exit 0
@@ -1151,6 +1163,9 @@ _save_session "${IDENTITY}" "active" "${ROLE}" "${BRANCH_NAME}" "$$" "${WORKTREE
 
     if command -v _journal_init >/dev/null 2>&1; then
         _journal_init
+    fi
+    if command -v _journal_rotate >/dev/null 2>&1; then
+        _journal_rotate
     fi
 
 # Soft-lock overlap warning

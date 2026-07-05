@@ -221,13 +221,20 @@ Adapters são thin wrappers que interceptam a chamada da ferramenta de IA e redi
 
 ### Wrapper Kimi (`wrappers/kimi/`)
 
-O wrapper `wrappers/kimi/wrapper.sh` substitui o binário `kimi` do Kimi Code CLI. Ele:
+O wrapper `wrappers/kimi/wrapper.sh` pode substituir o binário `kimi` do Kimi Code CLI para impor isolamento automaticamente. Ele:
 
 - Detecta automaticamente o repositório via `git rev-parse --show-toplevel`.
 - Lê `agent-guard.yaml` para descobrir caminhos, identidades e o binário real do Kimi.
 - Impede execução no repo principal e redireciona para um worktree livre.
 - Bloqueia worktrees sujos ou já em uso por outro processo.
-- Instalação:
+
+**Modo padrão (não-invasivo):** o instalador não substitui mais o binário global `kimi`. O isolamento pode ser ativado manualmente via init stub ou, para automação total, via wrapper invasivo.
+
+- Instalação do wrapper invasivo (opcional, requer `--install-wrapper`):
+  ```bash
+  bash /path/to/agent-guard-core/install.sh --target /path/to/your/repo --install-wrapper
+  ```
+- Instalação manual do wrapper:
   ```bash
   mv <bin_dir>/kimi <bin_dir>/kimi.real
   cp packages/agent-guard-core/wrappers/kimi/wrapper.sh <bin_dir>/kimi
@@ -236,6 +243,10 @@ O wrapper `wrappers/kimi/wrapper.sh` substitui o binário `kimi` do Kimi Code CL
 - Recuperação automática após updates do Kimi CLI:
   ```bash
   bash packages/agent-guard-core/wrappers/kimi/recovery.sh
+  ```
+- Remoção do wrapper invasivo e restauração do binário real:
+  ```bash
+  bash packages/agent-guard-core/wrappers/kimi/recovery.sh --remove-wrapper
   ```
 
 ## Testes

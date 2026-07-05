@@ -6,7 +6,7 @@
 # other event that replaces <bin_dir>/kimi with the real binary.
 #
 # Usage:
-#   bash /path/to/recovery.sh [--repo-root /path/to/repo]
+#   bash /path/to/recovery.sh [--repo-root /path/to/repo] [--remove-wrapper]
 #
 # The script:
 #   1. Checks whether <bin_dir>/kimi is still the wrapper.
@@ -14,10 +14,16 @@
 #   3. Copies the versioned wrapper to <bin_dir>/kimi.
 #   4. Ensures <bin_dir>/kimi.real points to the real binary.
 #
+# With --remove-wrapper:
+#   1. Backs up the current wrapper as kimi.wrapper.<timestamp>.
+#   2. Restores the real binary from kimi.real back to kimi.
+#   3. Leaves kimi.real in place for reference.
+#
 set -euo pipefail
 
-# Parse optional --repo-root.
+# Parse optional arguments.
 REPO_ROOT=""
+REMOVE_WRAPPER="false"
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --repo-root)
@@ -28,9 +34,13 @@ while [[ $# -gt 0 ]]; do
             REPO_ROOT="${1#*=}"
             shift
             ;;
+        --remove-wrapper)
+            REMOVE_WRAPPER="true"
+            shift
+            ;;
         *)
             echo "❌ Unknown argument: $1" >&2
-            echo "   Usage: $0 [--repo-root /path/to/repo]" >&2
+            echo "   Usage: $0 [--repo-root /path/to/repo] [--remove-wrapper]" >&2
             exit 1
             ;;
     esac
@@ -63,11 +73,6 @@ WRAPPER_SRC="${REPO_ROOT}/${PACKAGE_ROOT}/wrappers/kimi/wrapper.sh"
 KIMI_BIN="${KIMI_BIN_DIR}/kimi"
 KIMI_REAL="${KIMI_BIN_DIR}/kimi.real"
 
-if [[ ! -f "${WRAPPER_SRC}" ]]; then
-    echo "❌ Wrapper source not found: ${WRAPPER_SRC}" >&2
-    exit 1
-fi
-
 _is_wrapper() {
     local path="$1"
     [[ -f "${path}" ]] && head -n 5 "${path}" 2>/dev/null | grep -q "Agent Guard — Kimi CLI Wrapper"
@@ -77,6 +82,46 @@ _is_elf() {
     local path="$1"
     [[ -f "${path}" ]] && file "${path}" 2>/dev/null | grep -q "ELF"
 }
+
+if [[ ! -f "${WRAPPER_SRC}" ]]; then
+    echo "❌ Wrapper source not found: ${WRAPPER_SRC}" >&2
+    exit 1
+fi
+
+# ---------------------------------------------------------------------------
+# Remove invasive wrapper and restore real binary (non-invasive uninstall).
+# ---------------------------------------------------------------------------
+if [[ "${REMOVE_WRAPPER}" == "true" ]]; then
+    if ! _is_wrapper "${KIMI_BIN}"; then
+        echo "✅ ${KIMI_BIN} is not the Agent Guard wrapper. No removal needed."
+        exit 0
+    fi
+
+    echo "⚠️  Removing invasive Agent Guard wrapper from ${KIMI_BIN}..."
+
+    timestamp="$(date +%Y%m%d-%H%M%S)"
+    wrapper_backup="${KIMI_BIN_DIR}/kimi.wrapper.${timestamp}"
+    cp "${KIMI_BIN}" "${wrapper_backup}"
+    echo "💾 Backed up wrapper to ${wrapper_backup}"
+
+    if [[ ! -f "${KIMI_REAL}" ]]; then
+        echo "❌ Real Kimi binary not found at ${KIMI_REAL}." >&2
+        echo "   Cannot restore the original binary. Aborting removal." >&2
+        exit 1
+    fi
+
+    cp "${KIMI_REAL}" "${KIMI_BIN}"
+    chmod +x "${KIMI_BIN}"
+
+    if ! _is_wrapper "${KIMI_BIN}"; then
+        echo "✅ Invasive wrapper removed; ${KIMI_BIN} restored to real binary."
+        echo "   Wrapper backup: ${wrapper_backup}"
+        exit 0
+    else
+        echo "❌ Failed to remove wrapper at ${KIMI_BIN}" >&2
+        exit 1
+    fi
+fi
 
 # Nothing to do if already wrapper.
 if _is_wrapper "${KIMI_BIN}"; then
