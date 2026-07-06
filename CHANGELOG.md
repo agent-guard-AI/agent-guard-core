@@ -1,5 +1,17 @@
 # Changelog — agent-guard-core
 
+## Unreleased — Documentação de compatibilidade com Kimi (Moonshot AI)
+
+- `README.md`:
+  - Adicionado aviso de compatibilidade de wrappers no topo: o protocolo/hooks são genéricos, mas o único wrapper CLI oficial e testado é o do Kimi (Moonshot AI).
+  - Ajustada a descrição de múltiplos agentes para refletir que outros agentes só funcionam via init stub manual.
+  - Atualizada a seção "Adapters e wrappers" para deixar claro que apenas `wrappers/kimi/` existe.
+  - Exemplo de `agent-guard.yaml` no README agora comenta que outras identidades não têm wrapper implementado.
+- `agent-guard.yaml.example`:
+  - Adicionados comentários indicando que apenas Kimi possui wrapper CLI implementado.
+- `install.sh`:
+  - Documentação da flag `--install-wrapper` atualizada para mencionar explicitamente "Kimi by Moonshot AI".
+
 ## 0.5.4 — Wrapper não-invasivo, base_branch configurável e rotação automática de journal
 
 - `install.sh`:

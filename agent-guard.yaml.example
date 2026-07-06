@@ -15,11 +15,15 @@ paths:
   init_script: .agent-guard-init
 
 identities:
+  # Kimi by Moonshot AI: identidade com wrapper CLI oficial e testado.
   kimi:
     slots: 4
     worktree_prefix: myproject-ia-kimi
     author_email: agent-kimi{n}@example.dev
     author_name: MyProject Kimi{n} Agent
+  # Outras identidades abaixo são demonstrativas. O protocolo suporta multi-IA,
+  # mas nenhum wrapper CLI automático está implementado para elas. Use-as apenas
+  # com init stub manual.
   claude:
     slots: 2
     worktree_prefix: myproject-ia-claude
