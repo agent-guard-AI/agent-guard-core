@@ -14,7 +14,8 @@
 #   --init-name <name>    Name of the init stub at the repo root
 #                         (default: .agent-guard-init)
 #   --skip-hooks          Do not install Git hooks
-#   --install-wrapper     Install the invasive Kimi CLI wrapper (replaces ~/.kimi-code/bin/kimi)
+#   --install-wrapper     Install the invasive Kimi CLI wrapper for Kimi by Moonshot AI
+#                         (replaces ~/.kimi-code/bin/kimi)
 #   --skip-wrapper        Do not install the Kimi CLI wrapper (default: non-invasive launcher only)
 #   --yes                 Skip confirmation prompts
 

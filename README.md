@@ -2,7 +2,9 @@
 
 Protocolo open source de governança multi-IA para repositórios Git.
 
-Permite que múltiplos agentes de IA CLI — como Kimi, Claude, Gemini e Grok — colaborem no mesmo repositório sem colidir em branches, worktrees ou commits.
+Permite que múltiplos agentes de IA CLI colaborem no mesmo repositório sem colidir em branches, worktrees ou commits.
+
+> ⚠️ **Compatibilidade de wrappers:** o protocolo e os hooks são genéricos e podem ser estendidos para várias identidades, mas o **wrapper CLI oficial e testado é o do Kimi (Moonshot AI)**. Hoje, apenas `wrappers/kimi/` está implementado. Outros agentes (Claude, Gemini, Grok etc.) podem usar o protocolo via init stub manual, mas não há wrapper automático para eles.
 
 ## Por que usar
 
@@ -84,6 +86,8 @@ identities:
     worktree_prefix: "myproject-ia-kimi"
     author_email: "agent-kimi{n}@example.dev"
     author_name: "Kimi{n} Agent"
+  # Outras identidades podem ser declaradas para uso manual via init stub,
+  # mas nenhum wrapper CLI está implementado para elas.
   - name: claude
     slots: 2
     worktree_prefix: "myproject-ia-claude"
@@ -104,6 +108,7 @@ commit:
   generic_agent_email_template: agent@{domain}
 
 wrappers:
+  # Apenas o wrapper Kimi (Moonshot AI) está implementado.
   kimi:
     bin_dir: /home/user/.kimi-code/bin
     real_bin: kimi.real
@@ -217,11 +222,13 @@ O script rejeita commits de IA que não carreguem metadados de worktree ou cujo 
 
 ## Adapters e wrappers
 
-Adapters são thin wrappers que interceptam a chamada da ferramenta de IA e redirecionam para um worktree livre antes de delegar ao binário real. Veja exemplos em `adapters/`.
+Adapters são thin wrappers que interceptam a chamada da ferramenta de IA e redirecionam para um worktree livre antes de delegar ao binário real.
+
+> **Atenção:** nesta versão, o único adapter implementado e testado é o **wrapper do Kimi (Moonshot AI)** em `wrappers/kimi/`. Outras ferramentas de IA CLI não possuem wrapper automático e devem usar o init stub manualmente.
 
 ### Wrapper Kimi (`wrappers/kimi/`)
 
-O wrapper `wrappers/kimi/wrapper.sh` pode substituir o binário `kimi` do Kimi Code CLI para impor isolamento automaticamente. Ele:
+O wrapper `wrappers/kimi/wrapper.sh` substitui o binário `kimi` do Kimi Code CLI (Moonshot AI) para impor isolamento automaticamente. Ele:
 
 - Detecta automaticamente o repositório via `git rev-parse --show-toplevel`.
 - Lê `agent-guard.yaml` para descobrir caminhos, identidades e o binário real do Kimi.
