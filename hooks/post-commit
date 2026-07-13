@@ -29,8 +29,11 @@ IDENTITY=""
 IDENTITY_NAMES="$(bash "${AGENT_GUARD_BIN}" keys identities)"
 for name in ${IDENTITY_NAMES}; do
     prefix="$(bash "${AGENT_GUARD_BIN}" get "identities.${name}.worktree_prefix" '')"
-    if [[ -n "${prefix}" && "${WORKTREE_NAME}" =~ ^${prefix}[0-9]+$ ]]; then
-        IDENTITY="${name}${WORKTREE_NAME#${prefix}}"
+    # Support optional task suffix (e.g. hmvip-ia-kimi4-bling).
+    if [[ -n "${prefix}" && "${WORKTREE_NAME}" =~ ^${prefix}[0-9]+(-[a-z0-9-]+)?$ ]]; then
+        slot_and_suffix="${WORKTREE_NAME#${prefix}}"
+        # Strip any suffix from the slot number.
+        IDENTITY="${name}${slot_and_suffix%%-*}"
         break
     fi
 done

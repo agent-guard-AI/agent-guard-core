@@ -13,6 +13,7 @@
 # Usage:
 #   source ${AGENT_GUARD_INIT_NAME:-.agent-guard-init} [prefix] [role] [--impact plugin1,plugin2]
 #   source ${AGENT_GUARD_INIT_NAME:-.agent-guard-init} --attach ia-<identity>/<role>/<branch>
+#   source ${AGENT_GUARD_INIT_NAME:-.agent-guard-init} --adopt <identity>
 #   source ${AGENT_GUARD_INIT_NAME:-.agent-guard-init} --release
 #   source ${AGENT_GUARD_INIT_NAME:-.agent-guard-init} --status
 #   source ${AGENT_GUARD_INIT_NAME:-.agent-guard-init} --triage <prefix>
@@ -369,6 +370,34 @@ with open('${session_file}', 'w') as f:
 }
 
 # ---------------------------------------------------------------------------
+# Helper: resolve the PID that anchors this session's lease.
+#
+# `$$` is the right anchor when init is sourced in an interactive terminal
+# (the shell lives as long as the terminal) or in a long-lived wrapper that
+# execs into the agent CLI — wrappers pin it via AGENT_GUARD_SESSION_PID.
+# But agent CLIs (Kimi Code, etc.) source init from an ephemeral `bash -c`
+# subshell whose $$ dies as soon as the command ends; the lease then looks
+# stale and another session can steal the slot (slot race). In non-
+# interactive shells without an explicit pin, anchor the lease to the parent
+# process (the agent CLI), which lives for the whole session.
+# ---------------------------------------------------------------------------
+_ag_session_pid() {
+    if [[ -n "${AGENT_GUARD_SESSION_PID:-}" && "${AGENT_GUARD_SESSION_PID}" != "1" ]] && kill -0 "${AGENT_GUARD_SESSION_PID}" 2>/dev/null; then
+        echo "${AGENT_GUARD_SESSION_PID}"
+        return 0
+    fi
+    if [[ $- == *i* ]]; then
+        echo "$$"
+        return 0
+    fi
+    if [[ -n "${PPID:-}" && "${PPID}" != "1" ]] && kill -0 "${PPID}" 2>/dev/null; then
+        echo "${PPID}"
+        return 0
+    fi
+    echo "$$"
+}
+
+# ---------------------------------------------------------------------------
 # 4. Helper: atomic slot allocation
 # ---------------------------------------------------------------------------
 _acquire_slot() {
@@ -376,11 +405,19 @@ _acquire_slot() {
     local role="$2"
     local impact_plugins="$3"
 
-    local max_slots
-    max_slots="$(_guard_get "identities.${prefix}.slots" 2>/dev/null || echo "")"
-    if [[ -z "${max_slots}" || "${max_slots}" == "None" ]]; then
+    local initial_slots max_slots auto_expand
+    initial_slots="$(_guard_get "identities.${prefix}.slots" 2>/dev/null || echo "")"
+    if [[ -z "${initial_slots}" || "${initial_slots}" == "None" ]]; then
         echo "❌ Unknown prefix '${prefix}' or missing slots in agent-guard.yaml" >&2
         return 1
+    fi
+
+    # Optional dynamic expansion.  When auto_expand is true the guard may
+    # allocate slots beyond the configured initial count up to max_slots.
+    max_slots="$(_guard_get_str "identities.${prefix}.max_slots" "${initial_slots}")"
+    auto_expand="$(_guard_get_str "identities.${prefix}.auto_expand" "false")"
+    if [[ "${max_slots}" -lt "${initial_slots}" ]]; then
+        max_slots="${initial_slots}"
     fi
 
     local global_lock
@@ -391,58 +428,57 @@ _acquire_slot() {
     local lock_mode
     lock_mode="$(_ag_flock_acquire "${global_lock}")"
 
-    # Clean stale sessions while locked
-    for i in $(seq 1 "${max_slots}"); do
-        local identity="${prefix}${i}"
-        local session_file
+    # Helper: a slot is available when it is not held by a live process and,
+    # if its worktree already exists, that worktree is clean.  Dirty worktrees
+    # are not silently recycled; the user must release or clean them first.
+    _slot_is_free() {
+        local identity="$1"
+        local session_file worktree
         session_file="$(_get_session_file "${identity}")"
+        worktree="$(_get_worktree_path "${identity}")"
+
         if [[ -f "${session_file}" ]]; then
             local sess_status sess_pid
             sess_status="$(_load_session_field "${identity}" "status")"
             sess_pid="$(_load_session_field "${identity}" "pid")"
             if [[ "${sess_status}" == "active" ]]; then
-                if ! _is_pid_alive "${sess_pid}"; then
-                    _clear_session "${identity}"
+                if _is_pid_alive "${sess_pid}"; then
+                    return 1
                 fi
+                _clear_session "${identity}"
             fi
         fi
-    done
 
-    # Find a free slot whose worktree is not dirty (or does not exist yet).
+        if [[ -d "${worktree}" ]]; then
+            local dirty
+            dirty="$(git -C "${worktree}" status --porcelain 2>/dev/null || true)"
+            if [[ -n "${dirty}" ]]; then
+                return 1
+            fi
+        fi
+
+        return 0
+    }
+
+    # Clean stale sessions while locked and find the first free slot.
+    # We search up to max_slots so that pre-created expanded worktrees are
+    # reused before allocating a brand-new slot beyond the initial count.
     for i in $(seq 1 "${max_slots}"); do
         local identity="${prefix}${i}"
-        local session_file
-        session_file="$(_get_session_file "${identity}")"
-        local current_status="free"
-        if [[ -f "${session_file}" ]]; then
-            current_status="$(_load_session_field "${identity}" "status")"
+        if _slot_is_free "${identity}"; then
+            selected_identity="${identity}"
+            break
         fi
-        if [[ "${current_status}" == "active" ]]; then
-            continue
-        fi
-
-        # Skip slots whose existing worktree is dirty. The init script would
-        # reuse the worktree and fail later anyway; prefer a slot with no
-        # worktree or a clean one.
-        local worktree_prefix
-        worktree_prefix="$(_guard_get_str "identities.${prefix}.worktree_prefix")"
-        local worktree_path="${BASE_DIR}/${worktree_prefix}${i}"
-        if [[ -e "${worktree_path}/.git" ]]; then
-            local dirty_output
-            dirty_output="$(git -C "${worktree_path}" status --porcelain 2>/dev/null || true)"
-            if [[ -n "${dirty_output}" ]]; then
-                continue
-            fi
-        fi
-
-        selected_identity="${identity}"
-        break
     done
 
     _ag_flock_release "${lock_mode}"
 
     if [[ -z "${selected_identity}" ]]; then
-        echo "❌ No free slots available for '${prefix}' (all ${max_slots} in use)." >&2
+        if [[ "${auto_expand}" == "true" ]]; then
+            echo "❌ No free slots available for '${prefix}' (all ${max_slots} in use, auto_expand exhausted)." >&2
+        else
+            echo "❌ No free slots available for '${prefix}' (all ${initial_slots} in use). Enable auto_expand or release a session." >&2
+        fi
         return 1
     fi
 
@@ -547,24 +583,22 @@ _anti_stale_check() {
     local worktree_path="$1"
     local current_branch
     current_branch="$(git -C "${worktree_path}" branch --show-current 2>/dev/null || echo "")"
-    local base_branch
-    base_branch="$(_guard_get_str "git.base_branch" "develop")"
-    if [[ -z "${current_branch}" || "${current_branch}" == "${base_branch}" ]]; then
+    if [[ -z "${current_branch}" || "${current_branch}" == "develop" ]]; then
         return 0
     fi
-    git -C "${worktree_path}" fetch origin "${base_branch}" >/dev/null 2>&1 || true
+    git -C "${worktree_path}" fetch origin develop >/dev/null 2>&1 || true
     local behind_count
-    behind_count="$(git -C "${worktree_path}" rev-list --count "HEAD..origin/${base_branch}" 2>/dev/null || echo "0")"
+    behind_count="$(git -C "${worktree_path}" rev-list --count "HEAD..origin/develop" 2>/dev/null || echo "0")"
     if [[ -n "${behind_count}" && "${behind_count}" -gt 10 ]]; then
         echo "" >&2
-        echo "⚠️⚠️⚠️  ALERT: BRANCH STALE (>10 commits behind origin/${base_branch})  ⚠️⚠️⚠️" >&2
+        echo "⚠️⚠️⚠️  ALERT: BRANCH STALE (>10 commits behind origin/develop)  ⚠️⚠️⚠️" >&2
         echo "" >&2
-        echo "   Branch '${current_branch}' is ${behind_count} commits behind origin/${base_branch}." >&2
+        echo "   Branch '${current_branch}' is ${behind_count} commits behind origin/develop." >&2
         echo "   Rule: rebase before continuing." >&2
         echo "" >&2
         echo "   Run:" >&2
         echo "     git fetch origin" >&2
-        echo "     git rebase origin/${base_branch}" >&2
+        echo "     git rebase origin/develop" >&2
         echo "     git push --force-with-lease" >&2
         echo "" >&2
     fi
@@ -679,6 +713,7 @@ _create_or_reuse_worktree() {
 # 6. Parse arguments
 # ---------------------------------------------------------------------------
 ATTACH_BRANCH=""
+ADOPT_IDENTITY=""
 PREFIX=""
 ROLE=""
 IMPACT_PLUGINS=""
@@ -694,6 +729,16 @@ while [[ $# -gt 0 ]]; do
                 shift 2
             else
                 echo "❌ --attach requires a branch name." >&2
+                return 1 2>/dev/null || exit 1
+            fi
+            ;;
+        --adopt)
+            if [[ -n "${2:-}" ]]; then
+                ADOPT_IDENTITY="$2"
+                MODE="adopt"
+                shift 2
+            else
+                echo "❌ --adopt requires an identity (ex: kimi3)." >&2
                 return 1 2>/dev/null || exit 1
             fi
             ;;
@@ -765,6 +810,23 @@ _branch_is_current_agent_task() {
 }
 
 # ---------------------------------------------------------------------------
+# Helper: check whether the worktree is parked on its neutral post-release
+# branch (_released/<identity>). Release switches the worktree to this branch
+# at the end, so a second --release must be accepted as an idempotent no-op
+# instead of failing validation.
+# ---------------------------------------------------------------------------
+_branch_is_neutral_released() {
+    local worktree_path="$1"
+    local current_branch
+    current_branch="$(git -C "${worktree_path}" branch --show-current 2>/dev/null || echo "")"
+    local wt_name identity
+    wt_name="$(basename "${worktree_path}")"
+    identity="$(_detect_identity_from_worktree_name "${wt_name}" | awk '{print $1 $2}')"
+    [[ -n "${identity}" ]] || return 1
+    [[ "${current_branch}" == "_released/${identity}" ]]
+}
+
+# ---------------------------------------------------------------------------
 # Helper: validate worktree is in a neutral state before release
 # ---------------------------------------------------------------------------
 _validate_worktree_release_ready() {
@@ -782,13 +844,14 @@ _validate_worktree_release_ready() {
 
     local current_branch
     current_branch="$(git -C "${worktree_path}" branch --show-current 2>/dev/null || echo "")"
-    if [[ "${current_branch}" != "develop" ]] && ! _branch_is_current_agent_task "${worktree_path}"; then
+    if [[ "${current_branch}" != "develop" ]] && ! _branch_is_current_agent_task "${worktree_path}" && ! _branch_is_neutral_released "${worktree_path}"; then
         echo "" >&2
         echo "❌❌❌ ERROR: WORKTREE NOT RELEASABLE ❌❌❌" >&2
         echo "" >&2
         echo "   Current branch: ${current_branch:-<detached>}" >&2
         echo "   Release is only allowed when the worktree is on 'develop'," >&2
-        echo "   or on its own agent task branch (ia-<identity>/...)." >&2
+        echo "   on its own agent task branch (ia-<identity>/...), or on its" >&2
+        echo "   neutral '_released/<identity>' branch (release is idempotent)." >&2
         echo "" >&2
         echo "   Required actions before release:" >&2
         echo "     1. Commit or stash any unfinished work on your task branch." >&2
@@ -813,17 +876,39 @@ _validate_worktree_release_ready() {
     fi
 
     local stash_count
-    stash_count="$(git -C "${worktree_path}" stash list 2>/dev/null | grep -c "On ${current_branch}:" || true)"
+    # Stashes sao globais ao repo: so bloqueiam o release os que pertencem
+    # a ESTA identidade (criados em branch ia-<identity>/... ou na branch
+    # atual). Stash de outro agente vivo nao pode travar este slot
+    # (incidente 2026-07-12: stash do kimi2 bloqueou release de todos).
+    local wt_name identity
+    wt_name="$(basename "${worktree_path}")"
+    identity="$(_detect_identity_from_worktree_name "${wt_name}" | awk '{print $1 $2}')"
+    if [[ -n "${identity}" ]]; then
+        stash_count="$(git -C "${worktree_path}" stash list 2>/dev/null | grep -cE "^stash@\{[0-9]+\}: On (ia-${identity}/|${current_branch}:)" || true)"
+    else
+        stash_count="$(git -C "${worktree_path}" stash list 2>/dev/null | grep -c "On ${current_branch}:" || true)"
+    fi
     if [[ "${stash_count}" -gt 0 ]]; then
         echo "" >&2
-        echo "❌❌❌ ERROR: BRANCH HAS STASHES ❌❌❌" >&2
+        echo "❌❌❌ ERROR: WORKTREE HAS STASHES ❌❌❌" >&2
         echo "" >&2
-        git -C "${worktree_path}" stash list | grep "On ${current_branch}:" | sed 's/^/   /' >&2
+        if [[ -n "${identity}" ]]; then
+            git -C "${worktree_path}" stash list 2>/dev/null | grep -E "^stash@\{[0-9]+\}: On (ia-${identity}/|${current_branch}:)" | sed 's/^/   /' >&2
+        else
+            git -C "${worktree_path}" stash list 2>/dev/null | grep "On ${current_branch}:" | sed 's/^/   /' >&2
+        fi
         echo "" >&2
         echo "   Apply, drop, or move these stashes before releasing." >&2
         echo "   Stash is not a trash can — inspect with: git stash show -p stash@{<n>}" >&2
         echo "" >&2
         return 1
+    fi
+
+    # Aviso nao-bloqueante: stashes de OUTRAS identidades presentes no repo
+    local foreign_count
+    foreign_count="$(git -C "${worktree_path}" stash list 2>/dev/null | grep -c '^stash@{' || true)"
+    if [[ "${foreign_count}" -gt 0 ]]; then
+        echo "ℹ️  ${foreign_count} stash(es) de outra(s) identidade(s) no repo — nao bloqueiam este release." >&2
     fi
 
     return 0
@@ -877,21 +962,17 @@ if [[ "${MODE}" == "release" ]]; then
     if command -v _journal_release >/dev/null 2>&1; then
         _journal_release
     fi
-    if command -v _journal_rotate >/dev/null 2>&1; then
-        _journal_rotate
-    fi
 
     # After releasing the lease, move the worktree to a neutral branch so
-    # that the configured base branch is not held by an idle worktree. Git does
-    # not allow the same branch to be checked out in multiple worktrees; leaving
-    # the base branch behind blocks other agents from releasing their sessions.
+    # that 'develop' is not held by an idle worktree. Git does not allow the
+    # same branch to be checked out in multiple worktrees; leaving 'develop'
+    # behind blocks other agents from releasing their sessions.
     NEUTRAL_BRANCH="_released/${CURRENT_IDENTITY}"
     BASE_REF=""
-    RELEASE_BASE_BRANCH="$(_guard_get_str "git.base_branch" "develop")"
-    if git -C "${CURRENT_WORKTREE}" rev-parse --verify --quiet "origin/${RELEASE_BASE_BRANCH}" >/dev/null 2>&1; then
-        BASE_REF="origin/${RELEASE_BASE_BRANCH}"
-    elif git -C "${CURRENT_WORKTREE}" rev-parse --verify --quiet "${RELEASE_BASE_BRANCH}" >/dev/null 2>&1; then
-        BASE_REF="${RELEASE_BASE_BRANCH}"
+    if git -C "${CURRENT_WORKTREE}" rev-parse --verify --quiet "origin/develop" >/dev/null 2>&1; then
+        BASE_REF="origin/develop"
+    elif git -C "${CURRENT_WORKTREE}" rev-parse --verify --quiet "develop" >/dev/null 2>&1; then
+        BASE_REF="develop"
     fi
 
     if [[ -n "${BASE_REF}" ]]; then
@@ -1011,19 +1092,130 @@ if [[ "${MODE}" == "attach" ]]; then
     _session_audit "${WORKTREE_PATH}"
 
     impact_json="$(echo "${IMPACT_PLUGINS}" | ${AG_PYTHON} -c "import sys,json; print(json.dumps([p.strip() for p in sys.stdin.read().split(',') if p.strip()]))" 2>/dev/null || echo "[]")"
-    _save_session "${IDENTITY_FROM_BRANCH}" "active" "${ROLE}" "${ATTACH_BRANCH}" "$$" "${WORKTREE_PATH}" "${impact_json}"
+    _save_session "${IDENTITY_FROM_BRANCH}" "active" "${ROLE}" "${ATTACH_BRANCH}" "$(_ag_session_pid)" "${WORKTREE_PATH}" "${impact_json}"
 
     if command -v _journal_attach >/dev/null 2>&1; then
         _journal_attach "${ATTACH_BRANCH}"
-    fi
-    if command -v _journal_rotate >/dev/null 2>&1; then
-        _journal_rotate
     fi
 
     echo "🛡️  Agent Guard: attached to ${ATTACH_BRANCH}"
     echo "   Identity: ${IDENTITY_FROM_BRANCH}"
     echo "   Worktree: ${WORKTREE_PATH}"
     echo "✅ Git author set to ${GIT_AUTHOR_EMAIL}"
+    return 0 2>/dev/null || exit 0
+fi
+
+# ---------------------------------------------------------------------------
+# 10b. --adopt mode (assume an idle/dirty slot from a previous session)
+# ---------------------------------------------------------------------------
+# Use case: a new day starts and yesterday's slots are still dirty — the
+# normal acquire flow skips dirty worktrees, so the agent cannot resume the
+# work. Adopt explicitly takes over the slot of a DEAD session, without
+# deleting, stashing or committing anything. The agent inspects the state and
+# decides how to continue.
+#
+# Safety rails:
+#   - Refuses when the slot is held by a LIVE process.
+#   - Refuses when the worktree is on a branch of another identity
+#     (foreign work) or on a protected/neutral branch other than its own.
+#   - Never cleans the worktree: dirty files and stashes are only reported.
+if [[ "${MODE}" == "adopt" ]]; then
+    if [[ ! "${ADOPT_IDENTITY}" =~ ^([a-z]+)([0-9]+)$ ]]; then
+        echo "❌ --adopt identity must look like '<prefix><slot>' (ex: kimi3)." >&2
+        return 1 2>/dev/null || exit 1
+    fi
+    ADOPT_PREFIX="${BASH_REMATCH[1]}"
+
+    if [[ -z "$(bash "${AGENT_GUARD_CONFIG_BIN}" get "identities.${ADOPT_PREFIX}.slots" "" 2>/dev/null)" ]]; then
+        echo "❌ Unknown identity prefix '${ADOPT_PREFIX}'. Check agent-guard.yaml." >&2
+        return 1 2>/dev/null || exit 1
+    fi
+
+    WORKTREE_PATH="$(_get_worktree_path "${ADOPT_IDENTITY}")"
+    if [[ ! -e "${WORKTREE_PATH}/.git" ]]; then
+        echo "❌ Worktree for identity '${ADOPT_IDENTITY}' does not exist: ${WORKTREE_PATH}" >&2
+        echo "   Nothing to adopt — acquire a fresh session instead." >&2
+        return 1 2>/dev/null || exit 1
+    fi
+
+    # Refuse takeover of a live session.
+    adopt_sess_status="$(_load_session_field "${ADOPT_IDENTITY}" "status")"
+    adopt_sess_pid="$(_load_session_field "${ADOPT_IDENTITY}" "pid")"
+    if [[ "${adopt_sess_status}" == "active" && -n "${adopt_sess_pid}" && "${adopt_sess_pid}" != "$(_ag_session_pid)" ]]; then
+        if _is_pid_alive "${adopt_sess_pid}"; then
+            echo "" >&2
+            echo "❌❌❌ ERROR: SLOT STILL IN USE ❌❌❌" >&2
+            echo "" >&2
+            echo "   Identity '${ADOPT_IDENTITY}' is held by live PID ${adopt_sess_pid}." >&2
+            echo "   Adopt only works on slots whose previous session is dead." >&2
+            echo "" >&2
+            return 1 2>/dev/null || exit 1
+        fi
+        echo "🧹 Clearing stale session for ${ADOPT_IDENTITY} (PID ${adopt_sess_pid} is dead)." >&2
+        _clear_session "${ADOPT_IDENTITY}"
+    fi
+
+    cd "${WORKTREE_PATH}" || return 1 2>/dev/null || exit 1
+    git fetch origin >/dev/null 2>&1 || true
+
+    ADOPT_BRANCH="$(git branch --show-current 2>/dev/null || echo "")"
+    if [[ "${ADOPT_BRANCH}" != "ia-${ADOPT_IDENTITY}/"* && "${ADOPT_BRANCH}" != "_released/${ADOPT_IDENTITY}" ]]; then
+        echo "" >&2
+        echo "❌❌❌ ERROR: FOREIGN OR PROTECTED BRANCH ❌❌❌" >&2
+        echo "" >&2
+        echo "   Worktree ${WORKTREE_PATH} is on branch '${ADOPT_BRANCH:-<detached>}'." >&2
+        echo "   Adopt only resumes this identity's own branches:" >&2
+        echo "     ia-${ADOPT_IDENTITY}/... or _released/${ADOPT_IDENTITY}" >&2
+        echo "" >&2
+        echo "   If this is another agent's work, STOP and ask the user." >&2
+        echo "" >&2
+        return 1 2>/dev/null || exit 1
+    fi
+
+    echo ""
+    echo "=========================================================="
+    echo "🛡️  Agent Guard: ADOPTING slot ${ADOPT_IDENTITY}"
+    echo "=========================================================="
+    echo "   Worktree: ${WORKTREE_PATH}"
+    echo "   Branch:   ${ADOPT_BRANCH}"
+
+    DIRTY_FILES="$(git status --porcelain 2>/dev/null || true)"
+    if [[ -n "${DIRTY_FILES}" ]]; then
+        echo ""
+        echo "⚠️⚠️⚠️  UNCOMMITTED WORK FROM PREVIOUS SESSION  ⚠️⚠️⚠️"
+        echo ""
+        echo "${DIRTY_FILES}" | sed 's/^/   /'
+        echo ""
+        echo "   Nothing was touched. Inspect before continuing:"
+        echo "     git status && git diff"
+        echo "   Decide: commit as WIP/checkpoint on this branch, or ask the user."
+    fi
+
+    ADOPT_STASHES="$(git stash list 2>/dev/null || true)"
+    if [[ -n "${ADOPT_STASHES}" ]]; then
+        echo ""
+        echo "⚠️  Stashes present:"
+        echo "${ADOPT_STASHES}" | sed 's/^/   /'
+        echo "   Inspect with: git stash show -p stash@{<n>}"
+    fi
+    echo ""
+
+    _set_git_author "${ADOPT_IDENTITY}" "${WORKTREE_PATH}"
+    _export_session_env "${WORKTREE_PATH}" "${ADOPT_BRANCH}" "${IMPACT_PLUGINS}"
+
+    _configure_hooks_path "${WORKTREE_PATH}"
+    _anti_stale_check "${WORKTREE_PATH}"
+
+    impact_json="$(echo "${IMPACT_PLUGINS}" | ${AG_PYTHON} -c "import sys,json; print(json.dumps([p.strip() for p in sys.stdin.read().split(',') if p.strip()]))" 2>/dev/null || echo "[]")"
+    _save_session "${ADOPT_IDENTITY}" "active" "${ROLE}" "${ADOPT_BRANCH}" "$(_ag_session_pid)" "${WORKTREE_PATH}" "${impact_json}"
+
+    if command -v _journal_adopt >/dev/null 2>&1; then
+        _journal_adopt "${ADOPT_BRANCH}"
+    fi
+
+    echo "✅ Git author set to ${GIT_AUTHOR_EMAIL}"
+    echo "✅ Session active on ${ADOPT_IDENTITY} — resumed from previous state."
+    echo ""
     return 0 2>/dev/null || exit 0
 fi
 
@@ -1058,7 +1250,7 @@ if [[ -n "${CURRENT_IDENTITY}" && -n "${CURRENT_BRANCH}" ]]; then
     # its process is still alive, or when the wrapper races between sessions.
     existing_pid="$(_load_session_field "${CURRENT_IDENTITY}" "pid")"
     existing_status="$(_load_session_field "${CURRENT_IDENTITY}" "status")"
-    if [[ "${existing_status}" == "active" && -n "${existing_pid}" && "${existing_pid}" != "$$" ]]; then
+    if [[ "${existing_status}" == "active" && -n "${existing_pid}" && "${existing_pid}" != "$(_ag_session_pid)" ]]; then
         if _is_pid_alive "${existing_pid}"; then
             echo ""
             echo "❌❌❌ ERROR: WORKTREE ALREADY IN USE ❌❌❌" >&2
@@ -1095,13 +1287,10 @@ if [[ -n "${CURRENT_IDENTITY}" && -n "${CURRENT_BRANCH}" ]]; then
     _session_audit "${CURRENT_WORKTREE}"
 
     impact_json="$(echo "${IMPACT_PLUGINS}" | ${AG_PYTHON} -c "import sys,json; print(json.dumps([p.strip() for p in sys.stdin.read().split(',') if p.strip()]))" 2>/dev/null || echo "[]")"
-    _save_session "${CURRENT_IDENTITY}" "active" "${ROLE}" "${CURRENT_BRANCH}" "$$" "${CURRENT_WORKTREE}" "${impact_json}"
+    _save_session "${CURRENT_IDENTITY}" "active" "${ROLE}" "${CURRENT_BRANCH}" "$(_ag_session_pid)" "${CURRENT_WORKTREE}" "${impact_json}"
 
     if command -v _journal_init >/dev/null 2>&1; then
         _journal_init
-    fi
-    if command -v _journal_rotate >/dev/null 2>&1; then
-        _journal_rotate
     fi
 
     echo "✅ Git author set to ${GIT_AUTHOR_EMAIL}"
@@ -1174,14 +1363,11 @@ _set_git_author "${IDENTITY}" "${WORKTREE_PATH}"
 _export_session_env "${WORKTREE_PATH}" "${BRANCH_NAME}" "${IMPACT_PLUGINS}"
 
 impact_json="$(echo "${IMPACT_PLUGINS}" | ${AG_PYTHON} -c "import sys,json; print(json.dumps([p.strip() for p in sys.stdin.read().split(',') if p.strip()]))" 2>/dev/null || echo "[]")"
-_save_session "${IDENTITY}" "active" "${ROLE}" "${BRANCH_NAME}" "$$" "${WORKTREE_PATH}" "${impact_json}"
+_save_session "${IDENTITY}" "active" "${ROLE}" "${BRANCH_NAME}" "$(_ag_session_pid)" "${WORKTREE_PATH}" "${impact_json}"
 
 
     if command -v _journal_init >/dev/null 2>&1; then
         _journal_init
-    fi
-    if command -v _journal_rotate >/dev/null 2>&1; then
-        _journal_rotate
     fi
 
 # Soft-lock overlap warning

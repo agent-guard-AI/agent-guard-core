@@ -174,6 +174,11 @@ _journal_attach() {
     _journal_write_event "attach" "{\"branch\":\"${branch}\"}"
 }
 
+_journal_adopt() {
+    local branch="${1:-}"
+    _journal_write_event "adopt" "{\"branch\":\"${branch}\"}"
+}
+
 _journal_release() {
     _journal_write_event "release" "{\"message\":\"session released\"}"
 }

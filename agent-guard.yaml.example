@@ -15,27 +15,31 @@ paths:
   init_script: .agent-guard-init
 
 identities:
-  # Kimi by Moonshot AI: identidade com wrapper CLI oficial e testado.
   kimi:
     slots: 4
+    max_slots: 12
+    auto_expand: true
     worktree_prefix: myproject-ia-kimi
     author_email: agent-kimi{n}@example.dev
     author_name: MyProject Kimi{n} Agent
-  # Outras identidades abaixo são demonstrativas. O protocolo suporta multi-IA,
-  # mas nenhum wrapper CLI automático está implementado para elas. Use-as apenas
-  # com init stub manual.
   claude:
     slots: 2
+    max_slots: 8
+    auto_expand: true
     worktree_prefix: myproject-ia-claude
     author_email: agent-claude{n}@example.dev
     author_name: MyProject Claude{n} Agent
   gemini:
     slots: 2
+    max_slots: 8
+    auto_expand: true
     worktree_prefix: myproject-ia-gemini
     author_email: agent-gemini{n}@example.dev
     author_name: MyProject Gemini{n} Agent
   grok:
     slots: 2
+    max_slots: 8
+    auto_expand: true
     worktree_prefix: myproject-ia-grok
     author_email: agent-grok{n}@example.dev
     author_name: MyProject Grok{n} Agent
@@ -65,3 +69,4 @@ wrappers:
   kimi:
     bin_dir: /home/user/.kimi-code/bin
     real_bin: kimi.real
+    default_role: ia-a

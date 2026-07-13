@@ -54,6 +54,12 @@ fi
 # ---------------------------------------------------------------------------
 CWD="$(pwd -P 2>/dev/null || pwd)"
 
+# Pin the lease anchor PID to this wrapper process: the init script is
+# sourced below (non-interactive shell) and this same PID survives the final
+# `exec` into kimi.real, so the lease stays bound to the agent process
+# instead of the wrapper's parent shell (see _ag_session_pid in init.sh).
+export AGENT_GUARD_SESSION_PID="$$"
+
 # Resolve a usable Python interpreter cross-platform.
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 AG_PYTHON="$(bash "${SCRIPT_DIR}/bin/agent-guard-python" 2>/dev/null || echo "python3")"
@@ -98,15 +104,7 @@ _ag_load_config() {
     fi
 
     local package_root
-    # Support both nested installations (packages/agent-guard-core) and
-    # standalone repositories where Agent Guard lives at the repo root.
-    if [[ -f "${git_root}/packages/agent-guard-core/bin/agent-guard-config" ]]; then
-        package_root="$(bash "${git_root}/packages/agent-guard-core/bin/agent-guard-config" get paths.package_root 'packages/agent-guard-core' 2>/dev/null || echo 'packages/agent-guard-core')"
-    elif [[ -f "${git_root}/bin/agent-guard-config" ]]; then
-        package_root="$(bash "${git_root}/bin/agent-guard-config" get paths.package_root '.' 2>/dev/null || echo '.')"
-    else
-        return 1
-    fi
+    package_root="$(bash "${git_root}/packages/agent-guard-core/bin/agent-guard-config" get paths.package_root 'packages/agent-guard-core' 2>/dev/null || echo 'packages/agent-guard-core')"
     local config_bin="${git_root}/${package_root}/bin/agent-guard-config"
     if [[ ! -f "${config_bin}" ]]; then
         return 1
@@ -344,6 +342,91 @@ _ag_worktree_has_live_agent() {
     [[ -n "${pids}" ]]
 }
 
+# Return the most recent resumable worktree for a given identity prefix.
+# Reads the Agent Guard journal and, for the newest init/attach event whose
+# identity matches ${prefix}<number>, checks whether the recorded worktree is
+# available and not held by another live agent process. This enables "sticky
+# sessions": restarting Kimi from the main repository returns to the last
+# active worktree instead of allocating the first free slot.
+_ag_find_resumable_worktree() {
+    local prefix="$1"
+    local journal_path
+    journal_path="${_AG_MAIN_REPO}/$(bash "${_AG_CONFIG_BIN}" get journal.path ".agent-guard/journal/agent-guard.jsonl" 2>/dev/null || echo ".agent-guard/journal/agent-guard.jsonl")"
+    [[ ! -f "${journal_path}" ]] && return 1
+
+    local session_dir
+    session_dir="${_AG_MAIN_REPO}/$(bash "${_AG_CONFIG_BIN}" get paths.session_storage ".agent-guard/sessions")"
+
+    ${AG_PYTHON} - "${journal_path}" "${prefix}" "${session_dir}" <<'PY'
+import json, sys, os, re, subprocess
+journal_path, prefix, session_dir = sys.argv[1:4]
+identity_re = re.compile(rf'^{re.escape(prefix)}\\d+$')
+
+events = []
+with open(journal_path, 'r', encoding='utf-8') as f:
+    for line in f:
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            e = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if e.get('action') not in ('init', 'attach'):
+            continue
+        ident = e.get('identity', '')
+        if not identity_re.match(ident):
+            continue
+        events.append(e)
+
+# Most recent first.
+events.reverse()
+
+for e in events:
+    worktree = e.get('worktree', '')
+    branch = e.get('branch', '')
+    identity = e.get('identity', '')
+
+    if not worktree or not branch or not os.path.isdir(worktree):
+        continue
+    if not os.path.isdir(os.path.join(worktree, '.git')) and \
+       not os.path.isfile(os.path.join(worktree, '.git')):
+        continue
+
+    # Verify the branch still exists locally.
+    ref_check = os.path.join(worktree, '.git')
+    try:
+        with open(os.devnull, 'w') as devnull:
+            rc = subprocess.call(
+                ['git', '-C', worktree, 'show-ref', '--verify', '--quiet', f'refs/heads/{branch}'],
+                stdout=devnull, stderr=devnull
+            )
+        if rc != 0:
+            continue
+    except Exception:
+        continue
+
+    # If a session file exists and points to a live PID, the session is still
+    # held by a running process and must not be hijacked.
+    session_file = os.path.join(session_dir, f'{identity}.json')
+    if os.path.isfile(session_file):
+        try:
+            with open(session_file) as f:
+                data = json.load(f)
+            if data.get('status') == 'active':
+                pid = data.get('pid')
+                if pid and os.path.isdir(f'/proc/{pid}'):
+                    continue
+        except Exception:
+            pass
+
+    print(worktree)
+    sys.exit(0)
+
+sys.exit(1)
+PY
+}
+
 _ag_find_free_kimi_worktree() {
     local session_dir
     session_dir="${_AG_MAIN_REPO}/$(bash "${_AG_CONFIG_BIN}" get paths.session_storage ".agent-guard/sessions")"
@@ -352,69 +435,42 @@ _ag_find_free_kimi_worktree() {
         local wt_prefix
         wt_prefix="$(bash "${_AG_CONFIG_BIN}" get "identities.${prefix}.worktree_prefix" '' 2>/dev/null || true)"
         [[ -z "${wt_prefix}" ]] && continue
-        local slots
-        slots="$(bash "${_AG_CONFIG_BIN}" get "identities.${prefix}.slots" '1' 2>/dev/null || echo '1')"
-        for n in $(seq 1 "${slots}"); do
+
+        # Respect optional dynamic slot expansion configured in agent-guard.yaml.
+        local initial_slots max_slots
+        initial_slots="$(bash "${_AG_CONFIG_BIN}" get "identities.${prefix}.slots" '1' 2>/dev/null || echo '1')"
+        max_slots="$(bash "${_AG_CONFIG_BIN}" get "identities.${prefix}.max_slots" "${initial_slots}" 2>/dev/null || echo "${initial_slots}")"
+        [[ "${max_slots}" -lt "${initial_slots}" ]] && max_slots="${initial_slots}"
+
+        for n in $(seq 1 "${max_slots}"); do
             local identity="${prefix}${n}"
             local worktree="${_AG_BASE_DIR}/${wt_prefix}${n}"
             local session_file="${session_dir}/${identity}.json"
 
+            # The wrapper does not create missing worktrees here; creation is
+            # delegated to the init script when expansion is required.
             [[ ! -d "${worktree}" ]] && continue
 
-            if _ag_kimi_slot_is_free "${identity}" "${session_file}" && \
-               ! _ag_worktree_is_dirty "${worktree}" && \
-               ! _ag_worktree_has_live_agent "${worktree}"; then
-                echo "${worktree}"
-                return 0
+            local is_free=true
+            if [[ -f "${session_file}" ]]; then
+                local status pid
+                status="$(${AG_PYTHON} -c "import json,sys; d=json.load(open('${session_file}')); print(d.get('status','free'))" 2>/dev/null || echo free)"
+                pid="$(${AG_PYTHON} -c "import json,sys; d=json.load(open('${session_file}')); print(d.get('pid',''))" 2>/dev/null || echo '')"
+                if [[ "${status}" == "active" && -n "${pid}" && -d "/proc/${pid}" ]]; then
+                    is_free=false
+                fi
             fi
-        done
-    done
-    return 1
-}
 
-# Check whether a kimi identity slot is free at the lease level, ignoring
-# worktree dirtiness. Used as a fallback when no existing worktree is clean
-# enough to reuse — in that case the init script will create a fresh worktree
-# for the free slot.
-_ag_kimi_slot_is_free() {
-    local identity="$1"
-    local session_file="$2"
+            if [[ "${is_free}" == "true" ]] && _ag_worktree_is_dirty "${worktree}"; then
+                is_free=false
+            fi
 
-    if [[ ! -f "${session_file}" ]]; then
-        return 0
-    fi
+            if [[ "${is_free}" == "true" ]] && _ag_worktree_has_live_agent "${worktree}"; then
+                is_free=false
+            fi
 
-    local status pid
-    status="$(${AG_PYTHON} -c "import json,sys; d=json.load(open('${session_file}')); print(d.get('status','free'))" 2>/dev/null || echo free)"
-    pid="$(${AG_PYTHON} -c "import json,sys; d=json.load(open('${session_file}')); print(d.get('pid',''))" 2>/dev/null || echo '')"
-
-    if [[ "${status}" != "active" ]]; then
-        return 0
-    fi
-
-    if [[ -n "${pid}" && ! -d "/proc/${pid}" ]]; then
-        return 0
-    fi
-
-    return 1
-}
-
-# Return 0 if at least one kimi slot is free at the lease level, even if no
-# clean worktree exists to reuse.
-_ag_has_free_kimi_slot() {
-    local session_dir
-    session_dir="${_AG_MAIN_REPO}/$(bash "${_AG_CONFIG_BIN}" get paths.session_storage ".agent-guard/sessions")"
-    for prefix in ${_AG_KNOWN_IDENTITIES}; do
-        [[ "${prefix}" == "kimi" ]] || continue
-        local wt_prefix
-        wt_prefix="$(bash "${_AG_CONFIG_BIN}" get "identities.${prefix}.worktree_prefix" '' 2>/dev/null || true)"
-        [[ -z "${wt_prefix}" ]] && continue
-        local slots
-        slots="$(bash "${_AG_CONFIG_BIN}" get "identities.${prefix}.slots" '1' 2>/dev/null || echo '1')"
-        for n in $(seq 1 "${slots}"); do
-            local identity="${prefix}${n}"
-            local session_file="${session_dir}/${identity}.json"
-            if _ag_kimi_slot_is_free "${identity}" "${session_file}"; then
+            if [[ "${is_free}" == "true" ]]; then
+                echo "${worktree}"
                 return 0
             fi
         done
@@ -429,20 +485,38 @@ if ! _ag_have_lease; then
         exit 1
     fi
 
+    _AG_SKIP_INIT="false"
+
     if [[ "${CWD}" == "${_AG_MAIN_REPO}" ]]; then
-        _AG_FREE_WORKTREE="$(_ag_find_free_kimi_worktree 2>/dev/null || true)"
-        if [[ -n "${_AG_FREE_WORKTREE}" ]]; then
-            # Reuse an existing clean worktree.
-            cd "${_AG_FREE_WORKTREE}" || exit 1
-            CWD="${_AG_FREE_WORKTREE}"
-        elif _ag_has_free_kimi_slot; then
-            # No clean worktree to reuse, but a slot is free at the lease level.
-            # Let the init script create a fresh worktree for it.
-            :
+        # Try to resume the most recent active session before allocating a new slot.
+        _AG_RESUMABLE_WORKTREE="$(_ag_find_resumable_worktree "kimi" 2>/dev/null || true)"
+        if [[ -n "${_AG_RESUMABLE_WORKTREE}" ]]; then
+            echo "🔄 AG WRAPPER: resuming last active session at ${_AG_RESUMABLE_WORKTREE}" >&2
+            cd "${_AG_RESUMABLE_WORKTREE}" || exit 1
+            CWD="${_AG_RESUMABLE_WORKTREE}"
         else
-            echo "❌ AG WRAPPER: no free kimi worktree or slot available." >&2
-            echo "   Release an existing session with: source agent-guard release" >&2
-            exit 1
+            _AG_FREE_WORKTREE="$(_ag_find_free_kimi_worktree 2>/dev/null || true)"
+            if [[ -n "${_AG_FREE_WORKTREE}" ]]; then
+                cd "${_AG_FREE_WORKTREE}" || exit 1
+                CWD="${_AG_FREE_WORKTREE}"
+            else
+                # No existing worktree is free.  Ask the init script to allocate
+                # a new slot, which will expand beyond the configured initial
+                # slots when auto_expand is enabled.
+                default_role="$(bash "${_AG_CONFIG_BIN}" get "wrappers.kimi.default_role" "ia-a" 2>/dev/null || echo "ia-a")"
+                echo "🔄 AG WRAPPER: no free worktree available; allocating new slot..." >&2
+                ORIGINAL_ARGS=("$@")
+                set --
+                if ! source "${_AG_INIT_SCRIPT}" kimi "${default_role}" >/tmp/ag-wrapper-lease.log 2>&1; then
+                    echo "❌ AG WRAPPER: failed to acquire agent lease." >&2
+                    echo "   Log: /tmp/ag-wrapper-lease.log" >&2
+                    cat /tmp/ag-wrapper-lease.log >&2
+                    exit 1
+                fi
+                set -- "${ORIGINAL_ARGS[@]}"
+                CWD="$(pwd)"
+                _AG_SKIP_INIT="true"
+            fi
         fi
     else
         if _ag_worktree_has_live_agent "${CWD}"; then
@@ -453,28 +527,17 @@ if ! _ag_have_lease; then
         fi
     fi
 
-    ORIGINAL_ARGS=("$@")
-    set --
-
-    # When the wrapper is installed as a replacement for a specific AI CLI
-    # binary (e.g. ~/.kimi-code/bin/kimi), derive the default identity from the
-    # wrapper filename so the init stub can allocate a slot automatically.
-    _AG_WRAPPER_IDENTITY="$(basename "${BASH_SOURCE[0]}")"
-    _AG_INIT_ARGS=()
-    if [[ -n "${_AG_WRAPPER_IDENTITY}" ]]; then
-        _AG_WRAPPER_PREFIX="${_AG_WRAPPER_IDENTITY%%[0-9]*}"
-        if echo " ${_AG_KNOWN_IDENTITIES} " | grep -q " ${_AG_WRAPPER_PREFIX} "; then
-            _AG_INIT_ARGS=("${_AG_WRAPPER_PREFIX}" "ia-a")
+    if [[ "${_AG_SKIP_INIT}" != "true" ]]; then
+        ORIGINAL_ARGS=("$@")
+        set --
+        if ! source "${_AG_INIT_SCRIPT}" >/tmp/ag-wrapper-lease.log 2>&1; then
+            echo "❌ AG WRAPPER: failed to acquire agent lease." >&2
+            echo "   Log: /tmp/ag-wrapper-lease.log" >&2
+            cat /tmp/ag-wrapper-lease.log >&2
+            exit 1
         fi
+        set -- "${ORIGINAL_ARGS[@]}"
     fi
-
-    if ! source "${_AG_INIT_SCRIPT}" "${_AG_INIT_ARGS[@]}" >/tmp/ag-wrapper-lease.log 2>&1; then
-        echo "❌ AG WRAPPER: failed to acquire agent lease." >&2
-        echo "   Log: /tmp/ag-wrapper-lease.log" >&2
-        cat /tmp/ag-wrapper-lease.log >&2
-        exit 1
-    fi
-    set -- "${ORIGINAL_ARGS[@]}"
 
     # In reuse mode the init script exports the configured identity variable
     # (and legacy AGENT_GUARD_IDENTITY alias for older projects).
