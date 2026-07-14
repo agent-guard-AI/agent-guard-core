@@ -380,6 +380,27 @@ _load_session_field() {
     fi
 }
 
+# Update a single field in the session file without rewriting the whole record.
+# Used by --status and post-checkout to reconcile branch drift.
+_save_session_field() {
+    local identity="$1"
+    local field="$2"
+    local value="$3"
+    local session_file
+    session_file="$(_get_session_file "${identity}")"
+    [[ -f "${session_file}" ]] || return 1
+
+    ${AG_PYTHON} -c "
+import json
+with open('${session_file}') as f:
+    d = json.load(f)
+d['${field}'] = '${value}'
+d['timestamp'] = __import__('time').time()
+with open('${session_file}', 'w') as f:
+    json.dump(d, f, indent=2)
+" >/dev/null 2>&1
+}
+
 _save_session() {
     local identity="$1"
     local status="$2"
@@ -1129,6 +1150,19 @@ if [[ "${MODE}" == "status" ]]; then
             if [[ "${status}" == "active" && -n "${pid}" ]]; then
                 if _is_pid_alive "${pid}"; then
                     pid_alive=" (live)"
+                    # Reconcile session branch with the actual worktree branch.
+                    # A live session may have checked out a different branch
+                    # (e.g. after creating a new PR branch), leaving the session
+                    # file stale. Status must reflect reality to avoid misleading
+                    # other agents about whether the slot is released/neutral.
+                    if [[ -e "${worktree_path}/.git" ]]; then
+                        actual_branch="$(git -C "${worktree_path}" branch --show-current 2>/dev/null || true)"
+                        if [[ -n "${actual_branch}" && "${actual_branch}" != "${branch}" ]]; then
+                            if _save_session_field "${identity}" "branch" "${actual_branch}"; then
+                                branch="${actual_branch}"
+                            fi
+                        fi
+                    fi
                 else
                     pid_alive=" (dead)"
                 fi
