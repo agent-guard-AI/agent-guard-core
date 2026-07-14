@@ -316,33 +316,60 @@ _ag_worktree_has_live_agent() {
     local worktree="$1"
     local own_pid="$$"
 
-    # Primary scan via /proc: reliable on Linux and catches processes renamed
-    # via exec -a (test fakes) by inspecting argv[0] in /proc/PID/cmdline.
+    # Build the set of known agent PIDs by inspecting comm/cmdline.  Processes
+    # renamed via exec -a are caught by argv[0] in /proc/PID/cmdline.
+    local agent_pids=""
     local pid
+    for pid in /proc/[0-9]*; do
+        [[ -d "${pid}" ]] || continue
+        local pid_num="${pid#/proc/}"
+        local comm cmdline_argv0
+        comm="$(cat "${pid}/comm" 2>/dev/null || true)"
+        cmdline_argv0="$(tr '\0' '\n' < "${pid}/cmdline" 2>/dev/null | head -n1 || true)"
+        case "${comm}|${cmdline_argv0}" in
+            *kimi-code*|*claude*|*gemini*|*grok*|*cursor*|*antigravity*|*kiro*|*kimi*)
+                agent_pids="${agent_pids} ${pid_num}"
+                ;;
+        esac
+    done
+
+    # For every process whose cwd is the worktree, walk the ancestor chain
+    # looking for a known agent.  This catches child processes such as MCP
+    # servers spawned via "npm exec" or "node" whose own names do not contain
+    # the agent identifier.
     for pid in /proc/[0-9]*; do
         [[ -d "${pid}" ]] || continue
         local pid_num="${pid#/proc/}"
         [[ "${pid_num}" == "${own_pid}" ]] && continue
         local cwd_link
         cwd_link="$(readlink "${pid}/cwd" 2>/dev/null || true)"
-        if [[ "${cwd_link}" == "${worktree}" ]]; then
-            local comm cmdline_argv0
-            comm="$(cat "${pid}/comm" 2>/dev/null || true)"
-            cmdline_argv0="$(tr '\0' '\n' < "${pid}/cmdline" 2>/dev/null | head -n1 || true)"
-            case "${comm}|${cmdline_argv0}" in
-                *kimi-code*|*claude*|*gemini*|*grok*|*cursor*|*antigravity*|*kiro*|*kimi*)
-                    return 0
-                    ;;
-            esac
-        fi
-    done
+        [[ "${cwd_link}" != "${worktree}" ]] && continue
 
-    # Fallback scan via lsof for environments where /proc is restricted.
-    if command -v lsof >/dev/null 2>&1; then
-        local pids
-        pids="$(lsof +D "${worktree}" 2>/dev/null | awk '$1 ~ /^(kimi-code|claude|gemini|grok|cursor|antigravity|kiro|kimi)$/ {print $2}' | sort -u | grep -v "^${own_pid}$" || true)"
-        [[ -n "${pids}" ]] && return 0
-    fi
+        # Collect this process's ancestor chain.
+        local current_pid="${pid_num}"
+        local ancestors=""
+        local visited=""
+        while [[ -n "${current_pid}" && "${current_pid}" != "1" ]]; do
+            if [[ "${visited}" =~ (^|[[:space:]])${current_pid}([[:space:]]|$) ]]; then
+                break
+            fi
+            visited="${visited} ${current_pid}"
+            ancestors="${ancestors} ${current_pid}"
+            current_pid="$(grep '^PPid:' "/proc/${current_pid}/status" 2>/dev/null | awk '{print $2}' || true)"
+        done
+
+        # Ignore our own subprocesses that happen to visit the worktree.
+        if [[ "${ancestors}" =~ (^|[[:space:]])${own_pid}([[:space:]]|$) ]]; then
+            continue
+        fi
+
+        # Any known agent ancestor means another session holds the worktree.
+        for apid in ${agent_pids}; do
+            if [[ "${ancestors}" =~ (^|[[:space:]])${apid}([[:space:]]|$) ]]; then
+                return 0
+            fi
+        done
+    done
 
     return 1
 }
@@ -374,18 +401,17 @@ identity_re = re.compile(rf'^{re.escape(prefix)}\\d+$')
 AGENT_NAMES = {'kimi-code', 'claude', 'gemini', 'grok', 'cursor', 'antigravity', 'kiro', 'kimi'}
 
 def worktree_has_live_agent(worktree, own_pid):
-    """Return True if an agent process (other than own_pid) holds worktree."""
+    """Return True if an agent process (other than own_pid) holds worktree.
+
+    Detection walks the ancestor chain of every process whose cwd is the
+    worktree. This catches not only the main agent binary but also child
+    processes such as MCP servers spawned via npm exec or node.
+    """
     try:
+        # Build the set of known agent PIDs.
+        agent_pids = set()
         for entry in os.listdir('/proc'):
             if not entry.isdigit():
-                continue
-            if entry == own_pid:
-                continue
-            try:
-                cwd = os.readlink(f'/proc/{entry}/cwd')
-            except (OSError, FileNotFoundError):
-                continue
-            if cwd != worktree:
                 continue
             names = set()
             try:
@@ -401,6 +427,42 @@ def worktree_has_live_agent(worktree, own_pid):
             except (OSError, FileNotFoundError):
                 pass
             if names & AGENT_NAMES:
+                agent_pids.add(entry)
+
+        # For every process in the worktree, collect its ancestor chain. If our
+        # own PID is in the chain, it is just our own subprocess visiting the
+        # worktree (e.g. a test); ignore it. Any known agent ancestor means the
+        # worktree is held by another live session.
+        for entry in os.listdir('/proc'):
+            if not entry.isdigit() or entry == str(own_pid):
+                continue
+            try:
+                cwd = os.readlink(f'/proc/{entry}/cwd')
+            except (OSError, FileNotFoundError):
+                continue
+            if cwd != worktree:
+                continue
+
+            current = entry
+            visited = set()
+            ancestors = []
+            while current and current != '1' and current not in visited:
+                visited.add(current)
+                ancestors.append(current)
+                try:
+                    with open(f'/proc/{current}/status') as f:
+                        for line in f:
+                            if line.startswith('PPid:'):
+                                current = line.split()[1]
+                                break
+                        else:
+                            break
+                except (OSError, FileNotFoundError):
+                    break
+
+            if str(own_pid) in ancestors:
+                continue
+            if agent_pids.intersection(ancestors):
                 return True
     except Exception:
         pass

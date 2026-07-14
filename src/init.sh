@@ -299,30 +299,71 @@ _is_pid_alive() {
 # Return 0 if the worktree currently hosts a live agent process other than
 # the current session PID. Used in reuse mode to detect slot collapse when
 # the lease file is missing or stale.
+#
+# Detection walks the ancestor chain of every process whose cwd is the worktree.
+# This catches not only the main agent binary (kimi-code, claude, etc.) but also
+# child processes such as MCP servers spawned via "npm exec" or "node" that have
+# a generic name but are descendants of the agent session.
 _worktree_has_other_live_agent() {
     local worktree_path="$1"
     local own_pid
     own_pid="$(_ag_session_pid)"
 
+    # Build the set of known agent PIDs by inspecting comm/cmdline.
+    local agent_pids=""
     local pid
+    for pid in /proc/[0-9]*; do
+        [[ -d "${pid}" ]] || continue
+        local pid_num="${pid#/proc/}"
+        local comm cmdline_argv0
+        comm="$(cat "${pid}/comm" 2>/dev/null || true)"
+        cmdline_argv0="$(tr '\0' '\n' < "${pid}/cmdline" 2>/dev/null | head -n1 || true)"
+        case "${comm}|${cmdline_argv0}" in
+            *kimi-code*|*claude*|*gemini*|*grok*|*cursor*|*antigravity*|*kiro*|*kimi*)
+                agent_pids="${agent_pids} ${pid_num}"
+                ;;
+        esac
+    done
+
+    # For every process in the worktree, walk up the process tree looking for a
+    # known agent ancestor. This detects MCP child processes (npm exec, node,
+    # playwright-mcp, context7-mcp, etc.) whose own names do not contain the
+    # agent identifier.
     for pid in /proc/[0-9]*; do
         [[ -d "${pid}" ]] || continue
         local pid_num="${pid#/proc/}"
         [[ "${pid_num}" == "${own_pid}" ]] && continue
         local cwd_link
         cwd_link="$(readlink "${pid}/cwd" 2>/dev/null || true)"
-        if [[ "${cwd_link}" == "${worktree_path}" ]]; then
-            # /proc/PID/comm shows the executable name; argv[0] (cmdline)
-            # catches processes renamed via exec -a (test fakes).
-            local comm cmdline_argv0
-            comm="$(cat "${pid}/comm" 2>/dev/null || true)"
-            cmdline_argv0="$(tr '\0' '\n' < "${pid}/cmdline" 2>/dev/null | head -n1 || true)"
-            case "${comm}|${cmdline_argv0}" in
-                *kimi-code*|*claude*|*gemini*|*grok*|*cursor*|*antigravity*|*kiro*|*kimi*)
-                    return 0
-                    ;;
-            esac
+        [[ "${cwd_link}" != "${worktree_path}" ]] && continue
+
+        # Collect this process's ancestor chain.
+        local current_pid="${pid_num}"
+        local ancestors=""
+        local visited=""
+        while [[ -n "${current_pid}" && "${current_pid}" != "1" ]]; do
+            # Avoid infinite loops in malformed /proc entries.
+            if [[ "${visited}" =~ (^|[[:space:]])${current_pid}([[:space:]]|$) ]]; then
+                break
+            fi
+            visited="${visited} ${current_pid}"
+            ancestors="${ancestors} ${current_pid}"
+            current_pid="$(grep '^PPid:' "/proc/${current_pid}/status" 2>/dev/null | awk '{print $2}' || true)"
+        done
+
+        # If our own session is in the ancestor chain, this process is just our
+        # own subprocess visiting the worktree (e.g. a test or build). Ignore it.
+        if [[ "${ancestors}" =~ (^|[[:space:]])${own_pid}([[:space:]]|$) ]]; then
+            continue
         fi
+
+        # If any known agent is in the ancestor chain, the worktree is held by
+        # another live session.
+        for apid in ${agent_pids}; do
+            if [[ "${ancestors}" =~ (^|[[:space:]])${apid}([[:space:]]|$) ]]; then
+                return 0
+            fi
+        done
     done
     return 1
 }
