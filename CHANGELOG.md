@@ -1,5 +1,26 @@
 # Changelog — agent-guard-core
 
+## 0.8.0 — Posse de worktree por lease: hooks bloqueiam processos fora da sessão dona (L186)
+
+- `hooks/lease-owner-check.sh` (novo): validação de posse ancorada no session
+  file (`<repo-principal>/.kiro/locks/agent-sessions/<identidade>.json`). Se
+  existe lease `active` com PID vivo cujo `worktree_path` é o worktree atual,
+  somente processos descendentes desse PID podem escrever (caminhada de
+  PPID). Lease morto, ausente ou de outro worktree → permitido (recovery/adopt).
+  Bypass manual documentado: `HMVIP_AGENT_GUARD_BYPASS=1`. Override de teste:
+  `AGENT_GUARD_SESSION_DIR`.
+- `hooks/pre-commit` e `hooks/pre-push`: chamam `lease_owner_check <identidade>`
+  após a validação de identidade/prefixo — o gap era que qualquer processo
+  dentro de um worktree configurado (user.email repo-wide) podia criar branch
+  `ia-*` e commitar/pushar sem lease, mesmo com a sessão dona viva (L186:
+  ator sem init criou branch, commitou e mergeou PR no worktree do kimi1).
+- `hooks/pre-checkout`: chama `lease_owner_check ""` (modo qualquer-identidade)
+  antes de trocar/criar branch — o `checkout -b` com working tree limpa era o
+  ponto de entrada do invasor.
+- `tests/agent-guard/lease-owner-check-test.sh` (novo, no repo hospedeiro):
+  10 casos — ausente/ancestral/não-ancestral/morto/outro-worktree/inativo/
+  sem-file/modo-checkout/bypass. Roda no job `agent-guard-validation` do CI.
+
 ## 0.7.2 — Lease ancorado no processo da sessão (fim da corrida de slots via CLI)
 
 - `src/init.sh`:
