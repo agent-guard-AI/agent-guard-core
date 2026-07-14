@@ -48,7 +48,7 @@ HOOKS_DST="${REPO_ROOT}/.githooks"
 
 mkdir -p "${HOOKS_DST}"
 
-for hook in post-commit pre-push pre-commit pre-checkout commit-msg; do
+for hook in post-commit pre-push pre-commit pre-checkout commit-msg post-checkout; do
     src="${HOOKS_SRC}/${hook}"
     dst="${HOOKS_DST}/${hook}"
     if [[ ! -f "${src}" ]]; then

@@ -33,8 +33,16 @@ _get_domain() {
 
 BRANCH="$(git branch --show-current)"
 
-AUTHOR_IDENT="$(git var GIT_AUTHOR_IDENT)"
-AUTHOR_EMAIL="$(echo "${AUTHOR_IDENT}" | sed -n 's/.*<\(.*\)>.*/\1/p')"
+# Prefer the worktree's own user.email/user.name. This prevents a stale
+# GIT_AUTHOR_* environment variable (inherited from a previously leased slot
+# in the same Kimi CLI process) from spoofing the agent identity during push.
+AUTHOR_EMAIL="$(git config --worktree user.email 2>/dev/null || git config user.email 2>/dev/null || echo "")"
+AUTHOR_NAME="$(git config --worktree user.name 2>/dev/null || git config user.name 2>/dev/null || echo "")"
+if [[ -z "${AUTHOR_EMAIL}" || -z "${AUTHOR_NAME}" ]]; then
+    AUTHOR_IDENT="$(git var GIT_AUTHOR_IDENT)"
+    AUTHOR_EMAIL="$(echo "${AUTHOR_IDENT}" | sed -n 's/.*<\(.*\)>.*/\1/p')"
+    AUTHOR_NAME="$(echo "${AUTHOR_IDENT}" | sed -n 's/^\(.*\) <.*/\1/p')"
+fi
 
 DOMAIN="$(_get_domain)"
 PROTECTED_BRANCHES="$(_get_config git.protected_branches 'main master develop')"
@@ -105,6 +113,15 @@ if [[ -n "${IDENTITY}" ]]; then
         echo "You may only push branches under 'ia-${IDENTITY}/'."
         echo ""
         exit 1
+    fi
+
+    # Posse do lease: com lease vivo neste worktree, só processos descendentes
+    # da sessão dona podem fazer push (incidente L186).
+    HOOK_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+    if [[ -f "${HOOK_DIR}/lease-owner-check.sh" ]]; then
+        # shellcheck source=lease-owner-check.sh
+        source "${HOOK_DIR}/lease-owner-check.sh"
+        lease_owner_check "${IDENTITY}" || exit 1
     fi
 
     # Anti-stale check against configured base branch.

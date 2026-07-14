@@ -54,6 +54,12 @@ fi
 # ---------------------------------------------------------------------------
 CWD="$(pwd -P 2>/dev/null || pwd)"
 
+# Pin the lease anchor PID to this wrapper process: the init script is
+# sourced below (non-interactive shell) and this same PID survives the final
+# `exec` into kimi.real, so the lease stays bound to the agent process
+# instead of the wrapper's parent shell (see _ag_session_pid in init.sh).
+export AGENT_GUARD_SESSION_PID="$$"
+
 # Resolve a usable Python interpreter cross-platform.
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 AG_PYTHON="$(bash "${SCRIPT_DIR}/bin/agent-guard-python" 2>/dev/null || echo "python3")"
@@ -310,30 +316,228 @@ _ag_worktree_has_live_agent() {
     local worktree="$1"
     local own_pid="$$"
 
-    if ! command -v lsof >/dev/null 2>&1; then
-        local pid
-        for pid in /proc/[0-9]*; do
-            [[ -d "${pid}" ]] || continue
-            local pid_num="${pid#/proc/}"
-            [[ "${pid_num}" == "${own_pid}" ]] && continue
-            local cwd_link
-            cwd_link="$(readlink "${pid}/cwd" 2>/dev/null || true)"
-            if [[ "${cwd_link}" == "${worktree}" ]]; then
-                local comm
-                comm="$(cat "${pid}/comm" 2>/dev/null || true)"
-                case "${comm}" in
-                    kimi-code|claude|gemini|grok|cursor|antigravity|kiro)
-                        return 0
-                        ;;
-                esac
+    # Build the set of known agent PIDs by inspecting comm/cmdline.  Processes
+    # renamed via exec -a are caught by argv[0] in /proc/PID/cmdline.
+    local agent_pids=""
+    local pid
+    for pid in /proc/[0-9]*; do
+        [[ -d "${pid}" ]] || continue
+        local pid_num="${pid#/proc/}"
+        local comm cmdline_argv0
+        comm="$(cat "${pid}/comm" 2>/dev/null || true)"
+        cmdline_argv0="$(tr '\0' '\n' < "${pid}/cmdline" 2>/dev/null | head -n1 || true)"
+        case "${comm}|${cmdline_argv0}" in
+            *kimi-code*|*claude*|*gemini*|*grok*|*cursor*|*antigravity*|*kiro*|*kimi*)
+                agent_pids="${agent_pids} ${pid_num}"
+                ;;
+        esac
+    done
+
+    # For every process whose cwd is the worktree, walk the ancestor chain
+    # looking for a known agent.  This catches child processes such as MCP
+    # servers spawned via "npm exec" or "node" whose own names do not contain
+    # the agent identifier.
+    for pid in /proc/[0-9]*; do
+        [[ -d "${pid}" ]] || continue
+        local pid_num="${pid#/proc/}"
+        [[ "${pid_num}" == "${own_pid}" ]] && continue
+        local cwd_link
+        cwd_link="$(readlink "${pid}/cwd" 2>/dev/null || true)"
+        [[ "${cwd_link}" != "${worktree}" ]] && continue
+
+        # Collect this process's ancestor chain.
+        local current_pid="${pid_num}"
+        local ancestors=""
+        local visited=""
+        while [[ -n "${current_pid}" && "${current_pid}" != "1" ]]; do
+            if [[ "${visited}" =~ (^|[[:space:]])${current_pid}([[:space:]]|$) ]]; then
+                break
+            fi
+            visited="${visited} ${current_pid}"
+            ancestors="${ancestors} ${current_pid}"
+            current_pid="$(grep '^PPid:' "/proc/${current_pid}/status" 2>/dev/null | awk '{print $2}' || true)"
+        done
+
+        # Ignore our own subprocesses that happen to visit the worktree.
+        if [[ "${ancestors}" =~ (^|[[:space:]])${own_pid}([[:space:]]|$) ]]; then
+            continue
+        fi
+
+        # Any known agent ancestor means another session holds the worktree.
+        for apid in ${agent_pids}; do
+            if [[ "${ancestors}" =~ (^|[[:space:]])${apid}([[:space:]]|$) ]]; then
+                return 0
             fi
         done
-        return 1
-    fi
+    done
 
-    local pids
-    pids="$(lsof +D "${worktree}" 2>/dev/null | awk '$1 ~ /^(kimi-code|claude|gemini|grok|cursor|antigravity|kiro)$/ {print $2}' | sort -u | grep -v "^${own_pid}$" || true)"
-    [[ -n "${pids}" ]]
+    return 1
+}
+
+# Return the most recent resumable worktree for a given identity prefix.
+# Reads the Agent Guard journal and, for the newest init/attach event whose
+# identity matches ${prefix}<number>, checks whether the recorded worktree is
+# available and not held by another live agent process. This enables "sticky
+# sessions": restarting Kimi from the main repository returns to the last
+# active worktree instead of allocating the first free slot.
+_ag_find_resumable_worktree() {
+    local prefix="$1"
+    local journal_path
+    journal_path="${_AG_MAIN_REPO}/$(bash "${_AG_CONFIG_BIN}" get journal.path ".agent-guard/journal/agent-guard.jsonl" 2>/dev/null || echo ".agent-guard/journal/agent-guard.jsonl")"
+    [[ ! -f "${journal_path}" ]] && return 1
+
+    local session_dir
+    session_dir="${_AG_MAIN_REPO}/$(bash "${_AG_CONFIG_BIN}" get paths.session_storage ".agent-guard/sessions")"
+
+    # Own PID is used to exclude the current wrapper process from the live-agent
+    # scan; otherwise a resuming session would see itself as an intruder.
+    local own_pid="$$"
+
+    ${AG_PYTHON} - "${journal_path}" "${prefix}" "${session_dir}" "${own_pid}" <<'PY'
+import json, sys, os, re, subprocess
+journal_path, prefix, session_dir, own_pid = sys.argv[1:5]
+own_pid = str(own_pid)
+identity_re = re.compile(rf'^{re.escape(prefix)}\\d+$')
+AGENT_NAMES = {'kimi-code', 'claude', 'gemini', 'grok', 'cursor', 'antigravity', 'kiro', 'kimi'}
+
+def worktree_has_live_agent(worktree, own_pid):
+    """Return True if an agent process (other than own_pid) holds worktree.
+
+    Detection walks the ancestor chain of every process whose cwd is the
+    worktree. This catches not only the main agent binary but also child
+    processes such as MCP servers spawned via npm exec or node.
+    """
+    try:
+        # Build the set of known agent PIDs.
+        agent_pids = set()
+        for entry in os.listdir('/proc'):
+            if not entry.isdigit():
+                continue
+            names = set()
+            try:
+                with open(f'/proc/{entry}/comm', 'r') as f:
+                    names.add(f.read().strip())
+            except (OSError, FileNotFoundError):
+                pass
+            try:
+                with open(f'/proc/{entry}/cmdline', 'rb') as f:
+                    argv0 = f.read().split(b'\0', 1)[0].decode('utf-8', 'replace')
+                    if argv0:
+                        names.add(argv0)
+            except (OSError, FileNotFoundError):
+                pass
+            if names & AGENT_NAMES:
+                agent_pids.add(entry)
+
+        # For every process in the worktree, collect its ancestor chain. If our
+        # own PID is in the chain, it is just our own subprocess visiting the
+        # worktree (e.g. a test); ignore it. Any known agent ancestor means the
+        # worktree is held by another live session.
+        for entry in os.listdir('/proc'):
+            if not entry.isdigit() or entry == str(own_pid):
+                continue
+            try:
+                cwd = os.readlink(f'/proc/{entry}/cwd')
+            except (OSError, FileNotFoundError):
+                continue
+            if cwd != worktree:
+                continue
+
+            current = entry
+            visited = set()
+            ancestors = []
+            while current and current != '1' and current not in visited:
+                visited.add(current)
+                ancestors.append(current)
+                try:
+                    with open(f'/proc/{current}/status') as f:
+                        for line in f:
+                            if line.startswith('PPid:'):
+                                current = line.split()[1]
+                                break
+                        else:
+                            break
+                except (OSError, FileNotFoundError):
+                    break
+
+            if str(own_pid) in ancestors:
+                continue
+            if agent_pids.intersection(ancestors):
+                return True
+    except Exception:
+        pass
+    return False
+
+events = []
+with open(journal_path, 'r', encoding='utf-8') as f:
+    for line in f:
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            e = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if e.get('action') not in ('init', 'attach'):
+            continue
+        ident = e.get('identity', '')
+        if not identity_re.match(ident):
+            continue
+        events.append(e)
+
+# Most recent first.
+events.reverse()
+
+for e in events:
+    worktree = e.get('worktree', '')
+    branch = e.get('branch', '')
+    identity = e.get('identity', '')
+
+    if not worktree or not branch or not os.path.isdir(worktree):
+        continue
+    # Never resume a worktree parked on its neutral post-release branch.
+    if branch.startswith('_released/'):
+        continue
+    if not os.path.isdir(os.path.join(worktree, '.git')) and \
+       not os.path.isfile(os.path.join(worktree, '.git')):
+        continue
+
+    # Verify the branch still exists locally.
+    try:
+        with open(os.devnull, 'w') as devnull:
+            rc = subprocess.call(
+                ['git', '-C', worktree, 'show-ref', '--verify', '--quiet', f'refs/heads/{branch}'],
+                stdout=devnull, stderr=devnull
+            )
+        if rc != 0:
+            continue
+    except Exception:
+        continue
+
+    # If a session file exists and points to a live PID, the session is still
+    # held by a running process and must not be hijacked.
+    session_file = os.path.join(session_dir, f'{identity}.json')
+    if os.path.isfile(session_file):
+        try:
+            with open(session_file) as f:
+                data = json.load(f)
+            if data.get('status') == 'active':
+                pid = data.get('pid')
+                if pid and os.path.isdir(f'/proc/{pid}'):
+                    continue
+        except Exception:
+            pass
+
+    # Even when the session file is missing or stale, refuse to resume a
+    # worktree that currently hosts another live agent process.
+    if worktree_has_live_agent(worktree, own_pid):
+        continue
+
+    print(worktree)
+    sys.exit(0)
+
+sys.exit(1)
+PY
 }
 
 _ag_find_free_kimi_worktree() {
@@ -344,17 +548,34 @@ _ag_find_free_kimi_worktree() {
         local wt_prefix
         wt_prefix="$(bash "${_AG_CONFIG_BIN}" get "identities.${prefix}.worktree_prefix" '' 2>/dev/null || true)"
         [[ -z "${wt_prefix}" ]] && continue
-        local slots
-        slots="$(bash "${_AG_CONFIG_BIN}" get "identities.${prefix}.slots" '1' 2>/dev/null || echo '1')"
-        for n in $(seq 1 "${slots}"); do
+
+        # Respect optional dynamic slot expansion configured in agent-guard.yaml.
+        local initial_slots max_slots
+        initial_slots="$(bash "${_AG_CONFIG_BIN}" get "identities.${prefix}.slots" '1' 2>/dev/null || echo '1')"
+        max_slots="$(bash "${_AG_CONFIG_BIN}" get "identities.${prefix}.max_slots" "${initial_slots}" 2>/dev/null || echo "${initial_slots}")"
+        [[ "${max_slots}" -lt "${initial_slots}" ]] && max_slots="${initial_slots}"
+
+        for n in $(seq 1 "${max_slots}"); do
             local identity="${prefix}${n}"
             local worktree="${_AG_BASE_DIR}/${wt_prefix}${n}"
             local session_file="${session_dir}/${identity}.json"
 
+            # The wrapper does not create missing worktrees here; creation is
+            # delegated to the init script when expansion is required.
             [[ ! -d "${worktree}" ]] && continue
 
             local is_free=true
-            if [[ -f "${session_file}" ]]; then
+            local current_branch
+            current_branch="$(git -C "${worktree}" branch --show-current 2>/dev/null || true)"
+
+            # A worktree parked on its neutral _released/<identity> branch must not
+            # be selected as "free" for automatic reuse. It is in cooldown/post-release
+            # state and should only be reacquired through explicit allocation.
+            if [[ "${current_branch}" == "_released/${identity}" ]]; then
+                is_free=false
+            fi
+
+            if [[ "${is_free}" == "true" && -f "${session_file}" ]]; then
                 local status pid
                 status="$(${AG_PYTHON} -c "import json,sys; d=json.load(open('${session_file}')); print(d.get('status','free'))" 2>/dev/null || echo free)"
                 pid="$(${AG_PYTHON} -c "import json,sys; d=json.load(open('${session_file}')); print(d.get('pid',''))" 2>/dev/null || echo '')"
@@ -387,15 +608,39 @@ if ! _ag_have_lease; then
         exit 1
     fi
 
+    _AG_SKIP_INIT="false"
+
     if [[ "${CWD}" == "${_AG_MAIN_REPO}" ]]; then
-        _AG_FREE_WORKTREE="$(_ag_find_free_kimi_worktree 2>/dev/null || true)"
-        if [[ -z "${_AG_FREE_WORKTREE}" ]]; then
-            echo "❌ AG WRAPPER: no free kimi worktree available." >&2
-            echo "   Release an existing session with: source agent-guard release" >&2
-            exit 1
+        # Try to resume the most recent active session before allocating a new slot.
+        _AG_RESUMABLE_WORKTREE="$(_ag_find_resumable_worktree "kimi" 2>/dev/null || true)"
+        if [[ -n "${_AG_RESUMABLE_WORKTREE}" ]]; then
+            echo "🔄 AG WRAPPER: resuming last active session at ${_AG_RESUMABLE_WORKTREE}" >&2
+            cd "${_AG_RESUMABLE_WORKTREE}" || exit 1
+            CWD="${_AG_RESUMABLE_WORKTREE}"
+        else
+            _AG_FREE_WORKTREE="$(_ag_find_free_kimi_worktree 2>/dev/null || true)"
+            if [[ -n "${_AG_FREE_WORKTREE}" ]]; then
+                cd "${_AG_FREE_WORKTREE}" || exit 1
+                CWD="${_AG_FREE_WORKTREE}"
+            else
+                # No existing worktree is free.  Ask the init script to allocate
+                # a new slot, which will expand beyond the configured initial
+                # slots when auto_expand is enabled.
+                default_role="$(bash "${_AG_CONFIG_BIN}" get "wrappers.kimi.default_role" "ia-a" 2>/dev/null || echo "ia-a")"
+                echo "🔄 AG WRAPPER: no free worktree available; allocating new slot..." >&2
+                ORIGINAL_ARGS=("$@")
+                set --
+                if ! source "${_AG_INIT_SCRIPT}" kimi "${default_role}" >/tmp/ag-wrapper-lease.log 2>&1; then
+                    echo "❌ AG WRAPPER: failed to acquire agent lease." >&2
+                    echo "   Log: /tmp/ag-wrapper-lease.log" >&2
+                    cat /tmp/ag-wrapper-lease.log >&2
+                    exit 1
+                fi
+                set -- "${ORIGINAL_ARGS[@]}"
+                CWD="$(pwd)"
+                _AG_SKIP_INIT="true"
+            fi
         fi
-        cd "${_AG_FREE_WORKTREE}" || exit 1
-        CWD="${_AG_FREE_WORKTREE}"
     else
         if _ag_worktree_has_live_agent "${CWD}"; then
             echo "❌ AG WRAPPER: worktree '${CWD}' already has a live agent session." >&2
@@ -405,15 +650,17 @@ if ! _ag_have_lease; then
         fi
     fi
 
-    ORIGINAL_ARGS=("$@")
-    set --
-    if ! source "${_AG_INIT_SCRIPT}" >/tmp/ag-wrapper-lease.log 2>&1; then
-        echo "❌ AG WRAPPER: failed to acquire agent lease." >&2
-        echo "   Log: /tmp/ag-wrapper-lease.log" >&2
-        cat /tmp/ag-wrapper-lease.log >&2
-        exit 1
+    if [[ "${_AG_SKIP_INIT}" != "true" ]]; then
+        ORIGINAL_ARGS=("$@")
+        set --
+        if ! source "${_AG_INIT_SCRIPT}" >/tmp/ag-wrapper-lease.log 2>&1; then
+            echo "❌ AG WRAPPER: failed to acquire agent lease." >&2
+            echo "   Log: /tmp/ag-wrapper-lease.log" >&2
+            cat /tmp/ag-wrapper-lease.log >&2
+            exit 1
+        fi
+        set -- "${ORIGINAL_ARGS[@]}"
     fi
-    set -- "${ORIGINAL_ARGS[@]}"
 
     # In reuse mode the init script exports the configured identity variable
     # (and legacy AGENT_GUARD_IDENTITY alias for older projects).

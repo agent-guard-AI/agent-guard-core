@@ -1,0 +1,79 @@
+#!/bin/bash
+#
+# POST-CHECKOUT AGENT GUARD HOOK
+#
+# Keeps the agent session file in sync with the actual branch checked out in
+# the worktree. When an agent creates or switches to a new branch inside its
+# leased worktree, the session file's branch field is updated idempotently.
+#
+# Installed by packages/agent-guard-core/hooks/install.sh.
+#
+
+set -e
+
+# Hook arguments:
+# $1 = previous ref
+# $2 = new ref
+# $3 = flag (1 = branch checkout, 0 = file checkout)
+FLAG="${3:-}"
+[[ "${FLAG}" != "1" ]] && exit 0
+
+NEW_BRANCH="$(git branch --show-current 2>/dev/null || true)"
+[[ -z "${NEW_BRANCH}" ]] && exit 0
+
+REPO_ROOT="$(git rev-parse --show-toplevel 2>/dev/null || true)"
+[[ -z "${REPO_ROOT}" ]] && exit 0
+
+WT_NAME="$(basename "${REPO_ROOT}")"
+
+# Detect identity from worktree name. Supported prefixes must match
+# agent-guard.yaml identities (kimi, claude, gemini, grok).
+IDENTITY=""
+case "${WT_NAME}" in
+    test-ia-kimi*|hmvip-ia-kimi*) IDENTITY="kimi${WT_NAME##*kimi}" ;;
+    test-ia-claude*|hmvip-ia-claude*) IDENTITY="claude${WT_NAME##*claude}" ;;
+    test-ia-gemini*|hmvip-ia-gemini*) IDENTITY="gemini${WT_NAME##*gemini}" ;;
+    test-ia-grok*|hmvip-ia-grok*) IDENTITY="grok${WT_NAME##*grok}" ;;
+    *) exit 0 ;;
+esac
+
+# Locate the session file. The session storage path is derived from the
+# agent-guard.yaml config; we use the canonical default layout.
+MAIN_REPO="$(cd "${REPO_ROOT}/.." && pwd)"
+SESSION_FILE="${MAIN_REPO}/.agent-guard/sessions/${IDENTITY}.json"
+
+[[ -f "${SESSION_FILE}" ]] || exit 0
+
+# Only update if the session is active and the PID is still alive.
+python3 - <<PY 2>/dev/null || true
+import json, os, sys
+
+session_file = "${SESSION_FILE}"
+new_branch = "${NEW_BRANCH}"
+identity = "${IDENTITY}"
+
+try:
+    with open(session_file, 'r') as f:
+        data = json.load(f)
+except (json.JSONDecodeError, OSError):
+    sys.exit(0)
+
+if data.get('status') != 'active':
+    sys.exit(0)
+
+pid = data.get('pid')
+if not pid or not os.path.isdir(f'/proc/{pid}'):
+    sys.exit(0)
+
+# Extra safety: ensure the session belongs to this worktree.
+if data.get('worktree_path') != "${REPO_ROOT}":
+    sys.exit(0)
+
+if data.get('branch') != new_branch:
+    data['branch'] = new_branch
+    data['timestamp'] = __import__('time').time()
+    with open(session_file, 'w') as f:
+        json.dump(data, f, indent=2)
+PY
+
+exit 0

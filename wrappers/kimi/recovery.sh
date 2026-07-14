@@ -78,6 +78,18 @@ _is_elf() {
     [[ -f "${path}" ]] && file "${path}" 2>/dev/null | grep -q "ELF"
 }
 
+# Atomically replace a target file with the contents of a source file.
+# Works even when the target is an ELF binary currently being executed,
+# avoiding ETXTBSY ("text file busy").
+_ag_atomic_replace() {
+    local source="$1"
+    local target="$2"
+    local tmp_target="${target}.tmp.$$"
+    cp "${source}" "${tmp_target}"
+    chmod +x "${tmp_target}"
+    mv "${tmp_target}" "${target}"
+}
+
 # Nothing to do if already wrapper.
 if _is_wrapper "${KIMI_BIN}"; then
     echo "✅ ${KIMI_BIN} is already the Agent Guard wrapper."
@@ -97,7 +109,7 @@ if [[ -f "${KIMI_BIN}" ]]; then
         echo "💾 Backed up current binary to ${backup_bin}"
 
         if [[ ! -f "${KIMI_REAL}" ]] || [[ "${KIMI_BIN}" -nt "${KIMI_REAL}" ]]; then
-            cp "${KIMI_BIN}" "${KIMI_REAL}"
+            _ag_atomic_replace "${KIMI_BIN}" "${KIMI_REAL}"
             echo "🔄 Updated ${KIMI_REAL} to current binary."
         fi
     else
@@ -111,7 +123,7 @@ if [[ ! -f "${KIMI_REAL}" ]]; then
     newest_real="$(find "${KIMI_BIN_DIR}" -maxdepth 1 -type f -name 'kimi.real*' -print0 2>/dev/null | \
         xargs -0 -r ls -t 2>/dev/null | head -n 1)"
     if [[ -n "${newest_real}" ]] && _is_elf "${newest_real}"; then
-        cp "${newest_real}" "${KIMI_REAL}"
+        _ag_atomic_replace "${newest_real}" "${KIMI_REAL}"
         echo "🔄 Restored ${KIMI_REAL} from ${newest_real}"
     fi
 fi
@@ -124,9 +136,8 @@ fi
 
 chmod +x "${KIMI_REAL}"
 
-# Install the wrapper.
-cp "${WRAPPER_SRC}" "${KIMI_BIN}"
-chmod +x "${KIMI_BIN}"
+# Install the wrapper atomically so we never write over an executing ELF.
+_ag_atomic_replace "${WRAPPER_SRC}" "${KIMI_BIN}"
 
 if _is_wrapper "${KIMI_BIN}"; then
     echo "✅ Wrapper restored successfully."

@@ -1,5 +1,119 @@
 # Changelog — agent-guard-core
 
+## 0.8.1 — Impede reassumir slot imediatamente após release
+
+- `src/init.sh`:
+  - `_clear_session()` agora grava `released_at` (timestamp) no session file.
+  - `_slot_is_free()` ganha verificação de cooldown: slots liberados nos
+    últimos 60s são tratados como ocupados na primeira passagem do acquire;
+    uma segunda passagem os reconsidera caso sejam a única opção.
+  - `_acquire_slot()` executa dupla passagem: primeiro sem cooldown, depois
+    com cooldown ignorado.
+  - Reuse mode (seção 12) não mais reativa automaticamente um worktree que
+    está na branch neutra `_released/<identidade>`. Ao invés disso, o fluxo
+    cai para `_acquire_slot()`, que respeita o cooldown e aloca o próximo
+    slot livre. Isso evita que a IA "volte a assumir a mesma identidade"
+    quando o usuário pede para continuar logo após liberar.
+- `tests/agent-guard/agent-guard-release-reuse-test.sh` (novo, no repo
+  hospedeiro): 4 casos — `released_at` gravado, cooldown pula slot recente,
+  fallback seleciona slot recente quando é o único livre, e worktree
+  `_released/<identidade>` não é reusado.
+
+## 0.8.0 — Posse de worktree por lease: hooks bloqueiam processos fora da sessão dona (L186)
+
+- `hooks/lease-owner-check.sh` (novo): validação de posse ancorada no session
+  file (`<repo-principal>/.kiro/locks/agent-sessions/<identidade>.json`). Se
+  existe lease `active` com PID vivo cujo `worktree_path` é o worktree atual,
+  somente processos descendentes desse PID podem escrever (caminhada de
+  PPID). Lease morto, ausente ou de outro worktree → permitido (recovery/adopt).
+  Bypass manual documentado: `HMVIP_AGENT_GUARD_BYPASS=1`. Override de teste:
+  `AGENT_GUARD_SESSION_DIR`.
+- `hooks/pre-commit` e `hooks/pre-push`: chamam `lease_owner_check <identidade>`
+  após a validação de identidade/prefixo — o gap era que qualquer processo
+  dentro de um worktree configurado (user.email repo-wide) podia criar branch
+  `ia-*` e commitar/pushar sem lease, mesmo com a sessão dona viva (L186:
+  ator sem init criou branch, commitou e mergeou PR no worktree do kimi1).
+- `hooks/pre-checkout`: chama `lease_owner_check ""` (modo qualquer-identidade)
+  antes de trocar/criar branch — o `checkout -b` com working tree limpa era o
+  ponto de entrada do invasor.
+- `tests/agent-guard/lease-owner-check-test.sh` (novo, no repo hospedeiro):
+  10 casos — ausente/ancestral/não-ancestral/morto/outro-worktree/inativo/
+  sem-file/modo-checkout/bypass. Roda no job `agent-guard-validation` do CI.
+
+## 0.7.2 — Lease ancorado no processo da sessão (fim da corrida de slots via CLI)
+
+- `src/init.sh`:
+  - Novo helper `_ag_session_pid()` que resolve o PID gravado no lease:
+    1. `AGENT_GUARD_SESSION_PID` (pin explícito de wrappers), se vivo;
+    2. `$$` quando o shell é interativo (terminal humano);
+    3. `$PPID` quando não-interativo (subshell `bash -c` de CLIs de agente,
+       ex.: ferramenta Bash do Kimi Code) — o `$$` efêmero morria ao fim do
+       comando e o slot alugado parecia livre/stale, permitindo que outra
+       sessão roubasse o slot (corrida de slots);
+    4. fallback `$$`.
+  - PID 1 nunca é aceito como âncora (processo reparented não representa a
+    sessão).
+  - `_save_session` e as comparações de "lease já pertence a mim" nos fluxos
+    de acquire/attach/adopt passam a usar `_ag_session_pid`.
+- `wrappers/kimi/wrapper.sh`:
+  - Exporta `AGENT_GUARD_SESSION_PID=$$` antes de sourcar o init: o wrapper é
+    não-interativo, mas seu PID sobrevive ao `exec` final para `kimi.real`,
+    preservando o comportamento canônico (lease preso ao processo do agente).
+
+## 0.7.1 — Release idempotente em branch neutra `_released/<identidade>`
+
+- `src/init.sh`:
+  - Novo helper `_branch_is_neutral_released()` e extensão de
+    `_validate_worktree_release_ready()` para aceitar a branch neutra
+    `_released/<identidade>` além de `develop` e `ia-<identidade>/...`.
+  - Corrige falso erro "WORKTREE NOT RELEASABLE" ao rodar `--release` num
+    worktree já liberado: o próprio release estaciona o worktree em
+    `_released/<identidade>` (não pode usar `develop`, que fica presa ao repo
+    principal), e um segundo release — ou um release após crash no meio do
+    fluxo — reprovava na validação de branch. Release agora é idempotente.
+  - Mensagem de erro atualizada para listar `_released/<identidade>` como
+    estado aceito.
+
+## 0.7.0 — Modo adopt: assumir slots sujos de sessões mortas
+
+- `src/init.sh`:
+  - Novo modo `--adopt <identidade>` (ex: `--adopt kimi3`) para assumir
+    explicitamente um slot deixado sujo/ocioso por uma sessão anterior cujo
+    processo já morreu — o caso típico de "novo dia, continuar o trabalho de
+    ontem". O fluxo normal de aquisição (`_slot_is_free`) continua pulando
+    worktrees sujas por segurança; o adopt é a escotilha explícita.
+  - Trilhos de segurança do adopt:
+    - Recusa quando o slot está preso por um PID vivo.
+    - Recusa quando o worktree está em branch de outra identidade ou em
+      branch protegida — só permite `ia-<identidade>/...` ou
+      `_released/<identidade>`.
+    - Nunca limpa a worktree: arquivos sujos e stashes são apenas reportados
+      para inspeção do agente.
+  - Sessões stale (PID morto) são limpas automaticamente antes da adoção.
+- `bin/agent-guard`: novo subcomando `adopt` (atalho `ad`).
+- `src/journal.sh`: novo evento `adopt` (`_journal_adopt`) no journal de sessão.
+- `.kiro/shell/hmvip.sh` (repo HMVIP): novo atalho `hmvip ad <identidade>`.
+
+## 0.6.0 — Expansão dinâmica de slots
+
+- `agent-guard.yaml`:
+  - Adicionadas chaves `identities.<name>.max_slots` e `identities.<name>.auto_expand`.
+  - Quando `auto_expand: true`, novos slots/worktrees são criados automaticamente
+    até `max_slots` quando todos os slots iniciais (`slots`) estão ocupados.
+  - Nova chave `wrappers.kimi.default_role` (padrão `ia-a`) usada pelo wrapper
+    ao alocar um novo slot dinamicamente.
+- `src/init.sh`:
+  - `_acquire_slot` respeita `max_slots` e `auto_expand`.
+  - Slots expandidos são reutilizados se já existirem e estiverem limpos;
+    caso contrário, novos worktrees são criados automaticamente.
+  - Sessões stale (PID morto) continuam sendo limpas antes da alocação.
+- `wrappers/kimi/wrapper.sh`:
+  - `_ag_find_free_kimi_worktree` busca worktrees livres até `max_slots`.
+  - Quando nenhum worktree existente está livre, o wrapper delega ao init script
+    com papel padrão, permitindo que o agent-guard expanda slots em vez de falhar
+    com "no free kimi worktree available".
+- `agent-guard.yaml.example` atualizado com as novas chaves.
+
 ## 0.5.3 — Compatibilidade Windows/Git Bash e instalação robusta
 
 - `install.sh`:

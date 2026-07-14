@@ -2,7 +2,9 @@
 
 Protocolo open source de governança multi-IA para repositórios Git.
 
-Permite que múltiplos agentes de IA CLI — como Kimi, Claude, Gemini e Grok — colaborem no mesmo repositório sem colidir em branches, worktrees ou commits.
+Permite que múltiplos agentes de IA CLI colaborem no mesmo repositório sem colidir em branches, worktrees ou commits.
+
+> ⚠️ **Compatibilidade de wrappers:** o protocolo e os hooks são genéricos e podem ser estendidos para várias identidades, mas o **wrapper CLI oficial e testado é o do Kimi (Moonshot AI)**. Hoje, apenas `wrappers/kimi/` está implementado. Outros agentes (Claude, Gemini, Grok etc.) podem usar o protocolo via init stub manual, mas não há wrapper automático para eles.
 
 ## Por que usar
 
@@ -84,6 +86,8 @@ identities:
     worktree_prefix: "myproject-ia-kimi"
     author_email: "agent-kimi{n}@example.dev"
     author_name: "Kimi{n} Agent"
+  # Outras identidades podem ser declaradas para uso manual via init stub,
+  # mas nenhum wrapper CLI está implementado para elas.
   - name: claude
     slots: 2
     worktree_prefix: "myproject-ia-claude"
@@ -104,6 +108,7 @@ commit:
   generic_agent_email_template: agent@{domain}
 
 wrappers:
+  # Apenas o wrapper Kimi (Moonshot AI) está implementado.
   kimi:
     bin_dir: /home/user/.kimi-code/bin
     real_bin: kimi.real
@@ -146,6 +151,30 @@ source agent-guard release
 ```bash
 source agent-guard attach <identidade>/<papel>/<branch>
 ```
+
+### Assumir slot sujo/ocioso de sessão morta (novo dia)
+
+```bash
+source agent-guard adopt <identidade>
+# Exemplo: source agent-guard adopt kimi3
+```
+
+Quando um novo dia começa e os slots ainda estão sujos com o trabalho de ontem, o fluxo normal de aquisição pula worktrees sujas (por segurança). O `adopt` é a escotilha explícita: assume o slot de uma sessão cujo processo já morreu, **sem apagar, commitar ou stashar nada** — o agente inspeciona o estado (`git status`, stashes) e decide como continuar.
+
+Trilhos de segurança:
+
+- Recusa slots presos por PID vivo.
+- Recusa worktrees em branch de outra identidade ou branch protegida — só permite `ia-<identidade>/...` ou `_released/<identidade>`.
+- Registra evento `adopt` no session journal.
+
+### Trocar de sessão
+
+```bash
+source agent-guard switch <identidade>
+# Exemplo: source agent-guard switch kimi4
+```
+
+Libera a sessão atual e aluga a identidade especificada em um único comando atômico. A identidade de destino deve estar livre; sessões ativas com PID vivo são recusadas. A worktree atual deve estar liberável (sem alterações pendentes e sem stashes).
 
 ## Session Journal — recuperação após crash
 
@@ -217,17 +246,26 @@ O script rejeita commits de IA que não carreguem metadados de worktree ou cujo 
 
 ## Adapters e wrappers
 
-Adapters são thin wrappers que interceptam a chamada da ferramenta de IA e redirecionam para um worktree livre antes de delegar ao binário real. Veja exemplos em `adapters/`.
+Adapters são thin wrappers que interceptam a chamada da ferramenta de IA e redirecionam para um worktree livre antes de delegar ao binário real.
+
+> **Atenção:** nesta versão, o único adapter implementado e testado é o **wrapper do Kimi (Moonshot AI)** em `wrappers/kimi/`. Outras ferramentas de IA CLI não possuem wrapper automático e devem usar o init stub manualmente.
 
 ### Wrapper Kimi (`wrappers/kimi/`)
 
-O wrapper `wrappers/kimi/wrapper.sh` substitui o binário `kimi` do Kimi Code CLI. Ele:
+O wrapper `wrappers/kimi/wrapper.sh` substitui o binário `kimi` do Kimi Code CLI (Moonshot AI) para impor isolamento automaticamente. Ele:
 
 - Detecta automaticamente o repositório via `git rev-parse --show-toplevel`.
 - Lê `agent-guard.yaml` para descobrir caminhos, identidades e o binário real do Kimi.
 - Impede execução no repo principal e redireciona para um worktree livre.
 - Bloqueia worktrees sujos ou já em uso por outro processo.
-- Instalação:
+
+**Modo padrão (não-invasivo):** o instalador não substitui mais o binário global `kimi`. O isolamento pode ser ativado manualmente via init stub ou, para automação total, via wrapper invasivo.
+
+- Instalação do wrapper invasivo (opcional, requer `--install-wrapper`):
+  ```bash
+  bash /path/to/agent-guard-core/install.sh --target /path/to/your/repo --install-wrapper
+  ```
+- Instalação manual do wrapper:
   ```bash
   mv <bin_dir>/kimi <bin_dir>/kimi.real
   cp packages/agent-guard-core/wrappers/kimi/wrapper.sh <bin_dir>/kimi
@@ -236,6 +274,10 @@ O wrapper `wrappers/kimi/wrapper.sh` substitui o binário `kimi` do Kimi Code CL
 - Recuperação automática após updates do Kimi CLI:
   ```bash
   bash packages/agent-guard-core/wrappers/kimi/recovery.sh
+  ```
+- Remoção do wrapper invasivo e restauração do binário real:
+  ```bash
+  bash packages/agent-guard-core/wrappers/kimi/recovery.sh --remove-wrapper
   ```
 
 ## Testes

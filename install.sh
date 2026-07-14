@@ -14,7 +14,9 @@
 #   --init-name <name>    Name of the init stub at the repo root
 #                         (default: .agent-guard-init)
 #   --skip-hooks          Do not install Git hooks
-#   --skip-wrapper        Do not install the Kimi CLI wrapper
+#   --install-wrapper     Install the invasive Kimi CLI wrapper for Kimi by Moonshot AI
+#                         (replaces ~/.kimi-code/bin/kimi)
+#   --skip-wrapper        Do not install the Kimi CLI wrapper (default: non-invasive launcher only)
 #   --yes                 Skip confirmation prompts
 
 set -euo pipefail
@@ -29,7 +31,7 @@ TARGET_DIR="$(pwd)"
 PACKAGE_ROOT="packages/agent-guard-core"
 INIT_NAME=".agent-guard-init"
 INSTALL_HOOKS="true"
-INSTALL_WRAPPER="true"
+INSTALL_WRAPPER="false"
 SKIP_CONFIRM="false"
 
 while [[ $# -gt 0 ]]; do
@@ -60,6 +62,10 @@ while [[ $# -gt 0 ]]; do
             ;;
         --skip-hooks)
             INSTALL_HOOKS="false"
+            shift
+            ;;
+        --install-wrapper)
+            INSTALL_WRAPPER="true"
             shift
             ;;
         --skip-wrapper)
@@ -173,6 +179,11 @@ if [[ "${INSTALL_WRAPPER}" == "true" ]]; then
         echo "⚠️  Kimi CLI binary not found at ${KIMI_BIN}; wrapper not installed."
         echo "   Install Kimi CLI and run: bash ${DEST_DIR}/wrappers/kimi/recovery.sh --repo-root ${TARGET_DIR}"
     fi
+else
+    echo "🛡️  Kimi CLI wrapper installation skipped (non-invasive mode)."
+    echo "   To enforce isolation automatically, install the invasive wrapper with:"
+    echo "     bash ${DEST_DIR}/install.sh --install-wrapper"
+    echo "   Or run the launcher manually from the init stub."
 fi
 
 # Ensure runtime artifacts are ignored by Git.
