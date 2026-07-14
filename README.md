@@ -152,6 +152,30 @@ source agent-guard release
 source agent-guard attach <identidade>/<papel>/<branch>
 ```
 
+### Assumir slot sujo/ocioso de sessão morta (novo dia)
+
+```bash
+source agent-guard adopt <identidade>
+# Exemplo: source agent-guard adopt kimi3
+```
+
+Quando um novo dia começa e os slots ainda estão sujos com o trabalho de ontem, o fluxo normal de aquisição pula worktrees sujas (por segurança). O `adopt` é a escotilha explícita: assume o slot de uma sessão cujo processo já morreu, **sem apagar, commitar ou stashar nada** — o agente inspeciona o estado (`git status`, stashes) e decide como continuar.
+
+Trilhos de segurança:
+
+- Recusa slots presos por PID vivo.
+- Recusa worktrees em branch de outra identidade ou branch protegida — só permite `ia-<identidade>/...` ou `_released/<identidade>`.
+- Registra evento `adopt` no session journal.
+
+### Trocar de sessão
+
+```bash
+source agent-guard switch <identidade>
+# Exemplo: source agent-guard switch kimi4
+```
+
+Libera a sessão atual e aluga a identidade especificada em um único comando atômico. A identidade de destino deve estar livre; sessões ativas com PID vivo são recusadas. A worktree atual deve estar liberável (sem alterações pendentes e sem stashes).
+
 ## Session Journal — recuperação após crash
 
 O `agent-guard-core` mantém um journal append-only em `.agent-guard/journal/agent-guard.jsonl` (caminho configurável) com eventos de sessão (`init`, `attach`, `release`, `commit`, `checkpoint`). Isso permite que uma nova sessão de IA descubra o que estava sendo feito antes, mesmo após crash da IDE ou troca de slot.

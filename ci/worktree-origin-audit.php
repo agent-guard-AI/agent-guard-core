@@ -198,7 +198,9 @@ final class WorktreeOriginAudit
             if ($prefix === '') {
                 continue;
             }
-            $pattern = '#/' . preg_quote($prefix, '#') . '([0-9]+)$#';
+            // Support optional task suffix (e.g. hmvip-ia-kimi4-bling) while
+            // still requiring the canonical prefix and numeric slot.
+            $pattern = '#/' . preg_quote($prefix, '#') . '([0-9]+)(-[a-z0-9-]+)?$#';
             if (preg_match($pattern, $worktree, $matches)) {
                 return array(
                     'identity' => $name . $matches[1],

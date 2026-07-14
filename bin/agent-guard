@@ -7,6 +7,7 @@
 #   source agent-guard status
 #   source agent-guard release
 #   source agent-guard attach <branch>
+#   source agent-guard adopt <identity>
 #   source agent-guard triage <prefixo>
 #   source agent-guard journal [--limit N] [--identity id] [--since ISO] [--action action]
 #   source agent-guard resume [--last | --nth N | --branch branch]
@@ -72,12 +73,24 @@ case "${COMMAND}" in
         source "${INIT_SCRIPT}" --release
         return $? 2>/dev/null || exit $?
         ;;
+    switch|sw)
+        source "${INIT_SCRIPT}" --switch "$@"
+        return $? 2>/dev/null || exit $?
+        ;;
     attach|a)
         if [[ $# -lt 1 ]]; then
             echo "❌ attach requires a branch name." >&2
             return 1 2>/dev/null || exit 1
         fi
         source "${INIT_SCRIPT}" --attach "$@"
+        return $? 2>/dev/null || exit $?
+        ;;
+    adopt|ad)
+        if [[ $# -lt 1 ]]; then
+            echo "❌ adopt requires an identity (ex: kimi3)." >&2
+            return 1 2>/dev/null || exit 1
+        fi
+        source "${INIT_SCRIPT}" --adopt "$@"
         return $? 2>/dev/null || exit $?
         ;;
     triage|t)
