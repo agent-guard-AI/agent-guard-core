@@ -495,6 +495,9 @@ for e in events:
 
     if not worktree or not branch or not os.path.isdir(worktree):
         continue
+    # Never resume a worktree parked on its neutral post-release branch.
+    if branch.startswith('_released/'):
+        continue
     if not os.path.isdir(os.path.join(worktree, '.git')) and \
        not os.path.isfile(os.path.join(worktree, '.git')):
         continue
@@ -562,7 +565,17 @@ _ag_find_free_kimi_worktree() {
             [[ ! -d "${worktree}" ]] && continue
 
             local is_free=true
-            if [[ -f "${session_file}" ]]; then
+            local current_branch
+            current_branch="$(git -C "${worktree}" branch --show-current 2>/dev/null || true)"
+
+            # A worktree parked on its neutral _released/<identity> branch must not
+            # be selected as "free" for automatic reuse. It is in cooldown/post-release
+            # state and should only be reacquired through explicit allocation.
+            if [[ "${current_branch}" == "_released/${identity}" ]]; then
+                is_free=false
+            fi
+
+            if [[ "${is_free}" == "true" && -f "${session_file}" ]]; then
                 local status pid
                 status="$(${AG_PYTHON} -c "import json,sys; d=json.load(open('${session_file}')); print(d.get('status','free'))" 2>/dev/null || echo free)"
                 pid="$(${AG_PYTHON} -c "import json,sys; d=json.load(open('${session_file}')); print(d.get('pid',''))" 2>/dev/null || echo '')"
