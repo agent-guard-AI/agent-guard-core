@@ -316,30 +316,35 @@ _ag_worktree_has_live_agent() {
     local worktree="$1"
     local own_pid="$$"
 
-    if ! command -v lsof >/dev/null 2>&1; then
-        local pid
-        for pid in /proc/[0-9]*; do
-            [[ -d "${pid}" ]] || continue
-            local pid_num="${pid#/proc/}"
-            [[ "${pid_num}" == "${own_pid}" ]] && continue
-            local cwd_link
-            cwd_link="$(readlink "${pid}/cwd" 2>/dev/null || true)"
-            if [[ "${cwd_link}" == "${worktree}" ]]; then
-                local comm
-                comm="$(cat "${pid}/comm" 2>/dev/null || true)"
-                case "${comm}" in
-                    kimi-code|claude|gemini|grok|cursor|antigravity|kiro)
-                        return 0
-                        ;;
-                esac
-            fi
-        done
-        return 1
+    # Primary scan via /proc: reliable on Linux and catches processes renamed
+    # via exec -a (test fakes) by inspecting argv[0] in /proc/PID/cmdline.
+    local pid
+    for pid in /proc/[0-9]*; do
+        [[ -d "${pid}" ]] || continue
+        local pid_num="${pid#/proc/}"
+        [[ "${pid_num}" == "${own_pid}" ]] && continue
+        local cwd_link
+        cwd_link="$(readlink "${pid}/cwd" 2>/dev/null || true)"
+        if [[ "${cwd_link}" == "${worktree}" ]]; then
+            local comm cmdline_argv0
+            comm="$(cat "${pid}/comm" 2>/dev/null || true)"
+            cmdline_argv0="$(tr '\0' '\n' < "${pid}/cmdline" 2>/dev/null | head -n1 || true)"
+            case "${comm}|${cmdline_argv0}" in
+                *kimi-code*|*claude*|*gemini*|*grok*|*cursor*|*antigravity*|*kiro*|*kimi*)
+                    return 0
+                    ;;
+            esac
+        fi
+    done
+
+    # Fallback scan via lsof for environments where /proc is restricted.
+    if command -v lsof >/dev/null 2>&1; then
+        local pids
+        pids="$(lsof +D "${worktree}" 2>/dev/null | awk '$1 ~ /^(kimi-code|claude|gemini|grok|cursor|antigravity|kiro|kimi)$/ {print $2}' | sort -u | grep -v "^${own_pid}$" || true)"
+        [[ -n "${pids}" ]] && return 0
     fi
 
-    local pids
-    pids="$(lsof +D "${worktree}" 2>/dev/null | awk '$1 ~ /^(kimi-code|claude|gemini|grok|cursor|antigravity|kiro)$/ {print $2}' | sort -u | grep -v "^${own_pid}$" || true)"
-    [[ -n "${pids}" ]]
+    return 1
 }
 
 # Return the most recent resumable worktree for a given identity prefix.
@@ -357,10 +362,49 @@ _ag_find_resumable_worktree() {
     local session_dir
     session_dir="${_AG_MAIN_REPO}/$(bash "${_AG_CONFIG_BIN}" get paths.session_storage ".agent-guard/sessions")"
 
-    ${AG_PYTHON} - "${journal_path}" "${prefix}" "${session_dir}" <<'PY'
+    # Own PID is used to exclude the current wrapper process from the live-agent
+    # scan; otherwise a resuming session would see itself as an intruder.
+    local own_pid="$$"
+
+    ${AG_PYTHON} - "${journal_path}" "${prefix}" "${session_dir}" "${own_pid}" <<'PY'
 import json, sys, os, re, subprocess
-journal_path, prefix, session_dir = sys.argv[1:4]
+journal_path, prefix, session_dir, own_pid = sys.argv[1:5]
+own_pid = str(own_pid)
 identity_re = re.compile(rf'^{re.escape(prefix)}\\d+$')
+AGENT_NAMES = {'kimi-code', 'claude', 'gemini', 'grok', 'cursor', 'antigravity', 'kiro', 'kimi'}
+
+def worktree_has_live_agent(worktree, own_pid):
+    """Return True if an agent process (other than own_pid) holds worktree."""
+    try:
+        for entry in os.listdir('/proc'):
+            if not entry.isdigit():
+                continue
+            if entry == own_pid:
+                continue
+            try:
+                cwd = os.readlink(f'/proc/{entry}/cwd')
+            except (OSError, FileNotFoundError):
+                continue
+            if cwd != worktree:
+                continue
+            names = set()
+            try:
+                with open(f'/proc/{entry}/comm', 'r') as f:
+                    names.add(f.read().strip())
+            except (OSError, FileNotFoundError):
+                pass
+            try:
+                with open(f'/proc/{entry}/cmdline', 'rb') as f:
+                    argv0 = f.read().split(b'\0', 1)[0].decode('utf-8', 'replace')
+                    if argv0:
+                        names.add(argv0)
+            except (OSError, FileNotFoundError):
+                pass
+            if names & AGENT_NAMES:
+                return True
+    except Exception:
+        pass
+    return False
 
 events = []
 with open(journal_path, 'r', encoding='utf-8') as f:
@@ -394,7 +438,6 @@ for e in events:
         continue
 
     # Verify the branch still exists locally.
-    ref_check = os.path.join(worktree, '.git')
     try:
         with open(os.devnull, 'w') as devnull:
             rc = subprocess.call(
@@ -419,6 +462,11 @@ for e in events:
                     continue
         except Exception:
             pass
+
+    # Even when the session file is missing or stale, refuse to resume a
+    # worktree that currently hosts another live agent process.
+    if worktree_has_live_agent(worktree, own_pid):
+        continue
 
     print(worktree)
     sys.exit(0)

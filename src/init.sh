@@ -296,6 +296,37 @@ _is_pid_alive() {
     kill -0 "${pid}" 2>/dev/null
 }
 
+# Return 0 if the worktree currently hosts a live agent process other than
+# the current session PID. Used in reuse mode to detect slot collapse when
+# the lease file is missing or stale.
+_worktree_has_other_live_agent() {
+    local worktree_path="$1"
+    local own_pid
+    own_pid="$(_ag_session_pid)"
+
+    local pid
+    for pid in /proc/[0-9]*; do
+        [[ -d "${pid}" ]] || continue
+        local pid_num="${pid#/proc/}"
+        [[ "${pid_num}" == "${own_pid}" ]] && continue
+        local cwd_link
+        cwd_link="$(readlink "${pid}/cwd" 2>/dev/null || true)"
+        if [[ "${cwd_link}" == "${worktree_path}" ]]; then
+            # /proc/PID/comm shows the executable name; argv[0] (cmdline)
+            # catches processes renamed via exec -a (test fakes).
+            local comm cmdline_argv0
+            comm="$(cat "${pid}/comm" 2>/dev/null || true)"
+            cmdline_argv0="$(tr '\0' '\n' < "${pid}/cmdline" 2>/dev/null | head -n1 || true)"
+            case "${comm}|${cmdline_argv0}" in
+                *kimi-code*|*claude*|*gemini*|*grok*|*cursor*|*antigravity*|*kiro*|*kimi*)
+                    return 0
+                    ;;
+            esac
+        fi
+    done
+    return 1
+}
+
 _load_session_field() {
     local identity="$1"
     local field="$2"
@@ -429,8 +460,9 @@ _acquire_slot() {
     lock_mode="$(_ag_flock_acquire "${global_lock}")"
 
     # Helper: a slot is available when it is not held by a live process and,
-    # if its worktree already exists, that worktree is clean.  Dirty worktrees
-    # are not silently recycled; the user must release or clean them first.
+    # if its worktree already exists, that worktree is clean and not occupied
+    # by another live agent process.  Dirty worktrees are not silently recycled;
+    # the user must release or clean them first.
     _slot_is_free() {
         local identity="$1"
         local session_file worktree
@@ -453,6 +485,12 @@ _acquire_slot() {
             local dirty
             dirty="$(git -C "${worktree}" status --porcelain 2>/dev/null || true)"
             if [[ -n "${dirty}" ]]; then
+                return 1
+            fi
+
+            # Even when the lease file is missing or stale, refuse to recycle a
+            # worktree that currently hosts another live agent process.
+            if _worktree_has_other_live_agent "${worktree}"; then
                 return 1
             fi
         fi
@@ -1269,6 +1307,29 @@ if [[ -n "${CURRENT_IDENTITY}" && -n "${CURRENT_BRANCH}" ]]; then
             echo "" >&2
             return 1 2>/dev/null || exit 1
         fi
+    fi
+
+    # Secondary guard: even if the lease file is missing or stale, detect any
+    # other live agent process currently inside this worktree. This prevents
+    # multiple independent sessions from collapsing into the same slot when the
+    # lease state drifts (e.g. crash without release or stale session files).
+    if _worktree_has_other_live_agent "${CURRENT_WORKTREE}"; then
+        echo ""
+        echo "❌❌❌ ERROR: WORKTREE ALREADY IN USE ❌❌❌" >&2
+        echo "" >&2
+        echo "   Another live agent process was detected in ${CURRENT_WORKTREE}." >&2
+        echo "   Identity '${CURRENT_IDENTITY}' cannot be reused until it is released." >&2
+        echo "" >&2
+        echo "   Possible causes:" >&2
+        echo "     - The lease file is missing or points to a dead PID." >&2
+        echo "     - Another terminal/chat is using this worktree." >&2
+        echo "" >&2
+        echo "   Resolution:" >&2
+        echo "     1. Find the other session and close it, OR" >&2
+        echo "     2. Start from ${MAIN_REPO} to get a free worktree, OR" >&2
+        echo "     3. Run agent-guard status to inspect stale sessions." >&2
+        echo "" >&2
+        return 1 2>/dev/null || exit 1
     fi
 
     DIRTY_FILES="$(git -C "${CURRENT_WORKTREE}" status --porcelain 2>/dev/null || true)"
