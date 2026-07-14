@@ -115,6 +115,15 @@ if [[ -n "${IDENTITY}" ]]; then
         exit 1
     fi
 
+    # Posse do lease: com lease vivo neste worktree, só processos descendentes
+    # da sessão dona podem fazer push (incidente L186).
+    HOOK_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+    if [[ -f "${HOOK_DIR}/lease-owner-check.sh" ]]; then
+        # shellcheck source=lease-owner-check.sh
+        source "${HOOK_DIR}/lease-owner-check.sh"
+        lease_owner_check "${IDENTITY}" || exit 1
+    fi
+
     # Anti-stale check against configured base branch.
     git fetch "origin" "${BASE_BRANCH}" >/dev/null 2>&1 || true
     if git rev-parse --verify "origin/${BASE_BRANCH}" >/dev/null 2>&1; then
