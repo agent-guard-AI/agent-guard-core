@@ -393,7 +393,7 @@ _clear_session() {
 import json
 with open('${session_file}') as f:
     d = json.load(f)
-d.update({'status':'free','role':None,'branch':'','pid':None,'timestamp':None,'worktree_path':'','impact_plugins':[]})
+d.update({'status':'free','role':None,'branch':'','pid':None,'timestamp':None,'worktree_path':'','impact_plugins':[],'released_at':__import__('time').time()})
 with open('${session_file}', 'w') as f:
     json.dump(d, f, indent=2)
 " >/dev/null 2>&1
@@ -463,8 +463,12 @@ _acquire_slot() {
     # if its worktree already exists, that worktree is clean and not occupied
     # by another live agent process.  Dirty worktrees are not silently recycled;
     # the user must release or clean them first.
+    # A 60-second cooldown prevents a slot that was just released by this shell
+    # from being immediately reacquired (e.g. user asks to continue right after
+    # releasing). Pass "true" as second arg to bypass the cooldown.
     _slot_is_free() {
         local identity="$1"
+        local ignore_cooldown="${2:-false}"
         local session_file worktree
         session_file="$(_get_session_file "${identity}")"
         worktree="$(_get_worktree_path "${identity}")"
@@ -478,6 +482,20 @@ _acquire_slot() {
                     return 1
                 fi
                 _clear_session "${identity}"
+            fi
+
+            # Cooldown: slots released in the last 60s are treated as occupied
+            # unless we are in the fallback pass (ignore_cooldown=true).
+            if [[ "${ignore_cooldown}" != "true" ]]; then
+                local released_at now
+                released_at="$(_load_session_field "${identity}" "released_at")"
+                if [[ -n "${released_at}" && "${released_at}" != "None" ]]; then
+                    now="$(date +%s)"
+                    released_at="${released_at%.*}"
+                    if [[ $((now - released_at)) -lt 60 ]]; then
+                        return 1
+                    fi
+                fi
             fi
         fi
 
@@ -501,6 +519,7 @@ _acquire_slot() {
     # Clean stale sessions while locked and find the first free slot.
     # We search up to max_slots so that pre-created expanded worktrees are
     # reused before allocating a brand-new slot beyond the initial count.
+    # First pass skips slots released in the last 60s; second pass allows them.
     for i in $(seq 1 "${max_slots}"); do
         local identity="${prefix}${i}"
         if _slot_is_free "${identity}"; then
@@ -508,6 +527,16 @@ _acquire_slot() {
             break
         fi
     done
+
+    if [[ -z "${selected_identity}" ]]; then
+        for i in $(seq 1 "${max_slots}"); do
+            local identity="${prefix}${i}"
+            if _slot_is_free "${identity}" "true"; then
+                selected_identity="${identity}"
+                break
+            fi
+        done
+    fi
 
     _ag_flock_release "${lock_mode}"
 
@@ -1278,7 +1307,7 @@ fi
 # ---------------------------------------------------------------------------
 # 12. Reuse branch when already inside an agent worktree
 # ---------------------------------------------------------------------------
-if [[ -n "${CURRENT_IDENTITY}" && -n "${CURRENT_BRANCH}" ]]; then
+if [[ -n "${CURRENT_IDENTITY}" && -n "${CURRENT_BRANCH}" && "${CURRENT_BRANCH}" != "_released/${CURRENT_IDENTITY}" ]]; then
     echo "🛡️  Agent Guard: reusing worktree ${CURRENT_WORKTREE}"
     echo "   Identity: ${CURRENT_IDENTITY}"
     echo "   Branch:   ${CURRENT_BRANCH}"
@@ -1356,6 +1385,12 @@ if [[ -n "${CURRENT_IDENTITY}" && -n "${CURRENT_BRANCH}" ]]; then
 
     echo "✅ Git author set to ${GIT_AUTHOR_EMAIL}"
     return 0 2>/dev/null || exit 0
+elif [[ -n "${CURRENT_IDENTITY}" && -n "${CURRENT_BRANCH}" && "${CURRENT_BRANCH}" == "_released/${CURRENT_IDENTITY}" ]]; then
+    # The worktree was released to its neutral branch. Do not silently reuse
+    # it; fall through to acquire a fresh slot (respecting cooldown).
+    echo "🛡️  Agent Guard: worktree ${CURRENT_WORKTREE} is on neutral branch '${CURRENT_BRANCH}'."
+    echo "   It was released; acquiring a fresh slot instead of reusing it."
+    echo ""
 fi
 
 # ---------------------------------------------------------------------------

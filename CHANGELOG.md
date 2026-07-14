@@ -1,5 +1,24 @@
 # Changelog — agent-guard-core
 
+## 0.8.2 — Impede reassumir slot imediatamente após release
+
+- `src/init.sh`:
+  - `_clear_session()` agora grava `released_at` (timestamp) no session file.
+  - `_slot_is_free()` ganha verificação de cooldown: slots liberados nos
+    últimos 60s são tratados como ocupados na primeira passagem do acquire;
+    uma segunda passagem os reconsidera caso sejam a única opção.
+  - `_acquire_slot()` executa dupla passagem: primeiro sem cooldown, depois
+    com cooldown ignorado.
+  - Reuse mode (seção 12) não mais reativa automaticamente um worktree que
+    está na branch neutra `_released/<identidade>`. Ao invés disso, o fluxo
+    cai para `_acquire_slot()`, que respeita o cooldown e aloca o próximo
+    slot livre. Isso evita que a IA "volte a assumir a mesma identidade"
+    quando o usuário pede para continuar logo após liberar.
+- `tests/agent-guard/agent-guard-release-reuse-test.sh` (novo): 4 casos —
+  `released_at` gravado, cooldown pula slot recente, fallback seleciona slot
+  recente quando é o único livre, e worktree `_released/<identidade>` não é
+  reusado.
+
 ## 0.8.1 — Prevenção de slot collapse por processo live no worktree
 
 - `src/init.sh`:
