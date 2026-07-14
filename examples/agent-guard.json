@@ -1,0 +1,70 @@
+{
+  "schema": "agent-guard-v1",
+  "version": "1.0.0",
+  "project": "my-project",
+  "description": "Example Agent Guard configuration for a generic project. Copy and adapt to your repository.",
+
+  "identities": {
+    "kimi": {
+      "slots": 4,
+      "worktree_prefix": "myproject-ia-kimi",
+      "author_email": "agent-kimi{n}@example.dev",
+      "author_name": "MyProject Kimi{n} Agent"
+    },
+    "claude": {
+      "slots": 2,
+      "worktree_prefix": "myproject-ia-claude",
+      "author_email": "agent-claude{n}@example.dev",
+      "author_name": "MyProject Claude{n} Agent"
+    },
+    "gemini": {
+      "slots": 2,
+      "worktree_prefix": "myproject-ia-gemini",
+      "author_email": "agent-gemini{n}@example.dev",
+      "author_name": "MyProject Gemini{n} Agent"
+    },
+    "grok": {
+      "slots": 2,
+      "worktree_prefix": "myproject-ia-grok",
+      "author_email": "agent-grok{n}@example.dev",
+      "author_name": "MyProject Grok{n} Agent"
+    }
+  },
+
+  "worktrees": {
+    "base_dir": "/home/user/projects",
+    "main_repo": "/home/user/projects/my-project",
+    "strategy": "one_worktree_per_identity_slot",
+    "main_repo_reserved_for": ["humans", "deploy"]
+  },
+
+  "session": {
+    "persistence_mode": "ppid_or_session_token",
+    "session_storage": ".agent-guard/sessions",
+    "hooks_path": ".githooks",
+    "init_script": ".agent-guard-init"
+  },
+
+  "rules": {
+    "acquire_lease_before_any_work": {
+      "enabled": true,
+      "description": "Every agent session must acquire a lease before creating branches, editing files, or committing."
+    },
+    "reuse_branch_in_same_session": {
+      "enabled": true,
+      "description": "If the worktree is already on an ia-<identity> branch, reuse it."
+    },
+    "create_new_branch_only_from_clean_base": {
+      "enabled": true,
+      "description": "A new timestamped branch may only be created when the worktree is on the base branch."
+    },
+    "block_direct_work_on_main_repo": {
+      "enabled": true,
+      "description": "The main repo is reserved for humans and deploy. Agents must work inside their assigned worktree."
+    },
+    "block_commit_on_dirty_worktree": {
+      "enabled": true,
+      "description": "Commits are only allowed when the worktree reflects the agent's own session state."
+    }
+  }
+}
