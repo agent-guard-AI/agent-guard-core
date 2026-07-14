@@ -48,37 +48,6 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 AG_PYTHON="$(bash "${SCRIPT_DIR}/../bin/agent-guard-python" 2>/dev/null || echo "python3")"
 export AG_PYTHON
 
-# Cross-platform lock helper. Uses flock(1) when available; otherwise falls
-# back to an atomic mkdir-based lock (e.g. Git Bash on Windows).
-_AG_LOCK_DIR=""
-_ag_flock_acquire() {
-    local lock_file="$1"
-    if command -v flock >/dev/null 2>&1; then
-        local lock_fd=200
-        eval "exec ${lock_fd}>\"${lock_file}\""
-        flock -x "${lock_fd}"
-        echo "${lock_fd}"
-    else
-        _AG_LOCK_DIR="${lock_file}.dir"
-        while ! mkdir "${_AG_LOCK_DIR}" 2>/dev/null; do
-            sleep 0.1
-        done
-        echo "mkdir"
-    fi
-}
-
-_ag_flock_release() {
-    local lock_mode="$1"
-    if [[ "${lock_mode}" == "mkdir" ]]; then
-        rmdir "${_AG_LOCK_DIR}" 2>/dev/null || true
-        _AG_LOCK_DIR=""
-    else
-        local lock_fd="${lock_mode}"
-        flock -u "${lock_fd}"
-        eval "exec ${lock_fd}>&-"
-    fi
-}
-
 # The guard config lives at the repository root. The init script is shipped
 # inside packages/agent-guard-core/src, so we walk up from SCRIPT_DIR until we
 # find a git repository that owns agent-guard.yaml.
@@ -517,9 +486,20 @@ _acquire_slot() {
     global_lock="$(_get_global_lock)"
     touch "${global_lock}"
 
+    # Open the lock descriptor in the CURRENT shell (not a subshell) and keep
+    # it open for the whole critical section. Using command substitution to
+    # capture output would close the descriptor when the subshell exits,
+    # breaking atomicity and causing "flock: <fd>: invalid descriptor".
+    local lock_fd=200
+    eval "exec ${lock_fd}>\"${global_lock}\""
+    flock -x "${lock_fd}"
+
+    # Ensure the lock is always released when this function returns.
+    # The trap runs in the current shell, so we guard against lock_fd being
+    # unset (e.g. if the trap fires after the function already returned).
+    trap 'if [[ -n "${lock_fd:-}" ]]; then flock -u "${lock_fd}" 2>/dev/null || true; eval "exec ${lock_fd}>&-" 2>/dev/null || true; fi' EXIT
+
     local selected_identity=""
-    local lock_mode
-    lock_mode="$(_ag_flock_acquire "${global_lock}")"
 
     # Helper: a slot is available when it is not held by a live process and,
     # if its worktree already exists, that worktree is clean and not occupied
@@ -582,8 +562,9 @@ _acquire_slot() {
     # We search up to max_slots so that pre-created expanded worktrees are
     # reused before allocating a brand-new slot beyond the initial count.
     # First pass skips slots released in the last 60s; second pass allows them.
+    local i identity
     for i in $(seq 1 "${max_slots}"); do
-        local identity="${prefix}${i}"
+        identity="${prefix}${i}"
         if _slot_is_free "${identity}"; then
             selected_identity="${identity}"
             break
@@ -592,15 +573,13 @@ _acquire_slot() {
 
     if [[ -z "${selected_identity}" ]]; then
         for i in $(seq 1 "${max_slots}"); do
-            local identity="${prefix}${i}"
+            identity="${prefix}${i}"
             if _slot_is_free "${identity}" "true"; then
                 selected_identity="${identity}"
                 break
             fi
         done
     fi
-
-    _ag_flock_release "${lock_mode}"
 
     if [[ -z "${selected_identity}" ]]; then
         if [[ "${auto_expand}" == "true" ]]; then
@@ -616,9 +595,20 @@ _acquire_slot() {
     date_str="$(date +%Y%m%d-%H%M)"
     local branch_name="ia-${selected_identity}/${role}/task-${date_str}"
 
+    # Output via global variables so the caller can read the allocation without
+    # command substitution (which would close the lock descriptor and break
+    # atomicity). We also echo the values for compatibility with existing tests
+    # and callers that still capture stdout.
+    _AG_ALLOC_IDENTITY="${selected_identity}"
+    _AG_ALLOC_BRANCH="${branch_name}"
+    _AG_ALLOC_IMPACT_PLUGINS="${impact_plugins}"
+
     echo "${selected_identity}"
     echo "${branch_name}"
     echo "${impact_plugins}"
+
+    # Trap releases the lock on return.
+    return 0
 }
 
 # ---------------------------------------------------------------------------
@@ -1498,15 +1488,14 @@ fi
 # ---------------------------------------------------------------------------
 # 14. Acquire slot atomically
 # ---------------------------------------------------------------------------
-ALLOCATION="$(_acquire_slot "${PREFIX}" "${ROLE}" "${IMPACT_PLUGINS}")"
-if [[ $? -ne 0 ]]; then
-    echo "${ALLOCATION}" >&2
+if ! _acquire_slot "${PREFIX}" "${ROLE}" "${IMPACT_PLUGINS}"; then
     return 1 2>/dev/null || exit 1
 fi
 
-IDENTITY="$(echo "${ALLOCATION}" | sed -n '1p')"
-BRANCH_NAME="$(echo "${ALLOCATION}" | sed -n '2p')"
-IMPACT_PLUGINS="$(echo "${ALLOCATION}" | sed -n '3p')"
+IDENTITY="${_AG_ALLOC_IDENTITY}"
+BRANCH_NAME="${_AG_ALLOC_BRANCH}"
+IMPACT_PLUGINS="${_AG_ALLOC_IMPACT_PLUGINS}"
+unset _AG_ALLOC_IDENTITY _AG_ALLOC_BRANCH _AG_ALLOC_IMPACT_PLUGINS
 
 # ---------------------------------------------------------------------------
 # 15. Create / reuse worktree
