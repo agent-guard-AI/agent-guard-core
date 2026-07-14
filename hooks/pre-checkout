@@ -19,6 +19,17 @@ if [ "${3:-0}" = "0" ]; then
     exit 0
 fi
 
+# Posse do lease ANTES de trocar/criar branch: com lease vivo neste worktree,
+# só processos descendentes da sessão dona podem trocar ou criar branches.
+# Em 2026-07-13 um ator sem lease fez `checkout -b` com working tree limpa no
+# worktree alugado do kimi1 e desviou o fluxo da sessão dona (incidente L186).
+HOOK_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+if [[ -f "${HOOK_DIR}/lease-owner-check.sh" ]]; then
+    # shellcheck source=lease-owner-check.sh
+    source "${HOOK_DIR}/lease-owner-check.sh"
+    lease_owner_check "" || exit 1
+fi
+
 # Verifica working tree dirty, incluindo untracked
 if git diff --quiet HEAD && [ -z "$(git status --porcelain)" ]; then
     exit 0

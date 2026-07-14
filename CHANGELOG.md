@@ -1,5 +1,44 @@
 # Changelog — agent-guard-core
 
+## 0.8.1 — Prevenção de slot collapse por processo live no worktree
+
+- `src/init.sh`:
+  - Novo helper `_worktree_has_other_live_agent()` escaneia `/proc` e detecta
+    processos de agente (incluindo os renomeados via `exec -a`) cujo cwd é o
+    worktree alugado.
+  - Modo reuse (dentro de um worktree de agente) recusa reiniciar a sessão se
+    outro processo live já ocupa o worktree, mesmo quando o session file está
+    stale/ausente ou aponta para PID morto.
+  - Alocação de slot (`_slot_is_free`) pula worktrees ocupados por outro agente
+    vivo, evitando que múltiplas sessões independentes colapsem no mesmo slot.
+- `wrappers/kimi/wrapper.sh`:
+  - `_ag_find_resumable_worktree` e `_ag_worktree_has_live_agent` usam scan
+    `/proc` + `cmdline` argv0 para detectar processos renomeados e recusam
+    reusar/resumir worktree ocupado.
+- `tests/agent-guard/agent-init-test.sh` e
+  `tests/agent-guard/kimi-wrapper-test.sh`: casos de slot collapse.
+
+## 0.8.0 — Posse de worktree por lease: hooks bloqueiam processos fora da sessão dona (L186)
+
+- `hooks/lease-owner-check.sh` (novo): validação de posse ancorada no session
+  file (`<repo-principal>/.kiro/locks/agent-sessions/<identidade>.json`). Se
+  existe lease `active` com PID vivo cujo `worktree_path` é o worktree atual,
+  somente processos descendentes desse PID podem escrever (caminhada de
+  PPID). Lease morto, ausente ou de outro worktree → permitido (recovery/adopt).
+  Bypass manual documentado: `HMVIP_AGENT_GUARD_BYPASS=1`. Override de teste:
+  `AGENT_GUARD_SESSION_DIR`.
+- `hooks/pre-commit` e `hooks/pre-push`: chamam `lease_owner_check <identidade>`
+  após a validação de identidade/prefixo — o gap era que qualquer processo
+  dentro de um worktree configurado (user.email repo-wide) podia criar branch
+  `ia-*` e commitar/pushar sem lease, mesmo com a sessão dona viva (L186:
+  ator sem init criou branch, commitou e mergeou PR no worktree do kimi1).
+- `hooks/pre-checkout`: chama `lease_owner_check ""` (modo qualquer-identidade)
+  antes de trocar/criar branch — o `checkout -b` com working tree limpa era o
+  ponto de entrada do invasor.
+- `tests/agent-guard/lease-owner-check-test.sh` (novo, no repo hospedeiro):
+  10 casos — ausente/ancestral/não-ancestral/morto/outro-worktree/inativo/
+  sem-file/modo-checkout/bypass. Roda no job `agent-guard-validation` do CI.
+
 ## 0.7.2 — Lease ancorado no processo da sessão (fim da corrida de slots via CLI)
 
 - `src/init.sh`:
