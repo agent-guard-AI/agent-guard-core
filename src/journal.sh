@@ -185,8 +185,30 @@ _journal_release() {
 
 _journal_checkpoint() {
     local message="${1:-}"
+    local worktree_path="${2:-${CURRENT_WORKTREE:-}}"
+    local branch="${3:-${CURRENT_BRANCH:-}}"
+
+    local head_sha=""
+    local dirty_files=""
+    local stash_list=""
+    # In a git worktree .git is a file, not a directory; use -e.
+    if [[ -n "${worktree_path}" && -e "${worktree_path}/.git" ]]; then
+        head_sha="$(git -C "${worktree_path}" rev-parse --short HEAD 2>/dev/null || echo "")"
+        dirty_files="$(git -C "${worktree_path}" status --porcelain 2>/dev/null || true)"
+        stash_list="$(git -C "${worktree_path}" stash list 2>/dev/null || true)"
+    fi
+
     local payload
-    payload="$(${AG_PYTHON} -c "import json,sys; print(json.dumps({'message': sys.argv[1]}))" "${message}" 2>/dev/null || echo "{}")"
+    payload="$(${AG_PYTHON} -c "
+import json, sys
+print(json.dumps({
+    'message': sys.argv[1],
+    'branch': sys.argv[2] or None,
+    'head': sys.argv[3] or None,
+    'dirty': sys.argv[4].splitlines() if sys.argv[4] else [],
+    'stashes': sys.argv[5].splitlines() if sys.argv[5] else []
+}))
+" "${message}" "${branch}" "${head_sha}" "${dirty_files}" "${stash_list}" 2>/dev/null || echo '{}')"
     _journal_write_event "checkpoint" "${payload}"
 }
 

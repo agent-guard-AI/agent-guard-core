@@ -262,7 +262,124 @@ _get_global_lock() {
 _is_pid_alive() {
     local pid="$1"
     [[ -z "${pid}" ]] && return 1
-    kill -0 "${pid}" 2>/dev/null
+    if ! kill -0 "${pid}" 2>/dev/null; then
+        return 1
+    fi
+    # Reject processes that are alive in kernel terms but not actually runnable:
+    # T (traced/stopped), Z (zombie), X/x (dead). These are common symptoms of
+    # a crashed parent or a debugger left behind after a frontend/OS crash.
+    local proc_stat
+    proc_stat="$(sed -n 's/.*) \([A-Za-z]\).*/\1/p' "/proc/${pid}/stat" 2>/dev/null || echo "")"
+    case "${proc_stat}" in
+        T|Z|X|x)
+            return 1
+            ;;
+    esac
+    return 0
+}
+
+# Return 0 if the PID belongs to a healthy, runnable process.
+# Differs from _is_pid_alive only in messaging intent; kept separate so callers
+# can distinguish "kernel signal works" from "process is in a good state".
+_is_pid_healthy() {
+    _is_pid_alive "$1"
+}
+
+# Reconcile session file with the actual state of the worktree and process.
+# Sets the following variables in the caller's scope:
+#   _rec_status, _rec_role, _rec_pid, _rec_branch, _rec_worktree,
+#   _rec_health, _rec_drift
+# _rec_health is one of: live, dead, stale, orphan, drift, -
+# _rec_drift is a short human-readable description of any inconsistency.
+_status_reconcile_session() {
+    local identity="$1"
+    local session_file
+    session_file="$(_get_session_file "${identity}")"
+
+    _rec_status="$(_load_session_field "${identity}" "status")"
+    _rec_role="$(_load_session_field "${identity}" "role")"
+    _rec_pid="$(_load_session_field "${identity}" "pid")"
+    _rec_branch="$(_load_session_field "${identity}" "branch")"
+    _rec_worktree="$(_load_session_field "${identity}" "worktree_path")"
+    _rec_health="-"
+    _rec_drift=""
+
+    local expected_worktree
+    expected_worktree="$(_get_worktree_path "${identity}")"
+
+    # If there is no session file at all, the slot is free regardless of
+    # whether a worktree happens to exist on disk.
+    if [[ ! -f "${session_file}" ]]; then
+        _rec_status="free"
+        return
+    fi
+
+    # If the session file claims the slot is free, trust it unless the
+    # worktree is on a task branch or has dirty files — that is a drift.
+    if [[ "${_rec_status}" != "active" ]]; then
+        if [[ -e "${expected_worktree}/.git" ]]; then
+            local actual_branch
+            actual_branch="$(git -C "${expected_worktree}" branch --show-current 2>/dev/null || true)"
+            local dirty
+            dirty="$(git -C "${expected_worktree}" status --porcelain 2>/dev/null || true)"
+            if [[ "${actual_branch}" == "ia-${identity}/"* || -n "${dirty}" ]]; then
+                _rec_health="drift"
+                _rec_drift="released session with active work"
+                _rec_branch="${actual_branch}"
+            fi
+        fi
+        return
+    fi
+
+    # Active session: validate process health.
+    local pid_health="-"
+    if [[ -n "${_rec_pid}" ]]; then
+        if _is_pid_alive "${_rec_pid}"; then
+            pid_health="live"
+        else
+            pid_health="dead"
+        fi
+    fi
+
+    # Validate worktree path matches the configured path.
+    local worktree_drift=""
+    if [[ -n "${_rec_worktree}" && "${_rec_worktree}" != "${expected_worktree}" ]]; then
+        worktree_drift="worktree path mismatch"
+    fi
+
+    # Validate branch matches the actual worktree branch.
+    local branch_drift=""
+    local actual_branch=""
+    if [[ -e "${expected_worktree}/.git" ]]; then
+        actual_branch="$(git -C "${expected_worktree}" branch --show-current 2>/dev/null || true)"
+        if [[ -n "${actual_branch}" && "${actual_branch}" != "${_rec_branch}" ]]; then
+            branch_drift="branch mismatch"
+            # Reconcile the session file so subsequent reads are correct.
+            if _save_session_field "${identity}" "branch" "${actual_branch}"; then
+                _rec_branch="${actual_branch}"
+            fi
+        fi
+    fi
+
+    # Determine final health label.
+    if [[ "${pid_health}" == "dead" ]]; then
+        _rec_health="dead"
+        _rec_drift="session PID is dead"
+    elif [[ -n "${worktree_drift}" || -n "${branch_drift}" ]]; then
+        _rec_health="drift"
+        _rec_drift="${worktree_drift}${worktree_drift:+, }${branch_drift}"
+    elif [[ "${pid_health}" == "live" ]]; then
+        _rec_health="live"
+    fi
+
+    # If the worktree is on a task branch but the session file says released,
+    # surface that as drift even if the PID field is empty.
+    if [[ "${_rec_health}" == "-" && -e "${expected_worktree}/.git" ]]; then
+        if [[ "${_rec_branch}" == "ia-${identity}/"* ]]; then
+            _rec_health="drift"
+            _rec_drift="released marker on task branch"
+        fi
+    fi
 }
 
 # Return 0 if the worktree currently hosts a live agent process other than
@@ -667,6 +784,50 @@ _export_session_env() {
     export AGENT_GUARD_WORKTREE_PATH="${worktree_path}"
     export AGENT_GUARD_BRANCH="${branch}"
     export AGENT_GUARD_IMPACT_PLUGINS="${impact_plugins}"
+}
+
+# Create an empty task note for dynamically expanded slots so that every
+# active session has a retomada document. Base slots are expected to have
+# their template note committed in the repository already.
+_ensure_task_note() {
+    local identity="$1"
+    local prefix="${identity%%[0-9]*}"
+    local slot="${identity##*[a-z]}"
+    local base_slots
+    base_slots="$(_guard_get "identities.${prefix}.slots" 2>/dev/null || echo "0")"
+    [[ -z "${base_slots}" || "${base_slots}" == "None" ]] && base_slots="0"
+
+    if [[ "${slot}" -le "${base_slots}" ]]; then
+        return 0
+    fi
+
+    local tasks_dir
+    tasks_dir="${_AG_REPO_ROOT}/.agent-guard/tasks"
+    mkdir -p "${tasks_dir}"
+    local note_file="${tasks_dir}/${identity}.md"
+    [[ -f "${note_file}" ]] && return 0
+
+    local today
+    today="$(date +%Y-%m-%d)"
+    cat > "${note_file}" <<EOF
+# Tarefa do slot \`${identity}\` — criada automaticamente em ${today}
+
+> Arquivo lido por \`hmvip resume ${identity}\`. Atualizar via PR quando a tarefa do slot mudar.
+
+## Tarefa ATUAL — ${today}
+**Descreva aqui o trabalho em andamento.**
+
+### Commits/PRs recentes
+(nenhum)
+
+### Próximo passo
+(não definido)
+
+### Como retomar
+\`\`\`bash
+hmvip resume ${identity}
+\`\`\`
+EOF
 }
 
 # Ensure the Git worktreeConfig extension is enabled in the main repository.
@@ -1112,56 +1273,50 @@ if [[ "${MODE}" == "status" ]]; then
     echo "=========================================================="
     echo "🛡️  Agent Guard — Session Status"
     echo "=========================================================="
-    printf "%-12s | %-8s | %-6s | %-8s | %-6s | %-40s\n" "Agent" "Status" "Role" "PID" "WT" "Branch"
+    printf "%-12s | %-8s | %-6s | %-10s | %-6s | %-8s | %-40s\n" "Agent" "Status" "Role" "PID" "WT" "Health" "Branch"
     echo "----------------------------------------------------------"
+
+    _rec_status="" _rec_role="" _rec_pid="" _rec_branch="" _rec_worktree="" _rec_health="" _rec_drift=""
+    any_drift=""
 
     identity_list="$(bash "${AGENT_GUARD_CONFIG_BIN}" keys identities)"
     for prefix in ${identity_list}; do
         [[ -z "${prefix}" ]] && continue
-        max_slots="$(_guard_get "identities.${prefix}.slots")"
+        # Show all slots up to max_slots so expanded slots (kimi8+) are visible.
+        base_slots="$(_guard_get "identities.${prefix}.slots")"
+        max_slots="$(_guard_get "identities.${prefix}.max_slots" "${base_slots}")"
         for i in $(seq 1 "${max_slots}"); do
             identity="${prefix}${i}"
-            session_file="$(_get_session_file "${identity}")"
-            if [[ -f "${session_file}" ]]; then
-                status="$(_load_session_field "${identity}" "status")"
-                role="$(_load_session_field "${identity}" "role")"
-                pid="$(_load_session_field "${identity}" "pid")"
-                branch="$(_load_session_field "${identity}" "branch")"
-            else
-                status="free"
-                role=""
-                pid=""
-                branch=""
-            fi
             worktree_path="$(_get_worktree_path "${identity}")"
             wt_ok="❌"
             [[ -e "${worktree_path}/.git" ]] && wt_ok="✅"
-            pid_alive=""
-            if [[ "${status}" == "active" && -n "${pid}" ]]; then
-                if _is_pid_alive "${pid}"; then
-                    pid_alive=" (live)"
-                    # Reconcile session branch with the actual worktree branch.
-                    # A live session may have checked out a different branch
-                    # (e.g. after creating a new PR branch), leaving the session
-                    # file stale. Status must reflect reality to avoid misleading
-                    # other agents about whether the slot is released/neutral.
-                    if [[ -e "${worktree_path}/.git" ]]; then
-                        actual_branch="$(git -C "${worktree_path}" branch --show-current 2>/dev/null || true)"
-                        if [[ -n "${actual_branch}" && "${actual_branch}" != "${branch}" ]]; then
-                            if _save_session_field "${identity}" "branch" "${actual_branch}"; then
-                                branch="${actual_branch}"
-                            fi
-                        fi
-                    fi
-                else
-                    pid_alive=" (dead)"
-                fi
+
+            _status_reconcile_session "${identity}"
+
+            pid_col="${_rec_pid}"
+            if [[ "${_rec_health}" == "live" ]]; then
+                pid_col="${_rec_pid} (live)"
+            elif [[ "${_rec_health}" == "dead" ]]; then
+                pid_col="${_rec_pid} (dead)"
             fi
-            printf "%-12s | %-8s | %-6s | %-8s | %-6s | %-40s\n" \
-                "${identity}" "${status:-free}" "${role:-}" "${pid}${pid_alive}" "${wt_ok}" "${branch:-}"
+
+            printf "%-12s | %-8s | %-6s | %-10s | %-6s | %-8s | %-40s\n" \
+                "${identity}" "${_rec_status:-free}" "${_rec_role:-}" \
+                "${pid_col:-}" "${wt_ok}" "${_rec_health:-}" "${_rec_branch:-}"
+
+            if [[ "${_rec_health}" != "-" && "${_rec_health}" != "live" ]]; then
+                any_drift="${any_drift}\n  ${_rec_drift:-drift}: ${identity} -> ${_rec_branch:-<no branch>}"
+            fi
         done
     done
     echo "=========================================================="
+    if [[ -n "${any_drift}" ]]; then
+        echo ""
+        echo "⚠️  Issues detected:"
+        echo -e "${any_drift}"
+        echo ""
+        echo "Use: source .hmvip-agent-init --adopt <identity>  to inspect/recover"
+    fi
     echo ""
     return 0 2>/dev/null || exit 0
 fi
@@ -1341,8 +1496,14 @@ if [[ "${MODE}" == "adopt" ]]; then
     impact_json="$(echo "${IMPACT_PLUGINS}" | ${AG_PYTHON} -c "import sys,json; print(json.dumps([p.strip() for p in sys.stdin.read().split(',') if p.strip()]))" 2>/dev/null || echo "[]")"
     _save_session "${ADOPT_IDENTITY}" "active" "${ROLE}" "${ADOPT_BRANCH}" "$(_ag_session_pid)" "${WORKTREE_PATH}" "${impact_json}"
 
+    # Expanded slots (beyond the base count) must have a retomada note.
+    _ensure_task_note "${ADOPT_IDENTITY}"
+
     if command -v _journal_adopt >/dev/null 2>&1; then
         _journal_adopt "${ADOPT_BRANCH}"
+    fi
+    if command -v _journal_checkpoint >/dev/null 2>&1; then
+        _journal_checkpoint "session adopted" "${WORKTREE_PATH}" "${ADOPT_BRANCH}"
     fi
 
     echo "✅ Git author set to ${GIT_AUTHOR_EMAIL}"
@@ -1447,6 +1608,9 @@ if [[ -n "${CURRENT_IDENTITY}" && -n "${CURRENT_BRANCH}" && "${CURRENT_BRANCH}" 
     if command -v _journal_init >/dev/null 2>&1; then
         _journal_init
     fi
+    if command -v _journal_checkpoint >/dev/null 2>&1; then
+        _journal_checkpoint "session acquired (reuse)" "${CURRENT_WORKTREE}" "${CURRENT_BRANCH}"
+    fi
 
     echo "✅ Git author set to ${GIT_AUTHOR_EMAIL}"
     return 0 2>/dev/null || exit 0
@@ -1525,10 +1689,15 @@ _export_session_env "${WORKTREE_PATH}" "${BRANCH_NAME}" "${IMPACT_PLUGINS}"
 impact_json="$(echo "${IMPACT_PLUGINS}" | ${AG_PYTHON} -c "import sys,json; print(json.dumps([p.strip() for p in sys.stdin.read().split(',') if p.strip()]))" 2>/dev/null || echo "[]")"
 _save_session "${IDENTITY}" "active" "${ROLE}" "${BRANCH_NAME}" "$(_ag_session_pid)" "${WORKTREE_PATH}" "${impact_json}"
 
+# Expanded slots (beyond the base count) must have a retomada note.
+_ensure_task_note "${IDENTITY}"
 
-    if command -v _journal_init >/dev/null 2>&1; then
-        _journal_init
-    fi
+if command -v _journal_init >/dev/null 2>&1; then
+    _journal_init
+fi
+if command -v _journal_checkpoint >/dev/null 2>&1; then
+    _journal_checkpoint "session acquired" "${WORKTREE_PATH}" "${BRANCH_NAME}"
+fi
 
 # Soft-lock overlap warning
 if [[ -n "${IMPACT_PLUGINS}" ]]; then

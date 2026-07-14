@@ -1,5 +1,32 @@
 # Changelog — agent-guard-core
 
+## 0.8.2 — Resiliência a crashes e reinicializações (L207)
+
+- `src/init.sh`:
+  - `_is_pid_alive()` agora rejeita processos em estados `T` (traced/stopped),
+    `Z` (zombie) e `X/x` (dead). Sessões cujo PID existe mas não está saudável
+    são reportadas como `dead` no status, não `live`.
+  - Nova função `_status_reconcile_session()` reconcilia session file com o
+    estado real do worktree: verifica `worktree_path`, `branch` e dirty state.
+    Divergências são reportadas como `drift` no `--status`.
+  - `--status` agora lista todos os slots até `max_slots` (incluindo slots
+    expandidos como `kimi8+`), mostra uma coluna `Health` e imprime um bloco de
+    aviso com ações sugeridas (`--adopt`).
+  - Nova função `_ensure_task_note()` cria `.agent-guard/tasks/<slot>.md`
+    automaticamente ao alocar um slot expandido, garantindo governança de
+    retomada igual à dos slots base.
+  - Chamadas automáticas de `_journal_checkpoint()` em `init` e `adopt`,
+    gravando HEAD, arquivos modificados e stashes no journal para recuperação
+    pós-crash.
+- `src/journal.sh`:
+  - `_journal_checkpoint()` expandido para capturar `branch`, `head`, lista de
+    arquivos dirty e lista de stashes.
+- `tests/agent-guard/agent-init-test.sh`:
+  - Teste 18: processo parado (`SIGSTOP`) é detectado como `dead`.
+  - Teste 19: slots expandidos aparecem no status e drift é detectado quando o
+    session file diz `_released` mas o worktree está em task branch suja.
+  - Teste 20: checkpoint no journal captura arquivos modificados.
+
 ## 0.8.1 — Impede reassumir slot imediatamente após release
 
 - `src/init.sh`:
