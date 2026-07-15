@@ -583,6 +583,7 @@ _acquire_slot() {
     local prefix="$1"
     local role="$2"
     local impact_plugins="$3"
+    local forced_identity="${4:-}"
 
     local initial_slots max_slots auto_expand
     initial_slots="$(_guard_get "identities.${prefix}.slots" 2>/dev/null || echo "")"
@@ -597,6 +598,19 @@ _acquire_slot() {
     auto_expand="$(_guard_get_str "identities.${prefix}.auto_expand" "false")"
     if [[ "${max_slots}" -lt "${initial_slots}" ]]; then
         max_slots="${initial_slots}"
+    fi
+
+    # Validate forced identity if requested.
+    if [[ -n "${forced_identity}" ]]; then
+        if [[ ! "${forced_identity}" =~ ^${prefix}[0-9]+$ ]]; then
+            echo "❌ Forced identity '${forced_identity}' is not a valid '${prefix}' slot." >&2
+            return 1
+        fi
+        local forced_slot="${forced_identity##*[a-z]}"
+        if [[ "${forced_slot}" -lt 1 || "${forced_slot}" -gt "${max_slots}" ]]; then
+            echo "❌ Forced identity '${forced_identity}' is outside the allowed range (1-${max_slots})." >&2
+            return 1
+        fi
     fi
 
     local global_lock
@@ -675,36 +689,52 @@ _acquire_slot() {
         return 0
     }
 
-    # Clean stale sessions while locked and find the first free slot.
-    # We search up to max_slots so that pre-created expanded worktrees are
-    # reused before allocating a brand-new slot beyond the initial count.
+    # Clean stale sessions while locked and find a free slot.
+    # If a forced identity was requested, only that slot is considered.
+    # Otherwise, search up to max_slots so that pre-created expanded worktrees
+    # are reused before allocating a brand-new slot beyond the initial count.
     # First pass skips slots released in the last 60s; second pass allows them.
     local i identity
-    for i in $(seq 1 "${max_slots}"); do
-        identity="${prefix}${i}"
+    if [[ -n "${forced_identity}" ]]; then
+        identity="${forced_identity}"
         if _slot_is_free "${identity}"; then
             selected_identity="${identity}"
-            break
+        elif _slot_is_free "${identity}" "true"; then
+            selected_identity="${identity}"
         fi
-    done
 
-    if [[ -z "${selected_identity}" ]]; then
+        if [[ -z "${selected_identity}" ]]; then
+            echo "❌ Slot '${forced_identity}' is not available (in use, dirty or on cooldown)." >&2
+            echo "   Use 'source .hmvip-agent-init --status' to inspect slots." >&2
+            return 1
+        fi
+    else
         for i in $(seq 1 "${max_slots}"); do
             identity="${prefix}${i}"
-            if _slot_is_free "${identity}" "true"; then
+            if _slot_is_free "${identity}"; then
                 selected_identity="${identity}"
                 break
             fi
         done
-    fi
 
-    if [[ -z "${selected_identity}" ]]; then
-        if [[ "${auto_expand}" == "true" ]]; then
-            echo "❌ No free slots available for '${prefix}' (all ${max_slots} in use, auto_expand exhausted)." >&2
-        else
-            echo "❌ No free slots available for '${prefix}' (all ${initial_slots} in use). Enable auto_expand or release a session." >&2
+        if [[ -z "${selected_identity}" ]]; then
+            for i in $(seq 1 "${max_slots}"); do
+                identity="${prefix}${i}"
+                if _slot_is_free "${identity}" "true"; then
+                    selected_identity="${identity}"
+                    break
+                fi
+            done
         fi
-        return 1
+
+        if [[ -z "${selected_identity}" ]]; then
+            if [[ "${auto_expand}" == "true" ]]; then
+                echo "❌ No free slots available for '${prefix}' (all ${max_slots} in use, auto_expand exhausted)." >&2
+            else
+                echo "❌ No free slots available for '${prefix}' (all ${initial_slots} in use). Enable auto_expand or release a session." >&2
+            fi
+            return 1
+        fi
     fi
 
     # Build branch name
@@ -997,6 +1027,7 @@ ADOPT_IDENTITY=""
 PREFIX=""
 ROLE=""
 IMPACT_PLUGINS=""
+FORCED_IDENTITY=""
 USE_WORKTREE="true"
 MODE="acquire"
 
@@ -1019,6 +1050,15 @@ while [[ $# -gt 0 ]]; do
                 shift 2
             else
                 echo "❌ --adopt requires an identity (ex: kimi3)." >&2
+                return 1 2>/dev/null || exit 1
+            fi
+            ;;
+        --slot)
+            if [[ -n "${2:-}" ]]; then
+                FORCED_IDENTITY="$2"
+                shift 2
+            else
+                echo "❌ --slot requires an identity (ex: kimi3)." >&2
                 return 1 2>/dev/null || exit 1
             fi
             ;;
@@ -1533,7 +1573,11 @@ fi
 # ---------------------------------------------------------------------------
 # 12. Reuse branch when already inside an agent worktree
 # ---------------------------------------------------------------------------
-if [[ -n "${CURRENT_IDENTITY}" && -n "${CURRENT_BRANCH}" && "${CURRENT_BRANCH}" != "_released/${CURRENT_IDENTITY}" ]]; then
+# If the user explicitly requested a different slot, do not reuse the current
+# worktree; fall through to forced allocation.
+if [[ -n "${FORCED_IDENTITY}" && "${FORCED_IDENTITY}" != "${CURRENT_IDENTITY}" ]]; then
+    echo "🎯 Agent Guard: explicit slot '${FORCED_IDENTITY}' requested; not reusing current worktree." >&2
+elif [[ -n "${CURRENT_IDENTITY}" && -n "${CURRENT_BRANCH}" && "${CURRENT_BRANCH}" != "_released/${CURRENT_IDENTITY}" ]]; then
     echo "🛡️  Agent Guard: reusing worktree ${CURRENT_WORKTREE}"
     echo "   Identity: ${CURRENT_IDENTITY}"
     echo "   Branch:   ${CURRENT_BRANCH}"
@@ -1652,7 +1696,7 @@ fi
 # ---------------------------------------------------------------------------
 # 14. Acquire slot atomically
 # ---------------------------------------------------------------------------
-if ! _acquire_slot "${PREFIX}" "${ROLE}" "${IMPACT_PLUGINS}"; then
+if ! _acquire_slot "${PREFIX}" "${ROLE}" "${IMPACT_PLUGINS}" "${FORCED_IDENTITY}"; then
     return 1 2>/dev/null || exit 1
 fi
 
