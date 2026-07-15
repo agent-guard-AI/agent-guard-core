@@ -644,6 +644,22 @@ _acquire_slot() {
             break
         fi
         _lock_attempt=$((_lock_attempt + 1))
+
+        # Recover from a stale lock file: if no live process holds the lock,
+        # the file is leftover from a crashed/killed holder. Back it up and
+        # recreate it, then retry immediately.
+        if [[ $((_lock_attempt % 5)) -eq 0 ]]; then
+            if ! lslocks | grep -qF "${global_lock}"; then
+                echo "⚠️  Agent Guard: stale global lock detected; recovering..." >&2
+                eval "exec ${lock_fd}>&-" 2>/dev/null || true
+                mv "${global_lock}" "${global_lock}.stale.$(date +%s)" 2>/dev/null || true
+                touch "${global_lock}"
+                eval "exec ${lock_fd}>\"${global_lock}\""
+                _lock_attempt=0
+                continue
+            fi
+        fi
+
         if [[ "${_lock_attempt}" -ge 60 ]]; then
             echo "❌ Could not acquire global agent-guard lock after 60s." >&2
             echo "   Another process may be holding it. Check: lslocks | grep agent-sessions" >&2
