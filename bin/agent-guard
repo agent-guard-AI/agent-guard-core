@@ -23,6 +23,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 INIT_SCRIPT="${SCRIPT_DIR}/src/init.sh"
 JOURNAL_SCRIPT="${SCRIPT_DIR}/src/journal.sh"
+SESSION_TRACE_SCRIPT="${SCRIPT_DIR}/src/session_trace.sh"
 
 if [[ ! -f "${INIT_SCRIPT}" ]]; then
     echo "❌ agent-guard init script not found: ${INIT_SCRIPT}" >&2
@@ -31,6 +32,10 @@ fi
 
 if [[ -f "${JOURNAL_SCRIPT}" ]]; then
     source "${JOURNAL_SCRIPT}"
+fi
+
+if [[ -f "${SESSION_TRACE_SCRIPT}" ]]; then
+    source "${SESSION_TRACE_SCRIPT}"
 fi
 
 if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
@@ -119,9 +124,86 @@ case "${COMMAND}" in
         echo "📝 Checkpoint recorded."
         return 0 2>/dev/null || exit 0
         ;;
+    prune)
+        target_identity="${1:-}"
+        shift 2>/dev/null || true
+        dry_run_flag="${1:-}"
+        if [[ -z "${target_identity}" ]]; then
+            echo "❌ prune requires an identity (ex: kimi12)." >&2
+            return 1 2>/dev/null || exit 1
+        fi
+        # Prune needs init.sh helpers (session files, worktree paths, config).
+        # Do not pass the CLI args down to init.sh to avoid unknown-option errors.
+        set --
+        AGENT_GUARD_FUNCTIONS_ONLY=1
+        source "${INIT_SCRIPT}"
+        unset AGENT_GUARD_FUNCTIONS_ONLY
+        _prune_identity "${target_identity}" "${dry_run_flag}"
+        return $? 2>/dev/null || exit $?
+        ;;
+    session|sess)
+        subcommand="${1:-list}"
+        shift 2>/dev/null || true
+        case "${subcommand}" in
+            list|ls)
+                _trace_list_checkpoints
+                return $? 2>/dev/null || exit $?
+                ;;
+            checkpoint|cp)
+                msg="${*:-session checkpoint}"
+                cp_id="$(_trace_checkpoint "${msg}" 2>/dev/null || echo "")"
+                if [[ -n "${cp_id}" ]]; then
+                    echo "📝 Session checkpoint recorded: ${cp_id}"
+                    return 0 2>/dev/null || exit 0
+                else
+                    echo "❌ Failed to record session checkpoint." >&2
+                    return 1 2>/dev/null || exit 1
+                fi
+                ;;
+            resume|res)
+                branch="${1:-}"
+                if [[ -n "${branch}" ]]; then
+                    echo "Resume for branch ${branch}:"
+                fi
+                _trace_last_checkpoint
+                return $? 2>/dev/null || exit $?
+                ;;
+            explain|exp)
+                cp_id="${1:-}"
+                if [[ -z "${cp_id}" ]]; then
+                    _trace_last_checkpoint
+                else
+                    git -C "$(_trace_get_repo_root)" show --stat --oneline "${cp_id}" 2>/dev/null || {
+                        echo "❌ Checkpoint ${cp_id} not found." >&2
+                        return 1 2>/dev/null || exit 1
+                    }
+                fi
+                return 0 2>/dev/null || exit 0
+                ;;
+            grep|search|g)
+                term="${1:-}"
+                if [[ -z "${term}" ]]; then
+                    echo "❌ session grep requires a search term." >&2
+                    echo "   Usage: agent-guard session grep <term>" >&2
+                    return 1 2>/dev/null || exit 1
+                fi
+                echo "🔍 Searching agent-guard session traces for '${term}'..."
+                _trace_grep_sessions "${term}" 2>/dev/null || echo "   (no matches in agent-guard traces)"
+                echo ""
+                echo "🔍 Searching Kimi session state for '${term}'..."
+                _trace_search_kimi_sessions "${term}" 2>/dev/null || echo "   (no matches in Kimi sessions)"
+                return 0 2>/dev/null || exit 0
+                ;;
+            *)
+                echo "❌ Unknown session subcommand: ${subcommand}" >&2
+                echo "   Subcommands: list, checkpoint, resume, explain, grep" >&2
+                return 1 2>/dev/null || exit 1
+                ;;
+        esac
+        ;;
     *)
         echo "❌ Unknown command or identity: ${COMMAND}" >&2
-        echo "   Commands: init, status, release, attach, triage, journal, resume, checkpoint" >&2
+        echo "   Commands: init, status, release, attach, triage, journal, resume, checkpoint, session, prune" >&2
         echo "   Legacy:   <kimi|claude|gemini|grok> <role>" >&2
         return 1 2>/dev/null || exit 1
         ;;

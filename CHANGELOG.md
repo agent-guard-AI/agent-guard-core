@@ -1,5 +1,66 @@
 # Changelog — agent-guard-core
 
+## 0.8.6 — Rastros contínuos de sessão para Kimi (ADR-0022)
+
+- `src/session_trace.sh`:
+  - Novas funções `_trace_find_kimi_session_dir`, `_trace_snapshot_kimi_state`, `_trace_watch_kimi_session`, `_trace_grep_sessions` e `_trace_search_kimi_sessions`.
+  - Captura best-effort do `state.json` do Kimi Code (título, último prompt, workDir, sessionId) a cada batimento, com redação de secrets.
+  - Busca unificada por termo tanto nos checkpoints da ref `refs/agent-guard/sessions/v1` quanto no estado Kimi local.
+- `wrappers/kimi/wrapper.sh`:
+  - Inicia um watcher em background após a aquisição do lease; ele tira snapshots do estado da sessão Kimi e grava checkpoints automáticos enquanto o processo da IA estiver vivo.
+  - Configurável via `AGENT_GUARD_KIMI_WATCH_INTERVAL_SECONDS` (padrão 60) e `AGENT_GUARD_KIMI_WATCH_CHECKPOINT_INTERVAL_SECONDS` (padrão 300).
+- `bin/agent-guard`:
+  - Novo subcomando `session grep <termo>` para descobrir em qual slot/branch um termo (ex: `mobilerun`) apareceu nos rastros de sessão ou no estado Kimi.
+- `packages/agent-guard-core/hooks/post-commit`:
+  - Grava um checkpoint de session-trace a cada commit, ligando o estado da conversa ao código commitado.
+- `tests/agent-guard/session_trace-test.sh`:
+  - Testes de descoberta de sessão Kimi, snapshot redacted, `grep_sessions` e `search_kimi_sessions`.
+
+## 0.8.5 — Correção do dispatch do subcomando `prune`
+
+- `bin/agent-guard`:
+  - O caso `prune` agora carrega `src/init.sh` no modo
+    `AGENT_GUARD_FUNCTIONS_ONLY` antes de invocar `_prune_identity`.
+  - Args do prune não são mais repassados para o parser do `init.sh`,
+    evitando erros como `Unknown option: --dry-run`.
+- `src/init.sh`:
+  - Guarda `AGENT_GUARD_FUNCTIONS_ONLY` para skippar o fluxo de aquisição/reuso
+    quando o script for carregado apenas pelos helpers.
+- `tests/agent-guard/prune-test.sh`:
+  - Adicionado teste de regressão para o dispatch CLI de `prune`.
+
+## 0.8.4 — Menu interativo de seleção de slots (`hmvip slots` / `hmvip selecionar`)
+
+- `.kiro/shell/hmvip.sh`:
+  - Nova função `_hmvip_menu_slots()` lista todos os slots configurados em
+    `agent-guard.yaml` com status (`free`/`active`), saúde do PID (`live`/`dead`),
+    existência do worktree e branch atual.
+  - Novos comandos `hmvip slots` e `hmvip selecionar` abrem o menu de slots.
+  - O menu principal (`hmvip m`) ganha a opção `2. selecionar` para abrir o
+    menu de slots.
+  - Ações disponíveis por slot:
+    - **Livre:** usar, adotar ou retomar (mostrar nota de tarefa).
+    - **Ativo:** retomar (nota) ou liberar.
+- `AGENTS.md`: documenta `hmvip slots` / `hmvip selecionar` na tabela de atalhos.
+
+## 0.8.3 — Alocação explícita de slot (`--slot` / `hmvip use`)
+
+- `src/init.sh`:
+  - `_acquire_slot()` ganha quarto parâmetro `forced_identity`. Quando
+    informado, só o slot solicitado é considerado (com e sem cooldown).
+    Validação rejeita identidades fora do prefixo ou fora de `max_slots`.
+  - Parse de argumentos aceita `--slot <identidade>`, permitindo
+    `source .hmvip-agent-init kimi ia-a --slot kimi3`.
+- `.kiro/shell/hmvip.sh`:
+  - Novo comando `hmvip use <identidade>` (e sinônimo `hmvip usar`).
+  - `HMVIP_AGENT_INIT` agora é resolvido dinamicamente: se o shell estiver
+    dentro de um worktree `hmvip-ia-*`, usa o stub daquele worktree;
+    caso contrário, usa o stub do repo principal.
+- `AGENTS.md` e `.agents/skills/hmvip-multi-agent/SKILL.md` atualizados com
+  o novo comando e gatilhos de linguagem natural.
+- Sync upstream: melhorias enviadas para `agent-guard-AI/agent-guard-core`
+  via PR #9 (`sync-main-for-upstream-20260715`).
+
 ## 0.8.2 — Resiliência a crashes e reinicializações (L207)
 
 - `src/init.sh`:
