@@ -15,6 +15,7 @@
   - Grava um checkpoint de session-trace a cada commit, ligando o estado da conversa ao código commitado.
 - `tests/agent-guard/session_trace-test.sh`:
   - Testes de descoberta de sessão Kimi, snapshot redacted, `grep_sessions` e `search_kimi_sessions`.
+- **Sync upstream:** melhorias sincronizadas com `agent-guard-AI/agent-guard-core` via PR #10.
 
 ## 0.8.5 — Correção do dispatch do subcomando `prune`
 
