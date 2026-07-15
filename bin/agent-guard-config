@@ -1,0 +1,135 @@
+#!/usr/bin/env bash
+#
+# agent-guard-config — read values from agent-guard.yaml (SSOT).
+#
+# Usage:
+#   source agent-guard-config get <dot.key> [default]
+#   agent-guard-config get <dot.key> [default]
+#
+# Examples:
+#   source agent-guard-config get git.notes_ref
+#   source agent-guard-config get worktrees.main_repo
+#
+# The script resolves the repository root from the current directory or the
+# AGENT_GUARD_REPO_ROOT environment variable. It parses agent-guard.yaml using
+# python3.
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+
+# Resolve a usable Python interpreter cross-platform.
+AG_PYTHON="$(bash "${SCRIPT_DIR}/bin/agent-guard-python" 2>/dev/null || echo "python3")"
+export AG_PYTHON
+
+_detect_repo_root() {
+    if [[ -n "${AGENT_GUARD_REPO_ROOT:-}" ]]; then
+        echo "${AGENT_GUARD_REPO_ROOT}"
+        return 0
+    fi
+    local git_root
+    git_root="$(git rev-parse --show-toplevel 2>/dev/null || true)"
+    if [[ -n "${git_root}" ]]; then
+        echo "${git_root}"
+        return 0
+    fi
+    echo "$(pwd)"
+}
+
+_load_config_json() {
+    local repo_root
+    repo_root="$(_detect_repo_root)"
+    local yaml_path="${repo_root}/agent-guard.yaml"
+
+    local config_json=""
+    if [[ -f "${yaml_path}" ]]; then
+        config_json="$(${AG_PYTHON} -c 'import json, sys, yaml; json.dump(yaml.safe_load(open(sys.argv[1])), sys.stdout)' "${yaml_path}" 2>/dev/null || true)"
+    fi
+    echo "${config_json}"
+}
+
+_get_config_value() {
+    local key="$1"
+    local default_value="${2:-}"
+
+    local config_json
+    config_json="$(_load_config_json)"
+    if [[ -z "${config_json}" ]]; then
+        echo "${default_value}"
+        return 0
+    fi
+
+    local result
+    result="$(echo "${config_json}" | ${AG_PYTHON} -c "
+import json, sys
+data = json.load(sys.stdin)
+key = sys.argv[1]
+default = sys.argv[2] if len(sys.argv) > 2 else ''
+for part in key.split('.'):
+    if not isinstance(data, dict) or part not in data:
+        print(default)
+        sys.exit(0)
+    data = data[part]
+if isinstance(data, list):
+    print(' '.join(str(x) for x in data))
+elif data is None:
+    print(default)
+else:
+    print(data)
+" "${key}" "${default_value}" 2>/dev/null || true)"
+
+    echo "${result}"
+}
+
+_get_config_keys() {
+    local key="$1"
+
+    local config_json
+    config_json="$(_load_config_json)"
+    if [[ -z "${config_json}" ]]; then
+        echo ""
+        return 0
+    fi
+
+    local result
+    result="$(echo "${config_json}" | ${AG_PYTHON} -c "
+import json, sys
+data = json.load(sys.stdin)
+key = sys.argv[1]
+if key:
+    for part in key.split('.'):
+        if not isinstance(data, dict) or part not in data:
+            print('')
+            sys.exit(0)
+        data = data[part]
+if isinstance(data, dict):
+    print(' '.join(str(x) for x in data.keys()))
+else:
+    print('')
+" "${key}" 2>/dev/null || true)"
+
+    echo "${result}"
+}
+
+COMMAND="${1:-}"
+if [[ "${COMMAND}" == "get" ]]; then
+    KEY="${2:-}"
+    if [[ -z "${KEY}" ]]; then
+        echo "❌ Missing key. Usage: agent-guard-config get <dot.key> [default]" >&2
+        exit 1
+    fi
+    DEFAULT_VALUE="${3:-}"
+    VALUE="$(_get_config_value "${KEY}" "${DEFAULT_VALUE}")"
+elif [[ "${COMMAND}" == "keys" ]]; then
+    KEY="${2:-}"
+    VALUE="$(_get_config_keys "${KEY}")"
+else
+    echo "❌ Usage: agent-guard-config {get|keys} <dot.key> [default]" >&2
+    exit 1
+fi
+
+if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
+    echo "${VALUE}"
+else
+    AGENT_GUARD_CONFIG_VALUE="${VALUE}"
+fi

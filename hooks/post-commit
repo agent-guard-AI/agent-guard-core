@@ -1,0 +1,64 @@
+#!/usr/bin/env bash
+#
+# POST-COMMIT HOOK — Agent Guard Core
+# Adds worktree origin metadata to the current commit via git notes.
+#
+# Configuration is read from agent-guard.yaml (SSOT) via agent-guard-config.
+
+set -euo pipefail
+
+REPO_ROOT="$(git rev-parse --show-toplevel)"
+AGENT_GUARD_BIN="${REPO_ROOT}/packages/agent-guard-core/bin/agent-guard-config"
+
+if [[ ! -f "${AGENT_GUARD_BIN}" ]]; then
+    # Silently skip if agent-guard-core is not installed in this repo.
+    exit 0
+fi
+
+NOTES_REF="$(bash "${AGENT_GUARD_BIN}" get git.notes_ref 'refs/notes/agent-guard-worktree')"
+
+WORKTREE_PATH="$(git rev-parse --show-toplevel 2>/dev/null || echo "")"
+if [[ -z "${WORKTREE_PATH}" ]]; then
+    exit 0
+fi
+
+WORKTREE_NAME="$(basename "${WORKTREE_PATH}")"
+IDENTITY=""
+
+# Match worktree name against configured identity prefixes.
+IDENTITY_NAMES="$(bash "${AGENT_GUARD_BIN}" keys identities)"
+for name in ${IDENTITY_NAMES}; do
+    prefix="$(bash "${AGENT_GUARD_BIN}" get "identities.${name}.worktree_prefix" '')"
+    # Support optional task suffix (e.g. hmvip-ia-kimi4-bling).
+    if [[ -n "${prefix}" && "${WORKTREE_NAME}" =~ ^${prefix}[0-9]+(-[a-z0-9-]+)?$ ]]; then
+        slot_and_suffix="${WORKTREE_NAME#${prefix}}"
+        # Strip any suffix from the slot number.
+        IDENTITY="${name}${slot_and_suffix%%-*}"
+        break
+    fi
+done
+
+if [[ -z "${IDENTITY}" ]]; then
+    # Not an AI worktree; do not add metadata.
+    exit 0
+fi
+
+BRANCH="$(git branch --show-current 2>/dev/null || echo "")"
+
+NOTE_CONTENT="worktree:${WORKTREE_PATH}
+identity:${IDENTITY}
+branch:${BRANCH}"
+
+git notes --ref="${NOTES_REF}" add -f -m "${NOTE_CONTENT}" HEAD >/dev/null 2>&1 || true
+
+# Record commit event in session journal for crash recovery.
+JOURNAL_SCRIPT="${REPO_ROOT}/packages/agent-guard-core/src/journal.sh"
+if [[ -f "${JOURNAL_SCRIPT}" ]]; then
+    source "${JOURNAL_SCRIPT}"
+    COMMIT_SHA="$(git rev-parse HEAD 2>/dev/null || echo "")"
+    COMMIT_MSG="$(git log -1 --pretty=%s 2>/dev/null || echo "")"
+    export AGENT_GUARD_IDENTITY="${IDENTITY}"
+    export AGENT_GUARD_BRANCH="${BRANCH}"
+    export AGENT_GUARD_WORKTREE_PATH="${WORKTREE_PATH}"
+    _journal_commit "${COMMIT_SHA}" "${COMMIT_MSG}"
+fi
