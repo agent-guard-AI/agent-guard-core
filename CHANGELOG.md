@@ -1,5 +1,19 @@
 # Changelog — agent-guard-core
 
+## 0.8.4 — Menu interativo de seleção de slots (`hmvip slots` / `hmvip selecionar`)
+
+- `.kiro/shell/hmvip.sh`:
+  - Nova função `_hmvip_menu_slots()` lista todos os slots configurados em
+    `agent-guard.yaml` com status (`free`/`active`), saúde do PID (`live`/`dead`),
+    existência do worktree e branch atual.
+  - Novos comandos `hmvip slots` e `hmvip selecionar` abrem o menu de slots.
+  - O menu principal (`hmvip m`) ganha a opção `2. selecionar` para abrir o
+    menu de slots.
+  - Ações disponíveis por slot:
+    - **Livre:** usar, adotar ou retomar (mostrar nota de tarefa).
+    - **Ativo:** retomar (nota) ou liberar.
+- `AGENTS.md`: documenta `hmvip slots` / `hmvip selecionar` na tabela de atalhos.
+
 ## 0.8.3 — Alocação explícita de slot (`--slot` / `hmvip use`)
 
 - `src/init.sh`:
