@@ -1,5 +1,18 @@
 # Changelog — agent-guard-core
 
+## 0.8.5 — Correção do dispatch do subcomando `prune`
+
+- `bin/agent-guard`:
+  - O caso `prune` agora carrega `src/init.sh` no modo
+    `AGENT_GUARD_FUNCTIONS_ONLY` antes de invocar `_prune_identity`.
+  - Args do prune não são mais repassados para o parser do `init.sh`,
+    evitando erros como `Unknown option: --dry-run`.
+- `src/init.sh`:
+  - Guarda `AGENT_GUARD_FUNCTIONS_ONLY` para skippar o fluxo de aquisição/reuso
+    quando o script for carregado apenas pelos helpers.
+- `tests/agent-guard/prune-test.sh`:
+  - Adicionado teste de regressão para o dispatch CLI de `prune`.
+
 ## 0.8.4 — Menu interativo de seleção de slots (`hmvip slots` / `hmvip selecionar`)
 
 - `.kiro/shell/hmvip.sh`:
