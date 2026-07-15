@@ -1,5 +1,21 @@
 # Changelog — agent-guard-core
 
+## 0.8.3 — Alocação explícita de slot (`--slot` / `hmvip use`)
+
+- `src/init.sh`:
+  - `_acquire_slot()` ganha quarto parâmetro `forced_identity`. Quando
+    informado, só o slot solicitado é considerado (com e sem cooldown).
+    Validação rejeita identidades fora do prefixo ou fora de `max_slots`.
+  - Parse de argumentos aceita `--slot <identidade>`, permitindo
+    `source .hmvip-agent-init kimi ia-a --slot kimi3`.
+- `.kiro/shell/hmvip.sh`:
+  - Novo comando `hmvip use <identidade>` (e sinônimo `hmvip usar`).
+  - `HMVIP_AGENT_INIT` agora é resolvido dinamicamente: se o shell estiver
+    dentro de um worktree `hmvip-ia-*`, usa o stub daquele worktree;
+    caso contrário, usa o stub do repo principal.
+- `AGENTS.md` e `.agents/skills/hmvip-multi-agent/SKILL.md` atualizados com
+  o novo comando e gatilhos de linguagem natural.
+
 ## 0.8.2 — Resiliência a crashes e reinicializações (L207)
 
 - `src/init.sh`:
