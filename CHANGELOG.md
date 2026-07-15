@@ -1,5 +1,21 @@
 # Changelog — agent-guard-core
 
+## 0.8.6 — Rastros contínuos de sessão para Kimi (ADR-0022)
+
+- `src/session_trace.sh`:
+  - Novas funções `_trace_find_kimi_session_dir`, `_trace_snapshot_kimi_state`, `_trace_watch_kimi_session`, `_trace_grep_sessions` e `_trace_search_kimi_sessions`.
+  - Captura best-effort do `state.json` do Kimi Code (título, último prompt, workDir, sessionId) a cada batimento, com redação de secrets.
+  - Busca unificada por termo tanto nos checkpoints da ref `refs/agent-guard/sessions/v1` quanto no estado Kimi local.
+- `wrappers/kimi/wrapper.sh`:
+  - Inicia um watcher em background após a aquisição do lease; ele tira snapshots do estado da sessão Kimi e grava checkpoints automáticos enquanto o processo da IA estiver vivo.
+  - Configurável via `AGENT_GUARD_KIMI_WATCH_INTERVAL_SECONDS` (padrão 60) e `AGENT_GUARD_KIMI_WATCH_CHECKPOINT_INTERVAL_SECONDS` (padrão 300).
+- `bin/agent-guard`:
+  - Novo subcomando `session grep <termo>` para descobrir em qual slot/branch um termo (ex: `mobilerun`) apareceu nos rastros de sessão ou no estado Kimi.
+- `packages/agent-guard-core/hooks/post-commit`:
+  - Grava um checkpoint de session-trace a cada commit, ligando o estado da conversa ao código commitado.
+- `tests/agent-guard/session_trace-test.sh`:
+  - Testes de descoberta de sessão Kimi, snapshot redacted, `grep_sessions` e `search_kimi_sessions`.
+
 ## 0.8.5 — Correção do dispatch do subcomando `prune`
 
 - `bin/agent-guard`:

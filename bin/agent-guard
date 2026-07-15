@@ -180,9 +180,23 @@ case "${COMMAND}" in
                 fi
                 return 0 2>/dev/null || exit 0
                 ;;
+            grep|search|g)
+                term="${1:-}"
+                if [[ -z "${term}" ]]; then
+                    echo "❌ session grep requires a search term." >&2
+                    echo "   Usage: agent-guard session grep <term>" >&2
+                    return 1 2>/dev/null || exit 1
+                fi
+                echo "🔍 Searching agent-guard session traces for '${term}'..."
+                _trace_grep_sessions "${term}" 2>/dev/null || echo "   (no matches in agent-guard traces)"
+                echo ""
+                echo "🔍 Searching Kimi session state for '${term}'..."
+                _trace_search_kimi_sessions "${term}" 2>/dev/null || echo "   (no matches in Kimi sessions)"
+                return 0 2>/dev/null || exit 0
+                ;;
             *)
                 echo "❌ Unknown session subcommand: ${subcommand}" >&2
-                echo "   Subcommands: list, checkpoint, resume, explain" >&2
+                echo "   Subcommands: list, checkpoint, resume, explain, grep" >&2
                 return 1 2>/dev/null || exit 1
                 ;;
         esac

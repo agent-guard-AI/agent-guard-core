@@ -715,6 +715,19 @@ if [[ -f "${_ag_session_trace_script}" && -n "${_AG_WORKTREE:-}" && -n "${_AG_ID
             date +%s > "${_ag_session_trace_dir}/current/.last_heartbeat" 2>/dev/null || true
         fi
     )
+
+    # Start a background watcher to snapshot Kimi session metadata (title,
+    # lastPrompt, sessionId) while the frontend process is alive. This captures
+    # conversation context even if the frontend crashes before writing an
+    # explicit checkpoint. The watcher is best-effort and never blocks Kimi.
+    local watch_interval="${AGENT_GUARD_KIMI_WATCH_INTERVAL_SECONDS:-60}"
+    if [[ "${watch_interval}" -gt 0 && -n "${_AG_WORKTREE:-}" ]]; then
+        (
+            source "${_ag_session_trace_script}" >/dev/null 2>&1
+            _trace_watch_kimi_session "$$" "${_AG_WORKTREE}" "${_ag_session_trace_dir}" "${watch_interval}" "${AGENT_GUARD_KIMI_WATCH_CHECKPOINT_INTERVAL_SECONDS:-300}" >/dev/null 2>&1
+        ) &
+        disown 2>/dev/null || true
+    fi
 fi
 
 # ---------------------------------------------------------------------------

@@ -384,6 +384,227 @@ _trace_heartbeat() {
 }
 
 # ---------------------------------------------------------------------------
+# Kimi session watcher (best-effort external metadata capture)
+# ---------------------------------------------------------------------------
+
+_trace_find_kimi_session_dir() {
+    local worktree="${1:-$(_trace_get_worktree)}"
+    if [[ -z "${worktree}" ]]; then
+        return 1
+    fi
+
+    local session_index
+    session_index="${HOME}/.kimi-code/session_index.jsonl"
+    if [[ ! -f "${session_index}" ]]; then
+        return 1
+    fi
+
+    ${AG_PYTHON} - "${session_index}" "${worktree}" <<'PY' 2>/dev/null
+import json, sys, os
+index_path, worktree = sys.argv[1:3]
+latest = None
+with open(index_path, 'r', encoding='utf-8') as f:
+    for line in f:
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            entry = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if entry.get('workDir') == worktree:
+            latest = entry
+if latest and latest.get('sessionDir') and os.path.isdir(latest['sessionDir']):
+    print(latest['sessionDir'])
+    sys.exit(0)
+sys.exit(1)
+PY
+}
+
+_trace_snapshot_kimi_state() {
+    local worktree="${1:-$(_trace_get_worktree)}"
+    local session_dir="${2:-$(_trace_get_session_dir)}"
+
+    local kimi_session_dir
+    kimi_session_dir="$(_trace_find_kimi_session_dir "${worktree}" 2>/dev/null || echo "")"
+    if [[ -z "${kimi_session_dir}" ]]; then
+        return 1
+    fi
+
+    local state_file
+    state_file="${kimi_session_dir}/state.json"
+    if [[ ! -f "${state_file}" ]]; then
+        return 1
+    fi
+
+    mkdir -p "${session_dir}/current"
+
+    local safe_state
+    safe_state="$(${AG_PYTHON} - "${state_file}" <<'PY' 2>/dev/null
+import json, sys, os
+state_path = sys.argv[1]
+try:
+    with open(state_path, 'r', encoding='utf-8') as f:
+        data = json.load(f)
+except Exception:
+    sys.exit(1)
+
+safe = {k: data.get(k) for k in ('sessionId', 'workDir', 'createdAt', 'updatedAt', 'title', 'isCustomTitle', 'lastPrompt')}
+
+def trunc(value, max_len=8192):
+    if isinstance(value, str) and len(value) > max_len:
+        return value[:max_len] + '... [truncated]'
+    return value
+
+safe['title'] = trunc(safe.get('title'))
+safe['lastPrompt'] = trunc(safe.get('lastPrompt'))
+print(json.dumps(safe, ensure_ascii=False))
+PY
+)" || echo ""
+
+    if [[ -z "${safe_state}" ]]; then
+        return 1
+    fi
+
+    local redacted_state
+    redacted_state="$(_trace_redact_secrets "${safe_state}")"
+
+    echo "${redacted_state}" > "${session_dir}/current/kimi_state.json"
+    _trace_write_event "kimi_state" "${redacted_state}" >/dev/null 2>&1 || true
+    echo "${kimi_session_dir}"
+}
+
+_trace_watch_kimi_session() {
+    local parent_pid="${1:-}"
+    local worktree="${2:-$(_trace_get_worktree)}"
+    local session_dir="${3:-$(_trace_get_session_dir)}"
+    local interval_seconds="${4:-${AGENT_GUARD_KIMI_WATCH_INTERVAL_SECONDS:-60}}"
+    local checkpoint_interval_seconds="${5:-${AGENT_GUARD_KIMI_WATCH_CHECKPOINT_INTERVAL_SECONDS:-300}}"
+
+    if [[ -z "${parent_pid}" || -z "${worktree}" || -z "${session_dir}" ]]; then
+        return 1
+    fi
+
+    if [[ "${interval_seconds}" -le 0 ]]; then
+        return 0
+    fi
+
+    mkdir -p "${session_dir}/current"
+
+    local last_checkpoint now
+    now="$(date +%s)"
+    last_checkpoint="${now}"
+
+    while true; do
+        sleep "${interval_seconds}" || true
+        if ! kill -0 "${parent_pid}" >/dev/null 2>&1; then
+            break
+        fi
+        _trace_snapshot_kimi_state "${worktree}" "${session_dir}" >/dev/null 2>&1 || true
+        now="$(date +%s)"
+        if [[ $((now - last_checkpoint)) -ge ${checkpoint_interval_seconds} ]]; then
+            _trace_checkpoint "auto checkpoint from kimi watcher" >/dev/null 2>&1 || true
+            last_checkpoint="${now}"
+        fi
+    done
+
+    _trace_snapshot_kimi_state "${worktree}" "${session_dir}" >/dev/null 2>&1 || true
+    _trace_checkpoint "final checkpoint after kimi session ended" >/dev/null 2>&1 || true
+}
+
+# ---------------------------------------------------------------------------
+# Busca / grep em rastros de sessão
+# ---------------------------------------------------------------------------
+
+_trace_grep_sessions() {
+    local term="${1:-}"
+    if [[ -z "${term}" ]]; then
+        echo "Usage: session grep <term>" >&2
+        return 1
+    fi
+
+    local repo_root session_dir
+    repo_root="$(_trace_get_repo_root)"
+    session_dir="$(_trace_get_session_dir)"
+
+    local found=0
+    if git -C "${repo_root}" rev-parse --verify --quiet "${AGENT_GUARD_SESSION_REF}" >/dev/null 2>&1; then
+        while IFS= read -r line; do
+            printf '[session-ref] %s\n' "${line}"
+            found=1
+        done < <(git -C "${repo_root}" log --format='%h | %ai | %s' "${AGENT_GUARD_SESSION_REF}" 2>/dev/null | grep -i "${term}" || true)
+
+        local commit_sha
+        commit_sha="$(git -C "${repo_root}" rev-parse "${AGENT_GUARD_SESSION_REF}" 2>/dev/null || echo "")"
+        if [[ -n "${commit_sha}" ]]; then
+            while IFS= read -r line; do
+                printf '[session-tree] %s\n' "${line}"
+                found=1
+            done < <(git -C "${repo_root}" grep -i "${term}" "${commit_sha}" 2>/dev/null || true)
+        fi
+    fi
+
+    # Also search the live (not-yet-checkpointed) session files in the worktree.
+    if [[ -d "${session_dir}/current" ]]; then
+        while IFS= read -r line; do
+            printf '[session-current] %s\n' "${line}"
+            found=1
+        done < <(grep -H -i "${term}" "${session_dir}/current"/*.json "${session_dir}/current"/*.jsonl 2>/dev/null || true)
+    fi
+
+    return $((found == 0 ? 1 : 0))
+}
+
+_trace_search_kimi_sessions() {
+    local term="${1:-}"
+    if [[ -z "${term}" ]]; then
+        echo "Usage: session search-kimi <term>" >&2
+        return 1
+    fi
+
+    local session_index
+    session_index="${HOME}/.kimi-code/session_index.jsonl"
+    if [[ ! -f "${session_index}" ]]; then
+        echo "No Kimi session index found at ${session_index}." >&2
+        return 1
+    fi
+
+    ${AG_PYTHON} - "${session_index}" "${term}" <<'PY' 2>/dev/null
+import json, sys, os, re
+index_path, term = sys.argv[1:3]
+term_re = re.compile(re.escape(term), re.IGNORECASE)
+matches = []
+with open(index_path, 'r', encoding='utf-8') as f:
+    for line in f:
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            entry = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        session_dir = entry.get('sessionDir', '')
+        state_file = os.path.join(session_dir, 'state.json') if session_dir else ''
+        title = ''
+        last_prompt = ''
+        if state_file and os.path.isfile(state_file):
+            try:
+                with open(state_file, 'r', encoding='utf-8') as sf:
+                    data = json.load(sf)
+                title = data.get('title', '')
+                last_prompt = data.get('lastPrompt', '')
+            except Exception:
+                pass
+        if term_re.search(title) or term_re.search(last_prompt) or term_re.search(entry.get('workDir', '')):
+            matches.append((entry.get('workDir', ''), session_dir, title, last_prompt))
+
+print(f'matches: {len(matches)}')
+for workdir, session_dir, title, last_prompt in matches[-20:]:
+    print(f'{session_dir} | {workdir} | {title} | {last_prompt}')
+PY
+}
+
+# ---------------------------------------------------------------------------
 # Listagem e resumo de checkpoints
 # ---------------------------------------------------------------------------
 
