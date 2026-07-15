@@ -623,7 +623,26 @@ _acquire_slot() {
     # breaking atomicity and causing "flock: <fd>: invalid descriptor".
     local lock_fd=200
     eval "exec ${lock_fd}>\"${global_lock}\""
-    flock -x "${lock_fd}"
+
+    # Acquire the global lock with a bounded retry loop.  The blocking variant
+    # `flock -x` on util-linux 2.39+ spawns a helper process that can hang forever
+    # if the lock is held by a dead/zombie process, leaving the terminal frozen.
+    # Non-blocking `flock -n` avoids the helper process; we retry for up to 60s.
+    local _lock_attempt=0
+    while true; do
+        if flock -n -x "${lock_fd}"; then
+            break
+        fi
+        _lock_attempt=$((_lock_attempt + 1))
+        if [[ "${_lock_attempt}" -ge 60 ]]; then
+            echo "❌ Could not acquire global agent-guard lock after 60s." >&2
+            echo "   Another process may be holding it. Check: lslocks | grep agent-sessions" >&2
+            eval "exec ${lock_fd}>&-" 2>/dev/null || true
+            return 1
+        fi
+        sleep 1
+    done
+    unset _lock_attempt
 
     # Ensure the lock is always released when this function returns.
     # The trap runs in the current shell, so we guard against lock_fd being
@@ -728,7 +747,7 @@ _acquire_slot() {
         fi
 
         if [[ -z "${selected_identity}" ]]; then
-            if [[ "${auto_expand}" == "true" ]]; then
+            if [[ "${auto_expand,,}" == "true" ]]; then
                 echo "❌ No free slots available for '${prefix}' (all ${max_slots} in use, auto_expand exhausted)." >&2
             else
                 echo "❌ No free slots available for '${prefix}' (all ${initial_slots} in use). Enable auto_expand or release a session." >&2
