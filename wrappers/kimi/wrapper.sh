@@ -678,6 +678,43 @@ if ! _ag_have_lease; then
 fi
 
 # ---------------------------------------------------------------------------
+# 8.5 Session trace initialization (best-effort)
+# ---------------------------------------------------------------------------
+# Initialize a local trace directory for this worktree and record that the
+# wrapper was invoked. Heartbeats are written on subsequent invocations when
+# enough time has passed, so a crashed frontend still leaves a recoverable
+# trail of metadata even if no explicit checkpoint was committed.
+_ag_session_trace_dir="${_AG_WORKTREE}/.agent-guard/session"
+_ag_session_trace_script="${_AG_REPO_ROOT}/${_AG_PACKAGE_ROOT:-packages/agent-guard-core}/src/session_trace.sh"
+if [[ -f "${_ag_session_trace_script}" && -n "${_AG_WORKTREE:-}" && -n "${_AG_IDENTITY:-}" && -n "${_AG_BRANCH:-}" ]]; then
+    AGENT_GUARD_REPO_ROOT="${_AG_REPO_ROOT}"
+    AGENT_GUARD_WORKTREE_PATH="${_AG_WORKTREE}"
+    AGENT_GUARD_IDENTITY="${_AG_IDENTITY}"
+    AGENT_GUARD_BRANCH="${_AG_BRANCH}"
+    AGENT_GUARD_SESSION_DIR="${_ag_session_trace_dir}"
+    export AGENT_GUARD_REPO_ROOT AGENT_GUARD_WORKTREE_PATH AGENT_GUARD_IDENTITY AGENT_GUARD_BRANCH AGENT_GUARD_SESSION_DIR
+
+    (
+        source "${_ag_session_trace_script}" >/dev/null 2>&1
+        _trace_init >/dev/null 2>&1 || true
+        _trace_write_event "wrapper_invoke" "$(printf '{"argv":%s}' "$(printf '%s ' "$@" | ${AG_PYTHON} -c 'import json,sys; print(json.dumps(sys.stdin.read().strip()))' 2>/dev/null || echo '""')" 2>/dev/null || true)" >/dev/null 2>&1 || true
+
+        # Heartbeat if enough time elapsed since last recorded heartbeat.
+        local heartbeat_interval="${AGENT_GUARD_HEARTBEAT_INTERVAL_SECONDS:-300}"
+        local last_heartbeat=0
+        if [[ -f "${_ag_session_trace_dir}/current/.last_heartbeat" ]]; then
+            last_heartbeat="$(cat "${_ag_session_trace_dir}/current/.last_heartbeat" 2>/dev/null || echo 0)"
+        fi
+        local now
+        now="$(date +%s)"
+        if [[ $((now - last_heartbeat)) -ge ${heartbeat_interval} ]]; then
+            _trace_heartbeat "wrapper periodic heartbeat" >/dev/null 2>&1 || true
+            date +%s > "${_ag_session_trace_dir}/current/.last_heartbeat" 2>/dev/null || true
+        fi
+    )
+fi
+
+# ---------------------------------------------------------------------------
 # 9. Validate lease variables
 # ---------------------------------------------------------------------------
 if [[ -z "${_AG_WORKTREE:-}" || -z "${_AG_IDENTITY:-}" || -z "${_AG_BRANCH:-}" ]]; then
