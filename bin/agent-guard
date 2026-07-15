@@ -127,11 +127,18 @@ case "${COMMAND}" in
     prune)
         target_identity="${1:-}"
         shift 2>/dev/null || true
+        dry_run_flag="${1:-}"
         if [[ -z "${target_identity}" ]]; then
             echo "❌ prune requires an identity (ex: kimi12)." >&2
             return 1 2>/dev/null || exit 1
         fi
-        _prune_identity "${target_identity}" "$@"
+        # Prune needs init.sh helpers (session files, worktree paths, config).
+        # Do not pass the CLI args down to init.sh to avoid unknown-option errors.
+        set --
+        AGENT_GUARD_FUNCTIONS_ONLY=1
+        source "${INIT_SCRIPT}"
+        unset AGENT_GUARD_FUNCTIONS_ONLY
+        _prune_identity "${target_identity}" "${dry_run_flag}"
         return $? 2>/dev/null || exit $?
         ;;
     session|sess)

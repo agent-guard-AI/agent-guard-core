@@ -1718,6 +1718,11 @@ if git -C "${CURRENT_DIR}" rev-parse --show-toplevel >/dev/null 2>&1; then
     fi
 fi
 
+# Early-out for callers that only need helper functions loaded (e.g. prune).
+if [[ "${AGENT_GUARD_FUNCTIONS_ONLY:-}" == "1" ]]; then
+    return 0 2>/dev/null || exit 0
+fi
+
 # ---------------------------------------------------------------------------
 # 12. Reuse branch when already inside an agent worktree
 # ---------------------------------------------------------------------------
@@ -1817,6 +1822,12 @@ fi
 # ---------------------------------------------------------------------------
 # 13. New session: validate args and acquire slot
 # ---------------------------------------------------------------------------
+# When sourced only to load helper functions (e.g. from bin/agent-guard prune),
+# skip the interactive/session acquisition flow.
+if [[ "${AGENT_GUARD_FUNCTIONS_ONLY:-}" == "1" ]]; then
+    return 0 2>/dev/null || exit 0
+fi
+
 if [[ -z "${PREFIX}" || -z "${ROLE}" ]]; then
     echo "❌ Not inside an agent worktree. Provide prefix and role:" >&2
     echo "   source ${AGENT_GUARD_INIT_NAME:-.agent-guard-init} <prefix> <role> [--impact plugin1,plugin2]" >&2
