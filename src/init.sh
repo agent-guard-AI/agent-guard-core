@@ -393,7 +393,7 @@ _status_reconcile_session() {
 _worktree_has_other_live_agent() {
     local worktree_path="$1"
     local own_pid
-    own_pid="$(_ag_session_pid)"
+    own_pid="$(_ag_session_pid "${worktree_path}")"
 
     # Build the set of known agent PIDs by inspecting comm/cmdline.
     local agent_pids=""
@@ -561,9 +561,19 @@ with open('${session_file}', 'w') as f:
 # process (the agent CLI), which lives for the whole session.
 # ---------------------------------------------------------------------------
 _ag_session_pid() {
+    local expected_worktree="${1:-${AGENT_GUARD_WORKTREE_PATH:-${AG_WORKTREE_PATH:-$(pwd)}}}"
+
+    # If a session PID pin exists and is alive, validate that it belongs to the
+    # expected worktree. A stale pin can be inherited when a user sources init
+    # from inside another active Agent Guard session (e.g. nested worktrees),
+    # causing two slots to share the same PID and collide on lease checks.
     if [[ -n "${AGENT_GUARD_SESSION_PID:-}" && "${AGENT_GUARD_SESSION_PID}" != "1" ]] && kill -0 "${AGENT_GUARD_SESSION_PID}" 2>/dev/null; then
-        echo "${AGENT_GUARD_SESSION_PID}"
-        return 0
+        local pid_cwd
+        pid_cwd="$(readlink "/proc/${AGENT_GUARD_SESSION_PID}/cwd" 2>/dev/null || echo "")"
+        if [[ -z "${expected_worktree}" || "${pid_cwd}" == "${expected_worktree}" ]]; then
+            echo "${AGENT_GUARD_SESSION_PID}"
+            return 0
+        fi
     fi
     if [[ $- == *i* ]]; then
         echo "$$"
@@ -877,6 +887,109 @@ _ensure_task_note() {
 hmvip resume ${identity}
 \`\`\`
 EOF
+}
+
+# ---------------------------------------------------------------------------
+# Prune a free agent worktree safely.
+# ---------------------------------------------------------------------------
+# Removes the worktree directory and session file for an identity only when
+# all safety checks pass. Base slots (1..initial_slots) are never pruned to
+# preserve the configured capacity; only expanded slots can be removed.
+#
+# Usage:
+#   _prune_identity <identity> [--dry-run]
+#
+# Returns 0 if pruned or dry-run would prune, 1 otherwise.
+_prune_identity() {
+    local identity="${1:-}"
+    local dry_run="false"
+    if [[ "${2:-}" == "--dry-run" ]]; then
+        dry_run="true"
+    fi
+
+    if [[ -z "${identity}" ]]; then
+        echo "❌ prune requires an identity (ex: kimi12)." >&2
+        return 1
+    fi
+
+    local prefix="${identity%%[0-9]*}"
+    local slot="${identity##*[a-z]}"
+    if [[ -z "${prefix}" || -z "${slot}" || "${slot}" =~ [^0-9] ]]; then
+        echo "❌ Invalid identity: ${identity}" >&2
+        return 1
+    fi
+
+    local base_slots initial_slots
+    base_slots="$(_guard_get "identities.${prefix}.slots" 2>/dev/null || echo "0")"
+    [[ -z "${base_slots}" || "${base_slots}" == "None" ]] && base_slots="0"
+
+    if [[ "${slot}" -le "${base_slots}" ]]; then
+        echo "❌ Refusing to prune base slot ${identity} (base slots = ${base_slots})." >&2
+        echo "   Base slots are part of the configured capacity and are never deleted." >&2
+        return 1
+    fi
+
+    local session_file worktree_path
+    session_file="$(_get_session_file "${identity}")"
+    worktree_path="$(_get_worktree_path "${identity}")"
+
+    # Check session is free.
+    local status
+    status="$(_load_session_field "${identity}" "status")"
+    if [[ -f "${session_file}" && "${status}" != "free" && "${status}" != "" ]]; then
+        echo "❌ Refusing to prune ${identity}: session status is '${status}', not free." >&2
+        return 1
+    fi
+
+    # Check worktree exists.
+    if [[ ! -e "${worktree_path}/.git" ]]; then
+        echo "❌ Worktree for ${identity} does not exist at ${worktree_path}." >&2
+        return 1
+    fi
+
+    # Check branch is the neutral post-release branch.
+    local current_branch
+    current_branch="$(git -C "${worktree_path}" branch --show-current 2>/dev/null || echo "")"
+    if [[ "${current_branch}" != "_released/${identity}" ]]; then
+        echo "❌ Refusing to prune ${identity}: branch is '${current_branch}', expected '_released/${identity}'." >&2
+        return 1
+    fi
+
+    # Check working tree is clean.
+    local dirty
+    dirty="$(git -C "${worktree_path}" status --porcelain 2>/dev/null || true)"
+    if [[ -n "${dirty}" ]]; then
+        echo "❌ Refusing to prune ${identity}: working tree has uncommitted changes." >&2
+        echo "   Resolve before pruning." >&2
+        return 1
+    fi
+
+    # Check no stashes.
+    local stash_list
+    stash_list="$(git -C "${worktree_path}" stash list 2>/dev/null || true)"
+    if [[ -n "${stash_list}" ]]; then
+        echo "❌ Refusing to prune ${identity}: worktree has stashes." >&2
+        return 1
+    fi
+
+    if [[ "${dry_run}" == "true" ]]; then
+        echo "✅ Would prune ${identity}:"
+        echo "   Worktree: ${worktree_path}"
+        echo "   Session file: ${session_file}"
+        return 0
+    fi
+
+    # Remove the worktree from git and delete the directory.
+    if git -C "${_AG_REPO_ROOT}" worktree remove "${worktree_path}" 2>/dev/null || rm -rf "${worktree_path}"; then
+        rm -f "${session_file}"
+        echo "✅ Pruned ${identity}:"
+        echo "   Removed worktree: ${worktree_path}"
+        echo "   Removed session file: ${session_file}"
+        return 0
+    fi
+
+    echo "❌ Failed to remove worktree for ${identity}." >&2
+    return 1
 }
 
 # Ensure the Git worktreeConfig extension is enabled in the main repository.
@@ -1438,7 +1551,7 @@ if [[ "${MODE}" == "attach" ]]; then
     _session_audit "${WORKTREE_PATH}"
 
     impact_json="$(echo "${IMPACT_PLUGINS}" | ${AG_PYTHON} -c "import sys,json; print(json.dumps([p.strip() for p in sys.stdin.read().split(',') if p.strip()]))" 2>/dev/null || echo "[]")"
-    _save_session "${IDENTITY_FROM_BRANCH}" "active" "${ROLE}" "${ATTACH_BRANCH}" "$(_ag_session_pid)" "${WORKTREE_PATH}" "${impact_json}"
+    _save_session "${IDENTITY_FROM_BRANCH}" "active" "${ROLE}" "${ATTACH_BRANCH}" "$(_ag_session_pid "${WORKTREE_PATH}")" "${WORKTREE_PATH}" "${impact_json}"
 
     if command -v _journal_attach >/dev/null 2>&1; then
         _journal_attach "${ATTACH_BRANCH}"
@@ -1487,7 +1600,7 @@ if [[ "${MODE}" == "adopt" ]]; then
     # Refuse takeover of a live session.
     adopt_sess_status="$(_load_session_field "${ADOPT_IDENTITY}" "status")"
     adopt_sess_pid="$(_load_session_field "${ADOPT_IDENTITY}" "pid")"
-    if [[ "${adopt_sess_status}" == "active" && -n "${adopt_sess_pid}" && "${adopt_sess_pid}" != "$(_ag_session_pid)" ]]; then
+    if [[ "${adopt_sess_status}" == "active" && -n "${adopt_sess_pid}" && "${adopt_sess_pid}" != "$(_ag_session_pid "${WORKTREE_PATH}")" ]]; then
         if _is_pid_alive "${adopt_sess_pid}"; then
             echo "" >&2
             echo "❌❌❌ ERROR: SLOT STILL IN USE ❌❌❌" >&2
@@ -1553,7 +1666,7 @@ if [[ "${MODE}" == "adopt" ]]; then
     _anti_stale_check "${WORKTREE_PATH}"
 
     impact_json="$(echo "${IMPACT_PLUGINS}" | ${AG_PYTHON} -c "import sys,json; print(json.dumps([p.strip() for p in sys.stdin.read().split(',') if p.strip()]))" 2>/dev/null || echo "[]")"
-    _save_session "${ADOPT_IDENTITY}" "active" "${ROLE}" "${ADOPT_BRANCH}" "$(_ag_session_pid)" "${WORKTREE_PATH}" "${impact_json}"
+    _save_session "${ADOPT_IDENTITY}" "active" "${ROLE}" "${ADOPT_BRANCH}" "$(_ag_session_pid "${WORKTREE_PATH}")" "${WORKTREE_PATH}" "${impact_json}"
 
     # Expanded slots (beyond the base count) must have a retomada note.
     _ensure_task_note "${ADOPT_IDENTITY}"
@@ -1606,7 +1719,7 @@ elif [[ -n "${CURRENT_IDENTITY}" && -n "${CURRENT_BRANCH}" && "${CURRENT_BRANCH}
     # its process is still alive, or when the wrapper races between sessions.
     existing_pid="$(_load_session_field "${CURRENT_IDENTITY}" "pid")"
     existing_status="$(_load_session_field "${CURRENT_IDENTITY}" "status")"
-    if [[ "${existing_status}" == "active" && -n "${existing_pid}" && "${existing_pid}" != "$(_ag_session_pid)" ]]; then
+    if [[ "${existing_status}" == "active" && -n "${existing_pid}" && "${existing_pid}" != "$(_ag_session_pid "${CURRENT_WORKTREE}")" ]]; then
         if _is_pid_alive "${existing_pid}"; then
             echo ""
             echo "❌❌❌ ERROR: WORKTREE ALREADY IN USE ❌❌❌" >&2
@@ -1666,7 +1779,7 @@ elif [[ -n "${CURRENT_IDENTITY}" && -n "${CURRENT_BRANCH}" && "${CURRENT_BRANCH}
     _session_audit "${CURRENT_WORKTREE}"
 
     impact_json="$(echo "${IMPACT_PLUGINS}" | ${AG_PYTHON} -c "import sys,json; print(json.dumps([p.strip() for p in sys.stdin.read().split(',') if p.strip()]))" 2>/dev/null || echo "[]")"
-    _save_session "${CURRENT_IDENTITY}" "active" "${ROLE}" "${CURRENT_BRANCH}" "$(_ag_session_pid)" "${CURRENT_WORKTREE}" "${impact_json}"
+    _save_session "${CURRENT_IDENTITY}" "active" "${ROLE}" "${CURRENT_BRANCH}" "$(_ag_session_pid "${CURRENT_WORKTREE}")" "${CURRENT_WORKTREE}" "${impact_json}"
 
     if command -v _journal_init >/dev/null 2>&1; then
         _journal_init
@@ -1750,7 +1863,7 @@ _set_git_author "${IDENTITY}" "${WORKTREE_PATH}"
 _export_session_env "${WORKTREE_PATH}" "${BRANCH_NAME}" "${IMPACT_PLUGINS}"
 
 impact_json="$(echo "${IMPACT_PLUGINS}" | ${AG_PYTHON} -c "import sys,json; print(json.dumps([p.strip() for p in sys.stdin.read().split(',') if p.strip()]))" 2>/dev/null || echo "[]")"
-_save_session "${IDENTITY}" "active" "${ROLE}" "${BRANCH_NAME}" "$(_ag_session_pid)" "${WORKTREE_PATH}" "${impact_json}"
+_save_session "${IDENTITY}" "active" "${ROLE}" "${BRANCH_NAME}" "$(_ag_session_pid "${WORKTREE_PATH}")" "${WORKTREE_PATH}" "${impact_json}"
 
 # Expanded slots (beyond the base count) must have a retomada note.
 _ensure_task_note "${IDENTITY}"

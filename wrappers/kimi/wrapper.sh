@@ -58,6 +58,9 @@ CWD="$(pwd -P 2>/dev/null || pwd)"
 # sourced below (non-interactive shell) and this same PID survives the final
 # `exec` into kimi.real, so the lease stays bound to the agent process
 # instead of the wrapper's parent shell (see _ag_session_pid in init.sh).
+# Unset first to avoid inheriting a stale pin from a parent Agent Guard session
+# (e.g. a nested `source .hmvip-agent-init` inside another leased worktree).
+unset AGENT_GUARD_SESSION_PID
 export AGENT_GUARD_SESSION_PID="$$"
 
 # Resolve a usable Python interpreter cross-platform.
