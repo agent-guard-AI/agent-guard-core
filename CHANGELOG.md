@@ -1,5 +1,34 @@
 # Changelog — agent-guard-core
 
+## 0.9.0 — Lançamento direto em slot específico (`kimi --slot`)
+
+- `wrappers/kimi/wrapper.sh`:
+  - Novo flag `--slot <identidade>` e variável de ambiente `AGENT_GUARD_SLOT`:
+    inicia o agente diretamente no slot pedido, em um único comando e de
+    qualquer diretório do ecossistema — sem rodar `adopt`/`init` manualmente
+    antes (gap relatado em recuperação pós-crash: o `adopt` preparava o slot,
+    mas o usuário ainda precisava lançar o agente em um segundo comando).
+  - O wrapper decide automaticamente entre três fluxos:
+    1. **Recusa** slots com processo de agente vivo ou PID de lease vivo —
+       nunca faz takeover de sessão ativa.
+    2. **Adopt** quando a sessão está morta (PID stale) e a worktree tem
+       trabalho não commitado: delega ao fluxo `--adopt` do init, que preserva
+       e exibe o trabalho da sessão morta, e exporta
+       `AG_ALLOW_DIRTY_WORKTREE=1` com escopo local para que o cleanliness
+       guard não bloqueie o lançamento recém-adotado.
+    3. **Acquire** para slots livres (ou stale com worktree limpa, que o
+       próprio init limpa): delega ao fluxo `--slot` do init.
+  - O flag é consumido pelo wrapper e nunca repassado ao binário real. Se o
+    CLI um dia introduzir seu próprio `--slot`, use `AGENT_GUARD_SLOT`.
+  - Cada wrapper só aceita slots da própria família de identidade (o wrapper
+    Kimi aceita `kimiN`, nunca `claudeN`); configurável via
+    `wrappers.kimi.identity_prefix` no `agent-guard.yaml`.
+- `README.md`: nova subseção "Seleção explícita de slot (`--slot` /
+  `AGENT_GUARD_SLOT`)" na documentação do wrapper Kimi.
+- Testes (monorepo HMVIP, `tests/agent-guard/kimi-wrapper-test.sh`):
+  cobertura dos fluxos acquire/adopt/refuse, formato inválido, família de
+  identidade estrangeira e a variável `AGENT_GUARD_SLOT` (15 casos no total).
+
 ## 0.8.8 — Isolamento de shell e correção do crash em `hmvip adopt`
 
 - `.hmvip-agent-init`, `bin/agent-guard`, `src/init.sh`:

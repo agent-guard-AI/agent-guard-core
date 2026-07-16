@@ -259,6 +259,27 @@ O wrapper `wrappers/kimi/wrapper.sh` substitui o binário `kimi` do Kimi Code CL
 - Impede execução no repo principal e redireciona para um worktree livre.
 - Bloqueia worktrees sujos ou já em uso por outro processo.
 
+#### Seleção explícita de slot (`--slot` / `AGENT_GUARD_SLOT`)
+
+Por padrão o wrapper escolhe o slot automaticamente (retoma a última sessão ativa ou aloca o primeiro livre). Para ir direto a um slot específico em um único comando — sem rodar `adopt`/`init` manualmente antes:
+
+```bash
+kimi --slot kimi3            # de qualquer diretório do ecossistema
+AGENT_GUARD_SLOT=kimi3 kimi  # equivalente via variável de ambiente
+```
+
+O wrapper decide automaticamente entre três fluxos:
+
+1. **Recusa** — o slot tem um processo de agente vivo (ou um PID de lease vivo). Nunca há takeover de sessão ativa.
+2. **Adopt** — a sessão anterior morreu (PID stale) e a worktree tem trabalho não commitado. O wrapper delega ao fluxo `--adopt` do init, que **preserva e exibe** o trabalho da sessão morta antes de lançar o agente.
+3. **Acquire** — slot livre (ou stale com worktree limpa). Delega ao fluxo `--slot` do init.
+
+Notas de implementação:
+
+- O flag é consumido pelo wrapper e **nunca** é repassado ao binário real. Se o CLI um dia introduzir seu próprio `--slot`, use `AGENT_GUARD_SLOT`.
+- Cada wrapper só aceita slots da própria família de identidade (o wrapper Kimi aceita `kimiN`, nunca `claudeN`). Configurável via `wrappers.kimi.identity_prefix` no `agent-guard.yaml`.
+- No fluxo *adopt*, o wrapper exporta `AG_ALLOW_DIRTY_WORKTREE=1` com escopo local: o cleanliness guard não pode bloquear o lançamento de uma worktree cujo trabalho sujo acabou de ser explicitamente assumido e exibido ao usuário.
+
 **Modo padrão (não-invasivo):** o instalador não substitui mais o binário global `kimi`. O isolamento pode ser ativado manualmente via init stub ou, para automação total, via wrapper invasivo.
 
 - Instalação do wrapper invasivo (opcional, requer `--install-wrapper`):
