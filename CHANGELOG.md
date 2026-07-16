@@ -1,5 +1,48 @@
 # Changelog — agent-guard-core
 
+## 0.8.8 — Isolamento de shell e correção do crash em `hmvip adopt`
+
+- `.hmvip-agent-init`, `bin/agent-guard`, `src/init.sh`:
+  - Corrigido o vazamento de `set -euo pipefail` para o shell interativo do
+    usuário quando comandos como `hmvip adopt` falhavam, o que terminava o
+    terminal com código 1.
+  - Scripts `source`ados agora salvam as flags do shell chamador, envolvem a
+    lógica em funções internas e restauram as flags originais **antes** de
+    retornar um código de erro, evitando que `errexit` dispare no shell do
+    usuário.
+  - `src/init.sh`: corpo principal movido para `_agent_guard_init_body()`;
+    falhas são capturadas com `|| _rc=$?` e o retorno é feito com as flags
+    restauradas.
+- `src/init.sh`:
+  - `--adopt` agora aceita worktrees em *detached HEAD* desde que o commit
+    atual pertença à branch própria do slot (`ia-<identidade>/...`).
+- `.kiro/shell/hmvip.sh`:
+  - Helper `hmvip()` protege o diretório de trabalho com `_hmvip_old_pwd` e
+    restaura-o em caso de falha do `source`, evitando que o usuário fique
+    preso em um diretório inesperado após um adopt malsucedido.
+  - Novo helper `_hmvip_safe_source()` centraliza todo `source` do stub do
+    agent-guard: salva e restaura o diretório de trabalho, garantindo que
+    nenhum comando (`status`, `triage`, `menu`, etc.) deixe o terminal em um
+    diretório errado.
+  - Validação inicial de `python3` e existência do stub impede mensagens
+    confusas em ambientes quebrados.
+- `.kiro/scripts/diff-regression-guard.sh`:
+  - Corrigido o `Broken pipe` causado por `echo "$VAR" | grep -q` sob
+    `set -euo pipefail`. As buscas foram reescritas com here-strings
+    (`grep -q ... <<< "$VAR"`), eliminando SIGPIPE quando a correspondência
+    é encontrada.
+- `.kiro/locks/regression-guard-allowlist.json`:
+  - Adicionada entrada para `packages/agent-guard-core/bin/agent-guard` (type
+    `large-content-removed-from-recent-file`), documentando que as ~178 linhas
+    removidas são a mesma lógica funcional reestruturada, não uma reversão.
+- `tests/agent-guard/`:
+  - Novo `shell-isolation-test.sh` valida que `source .hmvip-agent-init` não
+    deixa `set -e` ativo no shell chamador.
+  - Novo `diff-regression-guard-test.sh` valida que o guard detecta
+    regressões, respeita a allowlist e não emite `Broken pipe`.
+  - `agent-init-test.sh` ganhou casos de regressão para `--adopt` (PID morto,
+    PID vivo, branch estrangeira e detached HEAD).
+
 ## 0.8.7 — Fix do wrapper Kimi: `local` em subshells
 
 - `wrappers/kimi/wrapper.sh`:

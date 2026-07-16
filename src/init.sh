@@ -26,23 +26,52 @@
 #
 # v2.0.0 — independent from legacy lease scripts
 
-# Strict mode for init (do not apply to user's interactive shell after sourcing)
-set -euo pipefail
+# ---------------------------------------------------------------------------
+# 0. Preserve caller shell state
+# ---------------------------------------------------------------------------
+# This script is sourced into the user's interactive shell. We must restore
+# its options (especially set -e / errexit) before returning, otherwise a
+# later failing command in the user's shell kills their terminal.
+_AG_OLD_SHELL_FLAGS="$(set +o)"
+_AG_OLD_EXIT_TRAP="$(trap -p EXIT 2>/dev/null || true)"
 
-# ---------------------------------------------------------------------------
-# 0. Detect mode: sourced vs executed directly
-# ---------------------------------------------------------------------------
-if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
-    echo "❌ This script must be sourced, not executed directly." >&2
-    echo "   source ${AGENT_GUARD_INIT_NAME:-.agent-guard-init} <prefix> <role> [--impact plugin1,plugin2]" >&2
-    echo "   source ${AGENT_GUARD_INIT_NAME:-.agent-guard-init} --attach ia-<identity>/<role>/<branch>" >&2
-    exit 1
-fi
+_ag_restore_shell_flags() {
+    eval "${_AG_OLD_SHELL_FLAGS}" 2>/dev/null || true
+}
 
-# ---------------------------------------------------------------------------
-# 1. Resolve repository root and guard config
-# ---------------------------------------------------------------------------
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+_ag_cleanup_on_exit() {
+    _ag_restore_shell_flags
+    if [[ -n "${_AG_OLD_EXIT_TRAP}" ]]; then
+        eval "${_AG_OLD_EXIT_TRAP}" 2>/dev/null || true
+    else
+        trap - EXIT 2>/dev/null || true
+    fi
+}
+
+trap '_ag_cleanup_on_exit' EXIT
+
+function _agent_guard_init_main() {
+    # Strict mode for init (do not apply to user's interactive shell after sourcing)
+    set -euo pipefail
+
+    # The real work happens inside a nested function so that any failing return
+    # from the body is captured without propagating set -e to the caller's shell.
+    function _agent_guard_init_body() {
+
+    # ---------------------------------------------------------------------------
+    # 0a. Detect mode: sourced vs executed directly
+    # ---------------------------------------------------------------------------
+    if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
+        echo "❌ This script must be sourced, not executed directly." >&2
+        echo "   source ${AGENT_GUARD_INIT_NAME:-.agent-guard-init} <prefix> <role> [--impact plugin1,plugin2]" >&2
+        echo "   source ${AGENT_GUARD_INIT_NAME:-.agent-guard-init} --attach ia-<identity>/<role>/<branch>" >&2
+        exit 1
+    fi
+
+    # ---------------------------------------------------------------------------
+    # 1. Resolve repository root and guard config
+    # ---------------------------------------------------------------------------
+    SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 # Resolve a usable Python interpreter cross-platform.
 AG_PYTHON="$(bash "${SCRIPT_DIR}/../bin/agent-guard-python" 2>/dev/null || echo "python3")"
@@ -673,7 +702,8 @@ _acquire_slot() {
     # Ensure the lock is always released when this function returns.
     # The trap runs in the current shell, so we guard against lock_fd being
     # unset (e.g. if the trap fires after the function already returned).
-    trap 'if [[ -n "${lock_fd:-}" ]]; then flock -u "${lock_fd}" 2>/dev/null || true; eval "exec ${lock_fd}>&-" 2>/dev/null || true; fi' EXIT
+    # _ag_cleanup_on_exit also restores the caller's shell flags and trap.
+    trap '_ag_cleanup_on_exit' EXIT
 
     local selected_identity=""
 
@@ -1634,6 +1664,11 @@ if [[ "${MODE}" == "adopt" ]]; then
     git fetch origin >/dev/null 2>&1 || true
 
     ADOPT_BRANCH="$(git branch --show-current 2>/dev/null || echo "")"
+    if [[ -z "${ADOPT_BRANCH}" ]]; then
+        # Detached HEAD: accept if the current commit belongs to this slot's own
+        # branch (e.g. after a crash left the worktree detached on a task commit).
+        ADOPT_BRANCH="$(git branch --list "ia-${ADOPT_IDENTITY}/"* --contains HEAD 2>/dev/null | head -n1 | sed 's/^[ *]*//')"
+    fi
     if [[ "${ADOPT_BRANCH}" != "ia-${ADOPT_IDENTITY}/"* && "${ADOPT_BRANCH}" != "_released/${ADOPT_IDENTITY}" ]]; then
         echo "" >&2
         echo "❌❌❌ ERROR: FOREIGN OR PROTECTED BRANCH ❌❌❌" >&2
@@ -1938,3 +1973,12 @@ echo "To release the session, run: source ${AGENT_GUARD_INIT_NAME:-.agent-guard-
 echo ""
 
 return 0 2>/dev/null || exit 0
+}
+
+local _rc=0
+_agent_guard_init_body "$@" || _rc=$?
+_ag_restore_shell_flags
+return ${_rc}
+}
+
+_agent_guard_init_main "$@"
