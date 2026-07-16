@@ -703,12 +703,11 @@ if [[ -f "${_ag_session_trace_script}" && -n "${_AG_WORKTREE:-}" && -n "${_AG_ID
         _trace_write_event "wrapper_invoke" "$(printf '{"argv":%s}' "$(printf '%s ' "$@" | ${AG_PYTHON} -c 'import json,sys; print(json.dumps(sys.stdin.read().strip()))' 2>/dev/null || echo '""')" 2>/dev/null || true)" >/dev/null 2>&1 || true
 
         # Heartbeat if enough time elapsed since last recorded heartbeat.
-        local heartbeat_interval="${AGENT_GUARD_HEARTBEAT_INTERVAL_SECONDS:-300}"
-        local last_heartbeat=0
+        heartbeat_interval="${AGENT_GUARD_HEARTBEAT_INTERVAL_SECONDS:-300}"
+        last_heartbeat=0
         if [[ -f "${_ag_session_trace_dir}/current/.last_heartbeat" ]]; then
             last_heartbeat="$(cat "${_ag_session_trace_dir}/current/.last_heartbeat" 2>/dev/null || echo 0)"
         fi
-        local now
         now="$(date +%s)"
         if [[ $((now - last_heartbeat)) -ge ${heartbeat_interval} ]]; then
             _trace_heartbeat "wrapper periodic heartbeat" >/dev/null 2>&1 || true
@@ -720,7 +719,7 @@ if [[ -f "${_ag_session_trace_script}" && -n "${_AG_WORKTREE:-}" && -n "${_AG_ID
     # lastPrompt, sessionId) while the frontend process is alive. This captures
     # conversation context even if the frontend crashes before writing an
     # explicit checkpoint. The watcher is best-effort and never blocks Kimi.
-    local watch_interval="${AGENT_GUARD_KIMI_WATCH_INTERVAL_SECONDS:-60}"
+    watch_interval="${AGENT_GUARD_KIMI_WATCH_INTERVAL_SECONDS:-60}"
     if [[ "${watch_interval}" -gt 0 && -n "${_AG_WORKTREE:-}" ]]; then
         (
             source "${_ag_session_trace_script}" >/dev/null 2>&1
