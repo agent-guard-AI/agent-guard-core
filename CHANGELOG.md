@@ -1,5 +1,15 @@
 # Changelog — agent-guard-core
 
+## 0.8.7 — Fix do wrapper Kimi: `local` em subshells
+
+- `wrappers/kimi/wrapper.sh`:
+  - Remove `local` de variáveis declaradas em subshells de nível superior
+    (`heartbeat_interval`, `last_heartbeat`, `now`, `watch_interval`).
+  - `local` fora de funções causava `local: can only be used in a function`
+    e abortava o wrapper ao disparar heartbeat/watcher.
+- **Sync upstream:** correção incluída no PR upstream #10
+  (`agent-guard-AI/agent-guard-core`).
+
 ## 0.8.6 — Rastros contínuos de sessão para Kimi (ADR-0022)
 
 - `src/session_trace.sh`:
