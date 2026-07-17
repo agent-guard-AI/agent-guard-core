@@ -1,5 +1,31 @@
 # Changelog — agent-guard-core
 
+## 0.9.1 — Wrapper nunca herda lease de sessão pai
+
+- `wrappers/kimi/wrapper.sh`:
+  - **Correção de isolamento:** o wrapper agora faz `unset` de
+    `_AG_WORKTREE/_AG_IDENTITY/_AG_BRANCH`, `_HMVIP_*`, `AG_WORKTREE_PATH`,
+    `AG_BRANCH` e `AGENT_GUARD_WORKTREE_PATH/IDENTITY/BRANCH` logo no início.
+    Antes, uma invocação aninhada de `kimi` de dentro de uma sessão de agente
+    existente herdava essas variáveis e o `_ag_have_lease` fazia
+    short-circuit da aquisição de lease com a identidade/worktree/branch da
+    sessão pai — o agente filho rodava preso ao lease errado (ou morria no
+    cleanliness/foreign guard com dados do pai). Mesma classe de problema do
+    `unset AGENT_GUARD_SESSION_PID` já existente.
+- Testes (monorepo HMVIP, `tests/agent-guard/kimi-wrapper-test.sh`):
+  novo caso cobre a invocação aninhada com lease herdado da sessão pai
+  (16 casos no total).
+- Upstream `agent-guard-AI/agent-guard-core`:
+  - `tests/agent-guard/kimi-wrapper-fallback-test.sh` corrigido: layout
+    canônico `packages/agent-guard-core`, stub de init cria worktree com
+    branch própria (`develop` já estava checked out por outro worktree e o
+    `git worktree add` falhava em silêncio), arg não-management (`chat`)
+    para exercitar o fallback de verdade — management short-circuita antes
+    do fluxo de lease.
+  - `tests/agent-guard/agent-guard-release-reuse-test.sh` atualizado para a
+    versão do monorepo (atomic-lock refactor) com paths adaptados ao layout
+    do upstream.
+
 ## 0.9.0 — Lançamento direto em slot específico (`kimi --slot`)
 
 - `wrappers/kimi/wrapper.sh`:

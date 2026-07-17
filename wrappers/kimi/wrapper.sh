@@ -103,6 +103,16 @@ CWD="$(pwd -P 2>/dev/null || pwd)"
 unset AGENT_GUARD_SESSION_PID
 export AGENT_GUARD_SESSION_PID="$$"
 
+# Never inherit lease state from a parent Agent Guard session (e.g. a nested
+# `kimi` invocation from inside an existing agent session): these variables
+# are produced by THIS wrapper after the init script runs. A stale inherited
+# value would make _ag_have_lease short-circuit the lease acquisition below
+# with the parent session's identity/worktree/branch.
+unset _AG_WORKTREE _AG_IDENTITY _AG_BRANCH
+unset _HMVIP_WORKTREE _HMVIP_IDENTITY _HMVIP_BRANCH
+unset AG_WORKTREE_PATH AG_BRANCH
+unset AGENT_GUARD_WORKTREE_PATH AGENT_GUARD_IDENTITY AGENT_GUARD_BRANCH
+
 # Resolve a usable Python interpreter cross-platform.
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 AG_PYTHON="$(bash "${SCRIPT_DIR}/bin/agent-guard-python" 2>/dev/null || echo "python3")"
