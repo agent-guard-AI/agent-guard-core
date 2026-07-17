@@ -14,6 +14,12 @@
 # AGENT_GUARD_REPO_ROOT environment variable. It parses agent-guard.yaml using
 # python3.
 
+# Preserve caller shell options; never leak set -euo pipefail into the user's shell.
+_AG_OLD_SHELL_FLAGS="$(set +o)"
+_ag_restore_shell_flags() {
+    eval "${_AG_OLD_SHELL_FLAGS}" 2>/dev/null || true
+}
+
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -116,7 +122,8 @@ if [[ "${COMMAND}" == "get" ]]; then
     KEY="${2:-}"
     if [[ -z "${KEY}" ]]; then
         echo "❌ Missing key. Usage: agent-guard-config get <dot.key> [default]" >&2
-        exit 1
+        _ag_restore_shell_flags
+        return 1 2>/dev/null || exit 1
     fi
     DEFAULT_VALUE="${3:-}"
     VALUE="$(_get_config_value "${KEY}" "${DEFAULT_VALUE}")"
@@ -125,7 +132,8 @@ elif [[ "${COMMAND}" == "keys" ]]; then
     VALUE="$(_get_config_keys "${KEY}")"
 else
     echo "❌ Usage: agent-guard-config {get|keys} <dot.key> [default]" >&2
-    exit 1
+    _ag_restore_shell_flags
+    return 1 2>/dev/null || exit 1
 fi
 
 if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
@@ -133,3 +141,5 @@ if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
 else
     AGENT_GUARD_CONFIG_VALUE="${VALUE}"
 fi
+
+_ag_restore_shell_flags

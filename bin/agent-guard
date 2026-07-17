@@ -18,111 +18,219 @@
 #   source agent-guard --attach <branch>      # legado
 #   source agent-guard --triage <prefix>      # legado
 
-set -euo pipefail
+# Preserve caller shell options; never leak set -euo pipefail into the user's
+# interactive shell.
+_AG_OLD_SHELL_FLAGS="$(set +o)"
+_ag_restore_shell_flags() {
+    eval "${_AG_OLD_SHELL_FLAGS}" 2>/dev/null || true
+}
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-INIT_SCRIPT="${SCRIPT_DIR}/src/init.sh"
-JOURNAL_SCRIPT="${SCRIPT_DIR}/src/journal.sh"
+function _agent_guard_main() {
+    set -euo pipefail
 
-if [[ ! -f "${INIT_SCRIPT}" ]]; then
-    echo "❌ agent-guard init script not found: ${INIT_SCRIPT}" >&2
-    return 1 2>/dev/null || exit 1
-fi
+    local SCRIPT_DIR
+    SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+    local INIT_SCRIPT="${SCRIPT_DIR}/src/init.sh"
+    local JOURNAL_SCRIPT="${SCRIPT_DIR}/src/journal.sh"
+    local SESSION_TRACE_SCRIPT="${SCRIPT_DIR}/src/session_trace.sh"
 
-if [[ -f "${JOURNAL_SCRIPT}" ]]; then
-    source "${JOURNAL_SCRIPT}"
-fi
+    if [[ ! -f "${INIT_SCRIPT}" ]]; then
+        echo "❌ agent-guard init script not found: ${INIT_SCRIPT}" >&2
+        return 1
+    fi
 
-if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
-    echo "❌ agent-guard must be sourced, not executed directly." >&2
-    exit 1
-fi
+    if [[ -f "${JOURNAL_SCRIPT}" ]]; then
+        source "${JOURNAL_SCRIPT}"
+    fi
 
-KNOWN_IDENTITIES="kimi claude gemini grok"
-FIRST_ARG="${1:-}"
+    if [[ -f "${SESSION_TRACE_SCRIPT}" ]]; then
+        source "${SESSION_TRACE_SCRIPT}"
+    fi
 
-if [[ -z "${FIRST_ARG}" ]]; then
-    # No args: let init.sh decide (reuse current worktree branch or show help).
-    source "${INIT_SCRIPT}"
-    return $? 2>/dev/null || exit $?
-fi
+    if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
+        echo "❌ agent-guard must be sourced, not executed directly." >&2
+        exit 1
+    fi
 
-if [[ "${FIRST_ARG}" == --* ]]; then
-    source "${INIT_SCRIPT}" "$@"
-    return $? 2>/dev/null || exit $?
-fi
-
-if [[ " ${KNOWN_IDENTITIES} " =~ \ ${FIRST_ARG%%[0-9]*}\  ]]; then
-    source "${INIT_SCRIPT}" "$@"
-    return $? 2>/dev/null || exit $?
-fi
-
-COMMAND="${FIRST_ARG}"
-shift 2>/dev/null || true
-
-case "${COMMAND}" in
-    init|lease|l)
+    # Source init.sh with strict mode suspended. If init.sh fails, we want its
+    # exit code to return to our caller, not to kill this script under set -e.
+    # We must NOT re-enable set -e before returning: restore the caller's shell
+    # flags first, then return the captured exit code.
+    _ag_source_init() {
+        set +e
         source "${INIT_SCRIPT}" "$@"
-        return $? 2>/dev/null || exit $?
-        ;;
-    status|s)
-        source "${INIT_SCRIPT}" --status
-        return $? 2>/dev/null || exit $?
-        ;;
-    release|r)
-        source "${INIT_SCRIPT}" --release
-        return $? 2>/dev/null || exit $?
-        ;;
-    switch|sw)
-        source "${INIT_SCRIPT}" --switch "$@"
-        return $? 2>/dev/null || exit $?
-        ;;
-    attach|a)
-        if [[ $# -lt 1 ]]; then
-            echo "❌ attach requires a branch name." >&2
-            return 1 2>/dev/null || exit 1
-        fi
-        source "${INIT_SCRIPT}" --attach "$@"
-        return $? 2>/dev/null || exit $?
-        ;;
-    adopt|ad)
-        if [[ $# -lt 1 ]]; then
-            echo "❌ adopt requires an identity (ex: kimi3)." >&2
-            return 1 2>/dev/null || exit 1
-        fi
-        source "${INIT_SCRIPT}" --adopt "$@"
-        return $? 2>/dev/null || exit $?
-        ;;
-    triage|t)
-        if [[ $# -lt 1 ]]; then
-            echo "❌ triage requires a prefix." >&2
-            return 1 2>/dev/null || exit 1
-        fi
-        source "${INIT_SCRIPT}" --triage "$@"
-        return $? 2>/dev/null || exit $?
-        ;;
-    journal|j)
-        _journal_list "$@"
-        return $? 2>/dev/null || exit $?
-        ;;
-    resume|res)
-        _journal_resume "$@"
-        return $? 2>/dev/null || exit $?
-        ;;
-    checkpoint|cp)
-        msg="${*:-checkpoint}"
-        if [[ -z "${msg}" ]]; then
-            echo "❌ checkpoint requires a message." >&2
-            return 1 2>/dev/null || exit 1
-        fi
-        _journal_checkpoint "${msg}"
-        echo "📝 Checkpoint recorded."
-        return 0 2>/dev/null || exit 0
-        ;;
-    *)
-        echo "❌ Unknown command or identity: ${COMMAND}" >&2
-        echo "   Commands: init, status, release, attach, triage, journal, resume, checkpoint" >&2
-        echo "   Legacy:   <kimi|claude|gemini|grok> <role>" >&2
-        return 1 2>/dev/null || exit 1
-        ;;
-esac
+        local _rc=$?
+        _ag_restore_shell_flags
+        return ${_rc}
+    }
+
+    local KNOWN_IDENTITIES="kimi claude gemini grok"
+    local FIRST_ARG="${1:-}"
+
+    if [[ -z "${FIRST_ARG}" ]]; then
+        _ag_source_init
+        return $?
+    fi
+
+    if [[ "${FIRST_ARG}" == --* ]]; then
+        _ag_source_init "$@"
+        return $?
+    fi
+
+    if [[ " ${KNOWN_IDENTITIES} " =~ \ ${FIRST_ARG%%[0-9]*}\  ]]; then
+        _ag_source_init "$@"
+        return $?
+    fi
+
+    local COMMAND="${FIRST_ARG}"
+    shift 2>/dev/null || true
+
+    case "${COMMAND}" in
+        init|lease|l)
+            _ag_source_init "$@"
+            return $?
+            ;;
+        status|s)
+            _ag_source_init --status
+            return $?
+            ;;
+        release|r)
+            _ag_source_init --release "$@"
+            return $?
+            ;;
+        switch|sw)
+            _ag_source_init --switch "$@"
+            return $?
+            ;;
+        attach|a)
+            if [[ $# -lt 1 ]]; then
+                echo "❌ attach requires a branch name." >&2
+                return 1
+            fi
+            _ag_source_init --attach "$@"
+            return $?
+            ;;
+        adopt|ad)
+            if [[ $# -lt 1 ]]; then
+                echo "❌ adopt requires an identity (ex: kimi3)." >&2
+                return 1
+            fi
+            _ag_source_init --adopt "$@"
+            return $?
+            ;;
+        triage|t)
+            if [[ $# -lt 1 ]]; then
+                echo "❌ triage requires a prefix." >&2
+                return 1
+            fi
+            _ag_source_init --triage "$@"
+            return $?
+            ;;
+        journal|j)
+            _journal_list "$@"
+            return $?
+            ;;
+        resume|res)
+            _journal_resume "$@"
+            return $?
+            ;;
+        checkpoint|cp)
+            local msg="${*:-checkpoint}"
+            if [[ -z "${msg}" ]]; then
+                echo "❌ checkpoint requires a message." >&2
+                return 1
+            fi
+            _journal_checkpoint "${msg}"
+            echo "📝 Checkpoint recorded."
+            return 0
+            ;;
+        prune)
+            local target_identity="${1:-}"
+            shift 2>/dev/null || true
+            local dry_run_flag="${1:-}"
+            if [[ -z "${target_identity}" ]]; then
+                echo "❌ prune requires an identity (ex: kimi12)." >&2
+                return 1
+            fi
+            # Prune needs init.sh helpers (session files, worktree paths, config).
+            # Do not pass the CLI args down to init.sh to avoid unknown-option errors.
+            set --
+            AGENT_GUARD_FUNCTIONS_ONLY=1
+            _ag_source_init
+            unset AGENT_GUARD_FUNCTIONS_ONLY
+            _prune_identity "${target_identity}" "${dry_run_flag}"
+            return $?
+            ;;
+        session|sess)
+            local subcommand="${1:-list}"
+            shift 2>/dev/null || true
+            case "${subcommand}" in
+                list|ls)
+                    _trace_list_checkpoints
+                    return $?
+                    ;;
+                checkpoint|cp)
+                    local msg="${*:-session checkpoint}"
+                    local cp_id="$(_trace_checkpoint "${msg}" 2>/dev/null || echo "")"
+                    if [[ -n "${cp_id}" ]]; then
+                        echo "📝 Session checkpoint recorded: ${cp_id}"
+                        return 0
+                    else
+                        echo "❌ Failed to record session checkpoint." >&2
+                        return 1
+                    fi
+                    ;;
+                resume|res)
+                    local branch="${1:-}"
+                    if [[ -n "${branch}" ]]; then
+                        echo "Resume for branch ${branch}:"
+                    fi
+                    _trace_last_checkpoint
+                    return $?
+                    ;;
+                explain|exp)
+                    local cp_id="${1:-}"
+                    if [[ -z "${cp_id}" ]]; then
+                        _trace_last_checkpoint
+                    else
+                        git -C "$(_trace_get_repo_root)" show --stat --oneline "${cp_id}" 2>/dev/null || {
+                            echo "❌ Checkpoint ${cp_id} not found." >&2
+                            return 1
+                        }
+                    fi
+                    return 0
+                    ;;
+                grep|search|g)
+                    local term="${1:-}"
+                    if [[ -z "${term}" ]]; then
+                        echo "❌ session grep requires a search term." >&2
+                        echo "   Usage: agent-guard session grep <term>" >&2
+                        return 1
+                    fi
+                    echo "🔍 Searching agent-guard session traces for '${term}'..."
+                    _trace_grep_sessions "${term}" 2>/dev/null || echo "   (no matches in agent-guard traces)"
+                    echo ""
+                    echo "🔍 Searching Kimi session state for '${term}'..."
+                    _trace_search_kimi_sessions "${term}" 2>/dev/null || echo "   (no matches in Kimi sessions)"
+                    return 0
+                    ;;
+                *)
+                    echo "❌ Unknown session subcommand: ${subcommand}" >&2
+                    echo "   Subcommands: list, checkpoint, resume, explain, grep" >&2
+                    return 1
+                    ;;
+            esac
+            ;;
+        *)
+            echo "❌ Unknown command or identity: ${COMMAND}" >&2
+            echo "   Commands: init, status, release, attach, triage, journal, resume, checkpoint, session, prune" >&2
+            echo "   Legacy:   <kimi|claude|gemini|grok> <role>" >&2
+            return 1
+            ;;
+    esac
+}
+
+_agent_guard_main "$@"
+_AG_MAIN_RC=$?
+_ag_restore_shell_flags
+return ${_AG_MAIN_RC}

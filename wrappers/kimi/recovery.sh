@@ -13,6 +13,9 @@
 #   2. If not, backs up the current binary as kimi.real.<timestamp>.
 #   3. Copies the versioned wrapper to <bin_dir>/kimi.
 #   4. Ensures <bin_dir>/kimi.real points to the real binary.
+#   5. Prunes old kimi.real.* backups, keeping only the newest few
+#      (AG_KIMI_BACKUP_KEEP, default 3) — without retention each backup
+#      (~150 MB) accumulates forever and can fill the disk.
 #
 set -euo pipefail
 
@@ -90,6 +93,32 @@ _ag_atomic_replace() {
     mv "${tmp_target}" "${target}"
 }
 
+# Prune timestamped kimi.real.* backups, keeping only the newest few.
+# Every recovery run creates one backup (~150 MB); without retention they
+# accumulate indefinitely and can fill the disk. The canonical kimi.real
+# (no suffix) is never matched by the 'kimi.real.*' glob.
+_ag_prune_real_backups() {
+    local keep="${AG_KIMI_BACKUP_KEEP:-3}"
+    [[ "${keep}" =~ ^[0-9]+$ ]] || keep=3
+    local old_backups
+    old_backups="$(find "${KIMI_BIN_DIR}" -maxdepth 1 -type f -name 'kimi.real.*' -print0 2>/dev/null | \
+        xargs -0 -r ls -t 2>/dev/null | tail -n "+$((keep + 1))" || true)"
+    [[ -z "${old_backups}" ]] && return 0
+    local count=0
+    local old_backup
+    while IFS= read -r old_backup; do
+        [[ -z "${old_backup}" ]] && continue
+        rm -f -- "${old_backup}" && count=$((count + 1))
+    done <<< "${old_backups}"
+    if [[ "${count}" -gt 0 ]]; then
+        echo "🧹 Pruned ${count} old kimi.real backup(s); kept the newest ${keep}."
+    fi
+}
+
+# Retention runs on every invocation, including no-op "already wrapper" runs,
+# so a backup burst is cleaned up even when no recovery is needed.
+_ag_prune_real_backups
+
 # Nothing to do if already wrapper.
 if _is_wrapper "${KIMI_BIN}"; then
     echo "✅ ${KIMI_BIN} is already the Agent Guard wrapper."
@@ -107,6 +136,8 @@ if [[ -f "${KIMI_BIN}" ]]; then
         backup_bin="${KIMI_BIN_DIR}/kimi.real.${timestamp}"
         cp "${KIMI_BIN}" "${backup_bin}"
         echo "💾 Backed up current binary to ${backup_bin}"
+        # Re-prune so the fresh backup counts toward the retention window.
+        _ag_prune_real_backups
 
         if [[ ! -f "${KIMI_REAL}" ]] || [[ "${KIMI_BIN}" -nt "${KIMI_REAL}" ]]; then
             _ag_atomic_replace "${KIMI_BIN}" "${KIMI_REAL}"
