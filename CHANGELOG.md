@@ -1,5 +1,35 @@
 # Changelog — agent-guard-core
 
+## 0.9.3 — Release nunca é automático: guarda de PRs abertos + `--force`
+
+- **Mudança de protocolo (pedido do dono, 2026-07-17):** finalizar uma
+  tarefa/spec/lição/alteração/refatoração/correção/implementação **não libera
+  o slot**. A IA deve encerrar o trabalho com segurança, informar o estado
+  (PRs, fila, CI) e **perguntar ao usuário** se ele deseja liberar — 99% das
+  sessões ainda têm PRs em andamento e o slot estava sendo liberado
+  antecipadamente.
+- `src/init.sh`:
+  - Nova guarda `_release_pending_work_guard` no fluxo `--release`: consulta
+    PRs abertos da identidade (`gh pr list` filtrando `ia-<identidade>/*` por
+    prefixo via `startswith`) e:
+    - **sem PRs abertos:** release segue normalmente;
+    - **com PRs abertos + TTY (humano):** pergunta explícita `[y/N]` antes de
+      liberar;
+    - **com PRs abertos + não-TTY (IA):** release **bloqueado**, com a lista
+      dos PRs e a instrução de apresentá-los ao usuário — só prossegue com
+      `--release --force`, que exige autorização prévia do usuário;
+    - **gh ausente ou erro de rede:** fail-open com aviso (a guarda é contra
+      esquecimento, não trava de disponibilidade).
+  - Novo flag global `--force` (parser de argumentos + variável
+    `FORCE_RELEASE`).
+- Testes (monorepo HMVIP, `tests/agent-guard/agent-guard-release-pending-prs-test.sh`):
+  8 casos — bloqueio com PRs abertos, listagem dos PRs, instrução de
+  `--force`, sessão e branch preservadas no bloqueio, release com `--force`,
+  e release sem PRs sem `--force` (gh fakeado via PATH).
+- Documentação: ritual de encerramento do `AGENTS.md` e skills
+  `hmvip-multi-agent` / `hmvip-agent-guard` atualizados para o fluxo
+  "perguntar antes de liberar".
+
 ## 0.9.2 — Retenção de backups `kimi.real.*` no recovery do wrapper Kimi
 
 - `wrappers/kimi/recovery.sh`:

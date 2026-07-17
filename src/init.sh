@@ -1207,6 +1207,7 @@ ROLE=""
 IMPACT_PLUGINS=""
 FORCED_IDENTITY=""
 USE_WORKTREE="true"
+FORCE_RELEASE="false"
 MODE="acquire"
 
 while [[ $# -gt 0 ]]; do
@@ -1242,6 +1243,10 @@ while [[ $# -gt 0 ]]; do
             ;;
         --release)
             MODE="release"
+            shift
+            ;;
+        --force)
+            FORCE_RELEASE="true"
             shift
             ;;
         --status)
@@ -1413,6 +1418,82 @@ _validate_worktree_release_ready() {
 }
 
 # ---------------------------------------------------------------------------
+# Helper: pending-work guard (protocolo 2026-07-17)
+#
+# Finalizar uma tarefa/spec/correção NÃO libera o slot: na maioria das
+# sessões ainda há PRs em andamento (CI, merge queue, correções), e a IA
+# estava liberando antecipadamente. O release agora verifica PRs abertos da
+# identidade (branches ia-<identity>/*) e:
+#   - sem PRs abertos: segue normalmente;
+#   - com PRs abertos + TTY (humano): pergunta explicitamente [y/N];
+#   - com PRs abertos + não-TTY (IA): BLOQUEIA e exige --force, que só deve
+#     ser usado após autorização explícita do usuário;
+#   - gh indisponível/erro de rede: fail-open com aviso (guard é proteção
+#     contra esquecimento, não trava de disponibilidade).
+# ---------------------------------------------------------------------------
+_release_pending_work_guard() {
+    local identity="$1"
+    local worktree_path="$2"
+    local force="${3:-false}"
+
+    if ! command -v gh >/dev/null 2>&1; then
+        echo "⚠️  gh CLI indisponível — verificação de PRs abertos pulada (release segue)." >&2
+        return 0
+    fi
+
+    local pr_lines
+    if ! pr_lines="$(cd "${worktree_path}" 2>/dev/null && gh pr list --state open --limit 100 \
+        --json number,title,headRefName \
+        --jq ".[] | select(.headRefName | startswith(\"ia-${identity}/\")) | \"#\(.number) \(.headRefName) — \(.title)\"" 2>/dev/null)"; then
+        echo "⚠️  Falha ao consultar PRs abertos via gh — verificação pulada (release segue)." >&2
+        return 0
+    fi
+
+    local pr_count=0
+    if [[ -n "${pr_lines}" ]]; then
+        pr_count="$(printf '%s\n' "${pr_lines}" | grep -c . || true)"
+    fi
+
+    if [[ "${pr_count}" -eq 0 ]]; then
+        return 0
+    fi
+
+    if [[ "${force}" == "true" ]]; then
+        echo "⚠️  Liberando com ${pr_count} PR(s) aberto(s) de ia-${identity}/* (--force; exige autorização prévia do usuário):" >&2
+        printf '%s\n' "${pr_lines}" | sed 's/^/   /' >&2
+        return 0
+    fi
+
+    # Humano em TTY: pergunta explícita em vez de bloqueio seco.
+    if [[ -t 0 ]]; then
+        echo "" >&2
+        echo "⚠️  ${pr_count} PR(s) aberto(s) de ia-${identity}/*:" >&2
+        printf '%s\n' "${pr_lines}" | sed 's/^/   /' >&2
+        local answer=""
+        read -r -p "   Liberar o slot mesmo assim? [y/N] " answer || answer=""
+        if [[ "${answer}" =~ ^[yY]([eE][sS])?$ ]]; then
+            return 0
+        fi
+        echo "🔒 Release cancelado pelo usuário." >&2
+        return 1
+    fi
+
+    echo "" >&2
+    echo "❌❌❌ RELEASE BLOQUEADO: ${pr_count} PR(s) aberto(s) de ia-${identity}/* ❌❌❌" >&2
+    echo "" >&2
+    printf '%s\n' "${pr_lines}" | sed 's/^/   /' >&2
+    echo "" >&2
+    echo "   Protocolo (2026-07-17): finalizar tarefa/spec/correção NÃO libera o" >&2
+    echo "   slot — a maioria das sessões ainda tem PRs em andamento (CI, merge" >&2
+    echo "   queue, correções). Antes de liberar:" >&2
+    echo "     1. Apresente os PRs acima ao usuário." >&2
+    echo "     2. Só prossiga com autorização explícita dele, usando:" >&2
+    echo "        source ${AGENT_GUARD_INIT_NAME:-.hmvip-agent-init} --release --force" >&2
+    echo "" >&2
+    return 1
+}
+
+# ---------------------------------------------------------------------------
 # 7. --release mode
 # ---------------------------------------------------------------------------
 if [[ "${MODE}" == "release" ]]; then
@@ -1451,6 +1532,13 @@ if [[ "${MODE}" == "release" ]]; then
 
     if ! _validate_worktree_release_ready "${CURRENT_WORKTREE}"; then
         echo "🔒 Session NOT released. Resolve the issues above and run --release again." >&2
+        return 1 2>/dev/null || exit 1
+    fi
+
+    # Guarda de trabalho pendente: release nunca é automático com PRs abertos
+    # da identidade — exige confirmação do usuário (TTY) ou --force explícito.
+    if ! _release_pending_work_guard "${CURRENT_IDENTITY}" "${CURRENT_WORKTREE}" "${FORCE_RELEASE}"; then
+        echo "🔒 Session NOT released. Apresente os PRs ao usuário; com autorização, use --release --force." >&2
         return 1 2>/dev/null || exit 1
     fi
 

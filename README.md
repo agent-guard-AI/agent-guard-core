@@ -146,6 +146,17 @@ source agent-guard release
 
 > **Nota de implementação:** o release deve validar que a worktree está em uma branch base neutra (ex: `develop` ou `main`), que não há arquivos pendentes e que não há stashes antes de liberar o lease. Isso evita que outro agente reutilize o mesmo slot herdando estado deixado pelo anterior.
 
+> **Guarda de trabalho pendente (0.9.3):** finalizar uma tarefa **não** libera o slot automaticamente. Antes de liberar, o release consulta PRs abertos da identidade (`ia-<identidade>/*`) via `gh`:
+>
+> - **Sem PRs abertos:** o release segue normalmente.
+> - **Com PRs abertos:** em terminal interativo (TTY), o release pergunta `[y/N]` antes de liberar; fora de TTY (agentes de IA), o release é **bloqueado** com a lista dos PRs. Para prosseguir é preciso `--force`, que só deve ser usado após autorização explícita do usuário:
+>
+>   ```bash
+>   source agent-guard release --force   # só com autorização do usuário
+>   ```
+>
+> - **Sem `gh` ou falha de rede:** a verificação é pulada com aviso (fail-open).
+
 ### Reentrar em sessão existente
 
 ```bash
