@@ -95,7 +95,7 @@ function _agent_guard_main() {
             return $?
             ;;
         release|r)
-            _ag_source_init --release
+            _ag_source_init --release "$@"
             return $?
             ;;
         switch|sw)

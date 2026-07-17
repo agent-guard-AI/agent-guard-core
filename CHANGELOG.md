@@ -1,5 +1,28 @@
 # Changelog — agent-guard-core
 
+## 0.9.4 — Fix: dispatcher do `bin/agent-guard` encaminha `"$@"` no subcomando `release`
+
+- **Bug (introduzido em 0.9.3):** o caso `release|r)` do dispatcher chamava
+  `_ag_source_init --release` **sem repassar `"$@"`**, descartando o
+  `--force`. O caminho documentado `source .hmvip-agent-init --release --force`
+  (impresso pela própria guarda de PRs abertos em `src/init.sh`) nunca levava
+  o flag ao `init.sh`: em não-TTY (IA) a guarda bloqueava, instruía
+  `--release --force` e bloqueava de novo — loop sem saída. Em TTY o bug era
+  invisível, pois a guarda pergunta `[y/N]` interativamente e não precisa do
+  flag. Todos os outros subcomandos com argumentos (`switch`, `attach`,
+  `adopt`, `triage`) já repassavam `"$@"`; só `release` (e `status`, que não
+  tem argumentos) não. Workaround vigente: sourcar
+  `packages/agent-guard-core/src/init.sh --release --force` direto.
+- `bin/agent-guard`: `release|r)` agora chama `_ag_source_init --release "$@"`
+  (1 linha). Sem mudança de comportamento para `release` sem argumentos.
+- Testes (monorepo HMVIP, `tests/agent-guard/agent-guard-release-pending-prs-test.sh`):
+  novo **cenário D** — cadeia real stub → `bin/agent-guard` → `init.sh`. O
+  stub fake do teste original sourceava o `init.sh` DIRETO, mascarando bugs
+  de dispatcher; o cenário D copia o stub raiz real e o bin real para o
+  sandbox e roda `--release --force` ponta a ponta. Controle negativo
+  verificado: sem o fix, exatamente as 2 asserções do cenário D falham
+  (guarda bloqueia apesar do `--force`).
+
 ## 0.9.3 — Release nunca é automático: guarda de PRs abertos + `--force`
 
 - **Mudança de protocolo (pedido do dono, 2026-07-17):** finalizar uma
