@@ -296,6 +296,9 @@ Notas de implementação:
   ```bash
   bash packages/agent-guard-core/wrappers/kimi/recovery.sh
   ```
+  O recovery faz backup do binário real em `kimi.real.<timestamp>` antes de
+  restaurar o wrapper e mantém apenas os 3 backups mais novos
+  (`AG_KIMI_BACKUP_KEEP` para customizar), evitando acúmulo em disco.
 - Remoção do wrapper invasivo e restauração do binário real:
   ```bash
   bash packages/agent-guard-core/wrappers/kimi/recovery.sh --remove-wrapper

@@ -1,5 +1,26 @@
 # Changelog — agent-guard-core
 
+## 0.9.2 — Retenção de backups `kimi.real.*` no recovery do wrapper Kimi
+
+- `wrappers/kimi/recovery.sh`:
+  - Nova função `_ag_prune_real_backups`: mantém apenas os N backups
+    timestamped mais novos (`kimi.real.*`), descartando os demais por mtime.
+    N configurável via `AG_KIMI_BACKUP_KEEP` (padrão 3; valor inválido cai
+    para 3 sem quebrar o script). O `kimi.real` canônico (sem sufixo) nunca
+    é tocado.
+  - A poda roda em **toda** invocação — inclusive nas execuções no-op
+    ("já é o wrapper") — e novamente logo após a criação de um novo backup,
+    garantindo o invariante "no máximo N backups ao fim de qualquer run".
+  - Incidente que motivou: em 20 dias, 595 backups `kimi.real.<timestamp>`
+    (~150 MB cada, ~88 GB no total) se acumularam em `~/.kimi-code/bin/`
+    porque o recovery fazia backup a cada restauração e nunca apagava —
+    em um único dia de briga entre o auto-updater do Kimi CLI e o guard,
+    280 backups (~40 GB) foram criados.
+- Testes (monorepo HMVIP, `tests/agent-guard/kimi-recovery-retention-test.sh`):
+  9 casos cobrindo poda em run de recovery, poda em run no-op, preservação
+  do `kimi.real`, ordem por mtime, `AG_KIMI_BACKUP_KEEP` customizado e
+  inválido.
+
 ## 0.9.1 — Wrapper nunca herda lease de sessão pai
 
 - `wrappers/kimi/wrapper.sh`:
