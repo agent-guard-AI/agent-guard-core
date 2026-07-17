@@ -50,6 +50,46 @@ if [[ "${AG_WRAPPER_BYPASS:-}" == "1" || "${AG_WRAPPER_BYPASS:-}" == "1" ]]; the
 fi
 
 # ---------------------------------------------------------------------------
+# 0.5 Explicit slot selection: --slot <identity> or AGENT_GUARD_SLOT
+# ---------------------------------------------------------------------------
+# Allows starting the agent directly into a specific slot in one command:
+#
+#   kimi --slot kimi3            # acquire (or adopt) slot kimi3, then launch
+#   AGENT_GUARD_SLOT=kimi3 kimi  # same, via environment variable
+#
+# The flag is consumed by the wrapper and never forwarded to the real CLI.
+# If the Kimi CLI ever introduces its own --slot flag, use AGENT_GUARD_SLOT.
+_AG_SLOT="${AGENT_GUARD_SLOT:-}"
+if [[ $# -gt 0 ]]; then
+    _AG_REMAINING_ARGS=()
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --slot)
+                if [[ -z "${2:-}" ]]; then
+                    echo "❌ AG WRAPPER: --slot requires an identity (ex: kimi3)." >&2
+                    exit 1
+                fi
+                _AG_SLOT="$2"
+                shift 2
+                ;;
+            --slot=*)
+                _AG_SLOT="${1#--slot=}"
+                shift
+                ;;
+            *)
+                _AG_REMAINING_ARGS+=("$1")
+                shift
+                ;;
+        esac
+    done
+    if [[ "${#_AG_REMAINING_ARGS[@]}" -gt 0 ]]; then
+        set -- "${_AG_REMAINING_ARGS[@]}"
+    else
+        set --
+    fi
+fi
+
+# ---------------------------------------------------------------------------
 # 1. Resolve current working directory
 # ---------------------------------------------------------------------------
 CWD="$(pwd -P 2>/dev/null || pwd)"
@@ -58,7 +98,20 @@ CWD="$(pwd -P 2>/dev/null || pwd)"
 # sourced below (non-interactive shell) and this same PID survives the final
 # `exec` into kimi.real, so the lease stays bound to the agent process
 # instead of the wrapper's parent shell (see _ag_session_pid in init.sh).
+# Unset first to avoid inheriting a stale pin from a parent Agent Guard session
+# (e.g. a nested `source .hmvip-agent-init` inside another leased worktree).
+unset AGENT_GUARD_SESSION_PID
 export AGENT_GUARD_SESSION_PID="$$"
+
+# Never inherit lease state from a parent Agent Guard session (e.g. a nested
+# `kimi` invocation from inside an existing agent session): these variables
+# are produced by THIS wrapper after the init script runs. A stale inherited
+# value would make _ag_have_lease short-circuit the lease acquisition below
+# with the parent session's identity/worktree/branch.
+unset _AG_WORKTREE _AG_IDENTITY _AG_BRANCH
+unset _HMVIP_WORKTREE _HMVIP_IDENTITY _HMVIP_BRANCH
+unset AG_WORKTREE_PATH AG_BRANCH
+unset AGENT_GUARD_WORKTREE_PATH AGENT_GUARD_IDENTITY AGENT_GUARD_BRANCH
 
 # Resolve a usable Python interpreter cross-platform.
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
@@ -610,6 +663,104 @@ if ! _ag_have_lease; then
 
     _AG_SKIP_INIT="false"
 
+    # -----------------------------------------------------------------------
+    # 8a. Explicit slot requested: skip CWD heuristics and go straight to the
+    # requested slot. The wrapper decides between three outcomes:
+    #
+    #   1. REFUSE  — a live agent process (or live lease PID) holds the slot.
+    #   2. ADOPT   — the slot's session is stale (dead PID) AND its worktree
+    #                has uncommitted work; delegates to the init --adopt flow,
+    #                which preserves and surfaces the previous session's work.
+    #   3. ACQUIRE — free slot (or stale lease with a clean worktree, which
+    #                the init clears itself); delegates to init --slot.
+    # -----------------------------------------------------------------------
+    if [[ -n "${_AG_SLOT}" ]]; then
+        if [[ ! "${_AG_SLOT}" =~ ^[a-z]+[0-9]+$ ]]; then
+            echo "❌ AG WRAPPER: invalid slot '${_AG_SLOT}' (expected e.g. kimi3)." >&2
+            exit 1
+        fi
+
+        _ag_slot_prefix="${_AG_SLOT%%[0-9]*}"
+        _ag_slot_num="${_AG_SLOT##*[a-z]}"
+
+        # Each wrapper family manages its own identity prefix (the Kimi wrapper
+        # takes kimiN slots, never claudeN/geminiN). The expected prefix is
+        # configurable for upstream projects with different naming.
+        _ag_wrapper_prefix="$(bash "${_AG_CONFIG_BIN}" get "wrappers.kimi.identity_prefix" "kimi" 2>/dev/null || echo "kimi")"
+        if [[ "${_ag_slot_prefix}" != "${_ag_wrapper_prefix}" ]]; then
+            echo "❌ AG WRAPPER: slot '${_AG_SLOT}' does not belong to the '${_ag_wrapper_prefix}' family." >&2
+            echo "   Use the matching agent CLI wrapper for that identity prefix." >&2
+            exit 1
+        fi
+
+        _ag_wt_prefix="$(bash "${_AG_CONFIG_BIN}" get "identities.${_ag_slot_prefix}.worktree_prefix" '' 2>/dev/null || true)"
+        if [[ -z "${_ag_wt_prefix}" ]]; then
+            echo "❌ AG WRAPPER: no worktree_prefix configured for identity '${_ag_slot_prefix}'." >&2
+            exit 1
+        fi
+        _ag_slot_worktree="${_AG_BASE_DIR}/${_ag_wt_prefix}${_ag_slot_num}"
+
+        # 1. Refuse takeover of a slot with a live agent process.
+        if [[ -d "${_ag_slot_worktree}" ]] && _ag_worktree_has_live_agent "${_ag_slot_worktree}"; then
+            echo "❌ AG WRAPPER: slot '${_AG_SLOT}' already has a live agent session." >&2
+            echo "   Close that session first, or pick another slot." >&2
+            exit 1
+        fi
+
+        # 2. Decide adopt vs acquire from the slot's session file.
+        _ag_session_dir="${_AG_MAIN_REPO}/$(bash "${_AG_CONFIG_BIN}" get paths.session_storage ".agent-guard/sessions" 2>/dev/null || echo ".agent-guard/sessions")"
+        _ag_session_file="${_ag_session_dir}/${_AG_SLOT}.json"
+        _ag_slot_mode="acquire"
+        if [[ -f "${_ag_session_file}" && -d "${_ag_slot_worktree}" ]]; then
+            _ag_sess_status="$(${AG_PYTHON} -c "import json,sys; d=json.load(open(sys.argv[1])); print(d.get('status','free'))" "${_ag_session_file}" 2>/dev/null || echo free)"
+            _ag_sess_pid="$(${AG_PYTHON} -c "import json,sys; d=json.load(open(sys.argv[1])); print(d.get('pid',''))" "${_ag_session_file}" 2>/dev/null || echo '')"
+            if [[ "${_ag_sess_status}" == "active" && -n "${_ag_sess_pid}" ]]; then
+                if [[ -d "/proc/${_ag_sess_pid}" ]]; then
+                    echo "❌ AG WRAPPER: slot '${_AG_SLOT}' is held by live PID ${_ag_sess_pid}." >&2
+                    echo "   Close that session first, or pick another slot." >&2
+                    exit 1
+                fi
+                # Stale lease: adopt only when the worktree carries uncommitted
+                # work from the dead session; a clean stale worktree is handled
+                # by the normal acquire path (init clears the stale lease).
+                if _ag_worktree_is_dirty "${_ag_slot_worktree}"; then
+                    _ag_slot_mode="adopt"
+                fi
+            fi
+        fi
+
+        _ag_default_role="$(bash "${_AG_CONFIG_BIN}" get "wrappers.kimi.default_role" "ia-a" 2>/dev/null || echo "ia-a")"
+        ORIGINAL_ARGS=("$@")
+        set --
+        if [[ "${_ag_slot_mode}" == "adopt" ]]; then
+            echo "🔄 AG WRAPPER: slot '${_AG_SLOT}' has a stale session with uncommitted work; adopting..." >&2
+            if ! source "${_AG_INIT_SCRIPT}" --adopt "${_AG_SLOT}" >/tmp/ag-wrapper-lease.log 2>&1; then
+                echo "❌ AG WRAPPER: failed to adopt slot '${_AG_SLOT}'." >&2
+                echo "   Log: /tmp/ag-wrapper-lease.log" >&2
+                cat /tmp/ag-wrapper-lease.log >&2
+                exit 1
+            fi
+            # Adopt output lists uncommitted work and stashes left by the dead
+            # session; it must stay visible to the user.
+            cat /tmp/ag-wrapper-lease.log
+            # The adopted worktree legitimately carries the dead session's
+            # uncommitted work (surfaced above). The generic cleanliness guard
+            # must not block the launch it just adopted; AG_ALLOW_DIRTY_WORKTREE
+            # is scoped to this process and documented as the recovery escape.
+            export AG_ALLOW_DIRTY_WORKTREE=1
+        else
+            if ! source "${_AG_INIT_SCRIPT}" "${_ag_slot_prefix}" "${_ag_default_role}" --slot "${_AG_SLOT}" >/tmp/ag-wrapper-lease.log 2>&1; then
+                echo "❌ AG WRAPPER: failed to acquire slot '${_AG_SLOT}'." >&2
+                echo "   Log: /tmp/ag-wrapper-lease.log" >&2
+                cat /tmp/ag-wrapper-lease.log >&2
+                exit 1
+            fi
+        fi
+        set -- "${ORIGINAL_ARGS[@]}"
+        CWD="$(pwd)"
+        _AG_SKIP_INIT="true"
+    fi
+
     if [[ "${CWD}" == "${_AG_MAIN_REPO}" ]]; then
         # Try to resume the most recent active session before allocating a new slot.
         _AG_RESUMABLE_WORKTREE="$(_ag_find_resumable_worktree "kimi" 2>/dev/null || true)"
@@ -675,6 +826,55 @@ if ! _ag_have_lease; then
     export _HMVIP_WORKTREE="${_AG_WORKTREE}"
     export _HMVIP_IDENTITY="${_AG_IDENTITY}"
     export _HMVIP_BRANCH="${_AG_BRANCH}"
+fi
+
+# ---------------------------------------------------------------------------
+# 8.5 Session trace initialization (best-effort)
+# ---------------------------------------------------------------------------
+# Initialize a local trace directory for this worktree and record that the
+# wrapper was invoked. Heartbeats are written on subsequent invocations when
+# enough time has passed, so a crashed frontend still leaves a recoverable
+# trail of metadata even if no explicit checkpoint was committed.
+_ag_session_trace_dir="${_AG_WORKTREE}/.agent-guard/session"
+_ag_session_trace_script="${_AG_REPO_ROOT}/${_AG_PACKAGE_ROOT:-packages/agent-guard-core}/src/session_trace.sh"
+if [[ -f "${_ag_session_trace_script}" && -n "${_AG_WORKTREE:-}" && -n "${_AG_IDENTITY:-}" && -n "${_AG_BRANCH:-}" ]]; then
+    AGENT_GUARD_REPO_ROOT="${_AG_REPO_ROOT}"
+    AGENT_GUARD_WORKTREE_PATH="${_AG_WORKTREE}"
+    AGENT_GUARD_IDENTITY="${_AG_IDENTITY}"
+    AGENT_GUARD_BRANCH="${_AG_BRANCH}"
+    AGENT_GUARD_SESSION_DIR="${_ag_session_trace_dir}"
+    export AGENT_GUARD_REPO_ROOT AGENT_GUARD_WORKTREE_PATH AGENT_GUARD_IDENTITY AGENT_GUARD_BRANCH AGENT_GUARD_SESSION_DIR
+
+    (
+        source "${_ag_session_trace_script}" >/dev/null 2>&1
+        _trace_init >/dev/null 2>&1 || true
+        _trace_write_event "wrapper_invoke" "$(printf '{"argv":%s}' "$(printf '%s ' "$@" | ${AG_PYTHON} -c 'import json,sys; print(json.dumps(sys.stdin.read().strip()))' 2>/dev/null || echo '""')" 2>/dev/null || true)" >/dev/null 2>&1 || true
+
+        # Heartbeat if enough time elapsed since last recorded heartbeat.
+        heartbeat_interval="${AGENT_GUARD_HEARTBEAT_INTERVAL_SECONDS:-300}"
+        last_heartbeat=0
+        if [[ -f "${_ag_session_trace_dir}/current/.last_heartbeat" ]]; then
+            last_heartbeat="$(cat "${_ag_session_trace_dir}/current/.last_heartbeat" 2>/dev/null || echo 0)"
+        fi
+        now="$(date +%s)"
+        if [[ $((now - last_heartbeat)) -ge ${heartbeat_interval} ]]; then
+            _trace_heartbeat "wrapper periodic heartbeat" >/dev/null 2>&1 || true
+            date +%s > "${_ag_session_trace_dir}/current/.last_heartbeat" 2>/dev/null || true
+        fi
+    )
+
+    # Start a background watcher to snapshot Kimi session metadata (title,
+    # lastPrompt, sessionId) while the frontend process is alive. This captures
+    # conversation context even if the frontend crashes before writing an
+    # explicit checkpoint. The watcher is best-effort and never blocks Kimi.
+    watch_interval="${AGENT_GUARD_KIMI_WATCH_INTERVAL_SECONDS:-60}"
+    if [[ "${watch_interval}" -gt 0 && -n "${_AG_WORKTREE:-}" ]]; then
+        (
+            source "${_ag_session_trace_script}" >/dev/null 2>&1
+            _trace_watch_kimi_session "$$" "${_AG_WORKTREE}" "${_ag_session_trace_dir}" "${watch_interval}" "${AGENT_GUARD_KIMI_WATCH_CHECKPOINT_INTERVAL_SECONDS:-300}" >/dev/null 2>&1
+        ) &
+        disown 2>/dev/null || true
+    fi
 fi
 
 # ---------------------------------------------------------------------------

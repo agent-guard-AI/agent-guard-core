@@ -62,3 +62,15 @@ if [[ -f "${JOURNAL_SCRIPT}" ]]; then
     export AGENT_GUARD_WORKTREE_PATH="${WORKTREE_PATH}"
     _journal_commit "${COMMIT_SHA}" "${COMMIT_MSG}"
 fi
+
+# Capture a session-trace checkpoint for every commit so the conversation
+# context is linked to the code state and searchable after a crash.
+TRACE_SCRIPT="${REPO_ROOT}/packages/agent-guard-core/src/session_trace.sh"
+if [[ -f "${TRACE_SCRIPT}" && -d "${WORKTREE_PATH}/.agent-guard/session" ]]; then
+    source "${TRACE_SCRIPT}"
+    export AGENT_GUARD_REPO_ROOT="${REPO_ROOT}"
+    export AGENT_GUARD_WORKTREE_PATH="${WORKTREE_PATH}"
+    export AGENT_GUARD_IDENTITY="${IDENTITY}"
+    export AGENT_GUARD_BRANCH="${BRANCH}"
+    _trace_checkpoint "commit ${COMMIT_SHA}" >/dev/null 2>&1 || true
+fi
