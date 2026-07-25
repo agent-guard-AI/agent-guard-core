@@ -2,6 +2,8 @@
 
 ## 0.9.5 — Adoção segura de slots órfãos, shell isolation e guarda de PRs preservada (ADR-0023)
 
+> Sync upstream: enviado para `agent-guard-AI/agent-guard-core@main` em 2026-07-25 (commit `106e748443`).
+
 - `src/init.sh`:
   - Novo helper `_branch_belongs_to_identity_or_base()` que identifica se a branch
     atual do worktree pertence ao dono do slot ou é uma branch base segura.
