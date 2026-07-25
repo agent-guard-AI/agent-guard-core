@@ -1,5 +1,39 @@
 # Changelog — agent-guard-core
 
+## 0.9.5 — Adoção segura de slots órfãos, shell isolation e guarda de PRs preservada (ADR-0023)
+
+- `src/init.sh`:
+  - Novo helper `_branch_belongs_to_identity_or_base()` que identifica se a branch
+    atual do worktree pertence ao dono do slot ou é uma branch base segura.
+  - `_slot_is_free()` agora recusa worktrees em branch estrangeira, impedindo que
+    o fluxo normal de aquisição orfane branches de outras IAs.
+  - `_create_or_reuse_worktree()` ganha segunda trava: se a branch atual for
+    estrangeira, falha com instrução para usar `--adopt`.
+  - `--adopt` permite assumir slots órfãos com branch estrangeira quando a sessão
+    dona está confirmada morta e não há outro processo de agente vivo no worktree.
+  - Adoção de órfão estrangeiro exibe aviso explícito, preserva arquivos/stashes e
+    grava checkpoint no journal identificando a branch estrangeira.
+  - `_status_reconcile_session()` reporta estado `orphan`/`foreign branch` quando o
+    worktree está em branch de outra identidade.
+  - Shell isolation: strict mode (`set -euo pipefail`) não vaza mais para o shell
+    chamador; flags originais são salvas antes de ativar o strict mode e
+    restauradas antes do `return`.
+  - Guarda de PRs pendentes preservada no redesign: `--release` continua
+    bloqueando quando há PRs abertos de `ia-<identidade>/*`, listando-os e
+    instruindo `--release --force` em não-TTY; `--release --force` libera com
+    aviso de autorização explícita.
+- `.hmvip-agent-init` e `bin/agent-guard`:
+  - Aplicado o mesmo padrão de shell isolation, com nomes de variáveis distintos
+    para evitar colisão entre os três níveis de source.
+  - `bin/agent-guard`: subcomando `release|r)` repassa `"$@"` para que `--force`
+    chegue até `src/init.sh`.
+- `tests/agent-guard/agent-init-test.sh`:
+  - Testes de branch estrangeira recusada na aquisição normal, adoção de órfão
+    estrangeiro, recusa com processo agente vivo e detecção no `--status`.
+- `tests/agent-guard/shell-isolation-test.sh` (novo):
+  - Valida que falhas no `.hmvip-agent-init`, no `agent-guard` e fontes bem-sucedidas
+    não ativam `set -e` no shell do usuário.
+
 ## 0.9.4 — Fix: dispatcher do `bin/agent-guard` encaminha `"$@"` no subcomando `release`
 
 - **Bug (introduzido em 0.9.3):** o caso `release|r)` do dispatcher chamava

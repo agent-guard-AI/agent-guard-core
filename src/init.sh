@@ -26,52 +26,32 @@
 #
 # v2.0.0 — independent from legacy lease scripts
 
-# ---------------------------------------------------------------------------
-# 0. Preserve caller shell state
-# ---------------------------------------------------------------------------
-# This script is sourced into the user's interactive shell. We must restore
-# its options (especially set -e / errexit) before returning, otherwise a
-# later failing command in the user's shell kills their terminal.
-_AG_OLD_SHELL_FLAGS="$(set +o)"
-_AG_OLD_EXIT_TRAP="$(trap -p EXIT 2>/dev/null || true)"
-
-_ag_restore_shell_flags() {
-    eval "${_AG_OLD_SHELL_FLAGS}" 2>/dev/null || true
+# Save the caller's shell flags BEFORE enabling strict mode so we can restore
+# the original state before returning. Without this, strict mode leaks into the
+# user's interactive shell and may kill the terminal on the next failing command
+# (see hmvip-shell-safety, L222).
+_AG_INIT_OLD_FLAGS="$(set +o)"
+_ag_init_restore_shell_flags() {
+    eval "${_AG_INIT_OLD_FLAGS}" 2>/dev/null || true
 }
 
-_ag_cleanup_on_exit() {
-    _ag_restore_shell_flags
-    if [[ -n "${_AG_OLD_EXIT_TRAP}" ]]; then
-        eval "${_AG_OLD_EXIT_TRAP}" 2>/dev/null || true
-    else
-        trap - EXIT 2>/dev/null || true
-    fi
-}
+# Strict mode for init (do not apply to user's interactive shell after sourcing)
+set -euo pipefail
 
-trap '_ag_cleanup_on_exit' EXIT
+# ---------------------------------------------------------------------------
+# 0. Detect mode: sourced vs executed directly
+# ---------------------------------------------------------------------------
+if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
+    echo "❌ This script must be sourced, not executed directly." >&2
+    echo "   source ${AGENT_GUARD_INIT_NAME:-.agent-guard-init} <prefix> <role> [--impact plugin1,plugin2]" >&2
+    echo "   source ${AGENT_GUARD_INIT_NAME:-.agent-guard-init} --attach ia-<identity>/<role>/<branch>" >&2
+    exit 1
+fi
 
-function _agent_guard_init_main() {
-    # Strict mode for init (do not apply to user's interactive shell after sourcing)
-    set -euo pipefail
-
-    # The real work happens inside a nested function so that any failing return
-    # from the body is captured without propagating set -e to the caller's shell.
-    function _agent_guard_init_body() {
-
-    # ---------------------------------------------------------------------------
-    # 0a. Detect mode: sourced vs executed directly
-    # ---------------------------------------------------------------------------
-    if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
-        echo "❌ This script must be sourced, not executed directly." >&2
-        echo "   source ${AGENT_GUARD_INIT_NAME:-.agent-guard-init} <prefix> <role> [--impact plugin1,plugin2]" >&2
-        echo "   source ${AGENT_GUARD_INIT_NAME:-.agent-guard-init} --attach ia-<identity>/<role>/<branch>" >&2
-        exit 1
-    fi
-
-    # ---------------------------------------------------------------------------
-    # 1. Resolve repository root and guard config
-    # ---------------------------------------------------------------------------
-    SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# ---------------------------------------------------------------------------
+# 1. Resolve repository root and guard config
+# ---------------------------------------------------------------------------
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 # Resolve a usable Python interpreter cross-platform.
 AG_PYTHON="$(bash "${SCRIPT_DIR}/../bin/agent-guard-python" 2>/dev/null || echo "python3")"
@@ -354,6 +334,10 @@ _status_reconcile_session() {
             if [[ "${actual_branch}" == "ia-${identity}/"* || -n "${dirty}" ]]; then
                 _rec_health="drift"
                 _rec_drift="released session with active work"
+                _rec_branch="${actual_branch}"
+            elif [[ -n "${actual_branch}" ]] && ! _branch_belongs_to_identity_or_base "${expected_worktree}" "${identity}"; then
+                _rec_health="orphan"
+                _rec_drift="foreign branch ${actual_branch}"
                 _rec_branch="${actual_branch}"
             fi
         fi
@@ -702,8 +686,7 @@ _acquire_slot() {
     # Ensure the lock is always released when this function returns.
     # The trap runs in the current shell, so we guard against lock_fd being
     # unset (e.g. if the trap fires after the function already returned).
-    # _ag_cleanup_on_exit also restores the caller's shell flags and trap.
-    trap '_ag_cleanup_on_exit' EXIT
+    trap 'if [[ -n "${lock_fd:-}" ]]; then flock -u "${lock_fd}" 2>/dev/null || true; eval "exec ${lock_fd}>&-" 2>/dev/null || true; fi' EXIT
 
     local selected_identity=""
 
@@ -754,6 +737,15 @@ _acquire_slot() {
                 return 1
             fi
 
+            # Never recycle a worktree that is on another agent's task or
+            # neutral branch. Automatic allocation would orphan the foreign
+            # branch by creating a new branch from the base ref. Such slots
+            # must be adopted explicitly after confirming the previous session
+            # is dead.
+            if ! _branch_belongs_to_identity_or_base "${worktree}" "${identity}"; then
+                return 1
+            fi
+
             # Even when the lease file is missing or stale, refuse to recycle a
             # worktree that currently hosts another live agent process.
             if _worktree_has_other_live_agent "${worktree}"; then
@@ -779,8 +771,9 @@ _acquire_slot() {
         fi
 
         if [[ -z "${selected_identity}" ]]; then
-            echo "❌ Slot '${forced_identity}' is not available (in use, dirty or on cooldown)." >&2
+            echo "❌ Slot '${forced_identity}' is not available (in use, dirty, foreign branch or on cooldown)." >&2
             echo "   Use 'source .hmvip-agent-init --status' to inspect slots." >&2
+            echo "   If the slot contains another agent's work, use --adopt only when its session is dead." >&2
             return 1
         fi
     else
@@ -1168,6 +1161,24 @@ _create_or_reuse_worktree() {
             echo "🔄 Reusing existing branch '${current_wt_branch}' (v4.0)." >&2
             branch_name="${current_wt_branch}"
         else
+            # Safety net: refuse to create a new branch on top of another agent's
+            # work. This should have been caught by _slot_is_free, but guard here
+            # too in case the function is called directly or race conditions occur.
+            if [[ -n "${current_wt_branch}" ]] && ! _branch_belongs_to_identity_or_base "${worktree_path}" "${identity}"; then
+                echo "" >&2
+                echo "❌❌❌ ERROR: FOREIGN BRANCH IN WORKTREE ❌❌❌" >&2
+                echo "" >&2
+                echo "   Worktree ${worktree_path} is on branch '${current_wt_branch}'," >&2
+                echo "   which belongs to another agent or is not a safe base branch." >&2
+                echo "" >&2
+                echo "   The normal acquisition flow cannot recycle this worktree" >&2
+                echo "   because it would orphan the existing branch." >&2
+                echo "" >&2
+                echo "   To take over this slot only if the previous session is dead:" >&2
+                echo "     source .hmvip-agent-init --adopt ${identity}" >&2
+                echo "" >&2
+                return 1
+            fi
             echo "🌿 Creating new branch: ${branch_name}" >&2
             git checkout -b "${branch_name}" "${base_ref}" >/dev/null 2>&1 || git checkout "${branch_name}" >/dev/null 2>&1 || true
         fi
@@ -1198,6 +1209,14 @@ _create_or_reuse_worktree() {
 }
 
 # ---------------------------------------------------------------------------
+# Main entry point: argument parsing + mode execution.
+# Wrapped in a function so strict-mode flags can be restored before returning
+# to the caller's shell (see hmvip-shell-safety, L222).
+# ---------------------------------------------------------------------------
+_agent_guard_init_main() {
+    # Strict mode is already active at the script level.
+
+# ---------------------------------------------------------------------------
 # 6. Parse arguments
 # ---------------------------------------------------------------------------
 ATTACH_BRANCH=""
@@ -1206,8 +1225,8 @@ PREFIX=""
 ROLE=""
 IMPACT_PLUGINS=""
 FORCED_IDENTITY=""
-USE_WORKTREE="true"
 FORCE_RELEASE="false"
+USE_WORKTREE="true"
 MODE="acquire"
 
 while [[ $# -gt 0 ]]; do
@@ -1330,6 +1349,42 @@ _branch_is_neutral_released() {
 }
 
 # ---------------------------------------------------------------------------
+# Helper: check whether the current branch belongs to the identity that owns
+# the worktree, or is a safe base branch (develop, main, etc.). Returns 1 when
+# the worktree is on another agent's task/neutral branch.
+# ---------------------------------------------------------------------------
+_branch_belongs_to_identity_or_base() {
+    local worktree_path="$1"
+    local identity="$2"
+
+    local current_branch
+    current_branch="$(git -C "${worktree_path}" branch --show-current 2>/dev/null || echo "")"
+
+    # Empty/detached is treated as safe; the worktree setup will create a new
+    # branch from the base ref.
+    [[ -z "${current_branch}" ]] && return 0
+
+    # Own task branch or own neutral post-release branch.
+    if [[ "${current_branch}" == "ia-${identity}/"* || "${current_branch}" == "_released/${identity}" ]]; then
+        return 0
+    fi
+
+    # Configured base branch (usually develop) and common fallbacks.
+    local base_branch
+    base_branch="$(_guard_get_str "git.base_branch" "develop")"
+    if [[ "${current_branch}" == "${base_branch}" || "${current_branch}" == "origin/${base_branch}" ]]; then
+        return 0
+    fi
+    for fallback in develop main master; do
+        if [[ "${current_branch}" == "${fallback}" || "${current_branch}" == "origin/${fallback}" ]]; then
+            return 0
+        fi
+    done
+
+    return 1
+}
+
+# ---------------------------------------------------------------------------
 # Helper: validate worktree is in a neutral state before release
 # ---------------------------------------------------------------------------
 _validate_worktree_release_ready() {
@@ -1444,7 +1499,7 @@ _release_pending_work_guard() {
     local pr_lines
     if ! pr_lines="$(cd "${worktree_path}" 2>/dev/null && gh pr list --state open --limit 100 \
         --json number,title,headRefName \
-        --jq ".[] | select(.headRefName | startswith(\"ia-${identity}/\")) | \"#\(.number) \(.headRefName) — \(.title)\"" 2>/dev/null)"; then
+        --jq ".[] | select(.headRefName | startswith(\"ia-${identity}/\")) | \"#\\(.number) \\(.headRefName) — \\(.title)\"" 2>/dev/null)"; then
         echo "⚠️  Falha ao consultar PRs abertos via gh — verificação pulada (release segue)." >&2
         return 0
     fi
@@ -1748,34 +1803,55 @@ if [[ "${MODE}" == "adopt" ]]; then
         _clear_session "${ADOPT_IDENTITY}"
     fi
 
-    cd "${WORKTREE_PATH}" || return 1 2>/dev/null || exit 1
-    git fetch origin >/dev/null 2>&1 || true
-
-    ADOPT_BRANCH="$(git branch --show-current 2>/dev/null || echo "")"
-    if [[ -z "${ADOPT_BRANCH}" ]]; then
-        # Detached HEAD: accept if the current commit belongs to this slot's own
-        # branch (e.g. after a crash left the worktree detached on a task commit).
-        ADOPT_BRANCH="$(git branch --list "ia-${ADOPT_IDENTITY}/"* --contains HEAD 2>/dev/null | head -n1 | sed 's/^[ *]*//')"
-    fi
-    if [[ "${ADOPT_BRANCH}" != "ia-${ADOPT_IDENTITY}/"* && "${ADOPT_BRANCH}" != "_released/${ADOPT_IDENTITY}" ]]; then
+    # Secondary guard: even if the session file is free/stale, refuse to adopt
+    # when another live agent process is currently inside the worktree.
+    if _worktree_has_other_live_agent "${WORKTREE_PATH}"; then
         echo "" >&2
-        echo "❌❌❌ ERROR: FOREIGN OR PROTECTED BRANCH ❌❌❌" >&2
+        echo "❌❌❌ ERROR: WORKTREE HELD BY LIVE AGENT PROCESS ❌❌❌" >&2
         echo "" >&2
-        echo "   Worktree ${WORKTREE_PATH} is on branch '${ADOPT_BRANCH:-<detached>}'." >&2
-        echo "   Adopt only resumes this identity's own branches:" >&2
-        echo "     ia-${ADOPT_IDENTITY}/... or _released/${ADOPT_IDENTITY}" >&2
-        echo "" >&2
-        echo "   If this is another agent's work, STOP and ask the user." >&2
+        echo "   Another live agent process was detected in ${WORKTREE_PATH}." >&2
+        echo "   Adopt only works on slots whose previous session is dead." >&2
         echo "" >&2
         return 1 2>/dev/null || exit 1
     fi
 
+    cd "${WORKTREE_PATH}" || return 1 2>/dev/null || exit 1
+    git fetch origin >/dev/null 2>&1 || true
+
+    ADOPT_BRANCH="$(git branch --show-current 2>/dev/null || echo "")"
+    ADOPT_FOREIGN_BRANCH="false"
+    if [[ "${ADOPT_BRANCH}" != "ia-${ADOPT_IDENTITY}/"* && "${ADOPT_BRANCH}" != "_released/${ADOPT_IDENTITY}" ]]; then
+        if ! _branch_belongs_to_identity_or_base "${WORKTREE_PATH}" "${ADOPT_IDENTITY}"; then
+            ADOPT_FOREIGN_BRANCH="true"
+        else
+            echo "" >&2
+            echo "❌❌❌ ERROR: PROTECTED BRANCH ❌❌❌" >&2
+            echo "" >&2
+            echo "   Worktree ${WORKTREE_PATH} is on branch '${ADOPT_BRANCH:-<detached>}'." >&2
+            echo "   Adopt only resumes this identity's own branches:" >&2
+            echo "     ia-${ADOPT_IDENTITY}/... or _released/${ADOPT_IDENTITY}" >&2
+            echo "   or a safe base branch." >&2
+            echo "" >&2
+            return 1 2>/dev/null || exit 1
+        fi
+    fi
+
     echo ""
     echo "=========================================================="
-    echo "🛡️  Agent Guard: ADOPTING slot ${ADOPT_IDENTITY}"
+    if [[ "${ADOPT_FOREIGN_BRANCH}" == "true" ]]; then
+        echo "🛡️  Agent Guard: ADOPTING ORPHAN slot ${ADOPT_IDENTITY}"
+    else
+        echo "🛡️  Agent Guard: ADOPTING slot ${ADOPT_IDENTITY}"
+    fi
     echo "=========================================================="
     echo "   Worktree: ${WORKTREE_PATH}"
     echo "   Branch:   ${ADOPT_BRANCH}"
+    if [[ "${ADOPT_FOREIGN_BRANCH}" == "true" ]]; then
+        echo ""
+        echo "⚠️  This worktree contains a branch from another agent/identity."
+        echo "   The previous session was confirmed dead; you are adopting an orphan slot."
+        echo "   Do not commit/push to this branch unless you have verified ownership."
+    fi
 
     DIRTY_FILES="$(git status --porcelain 2>/dev/null || true)"
     if [[ -n "${DIRTY_FILES}" ]]; then
@@ -1814,11 +1890,19 @@ if [[ "${MODE}" == "adopt" ]]; then
         _journal_adopt "${ADOPT_BRANCH}"
     fi
     if command -v _journal_checkpoint >/dev/null 2>&1; then
-        _journal_checkpoint "session adopted" "${WORKTREE_PATH}" "${ADOPT_BRANCH}"
+        if [[ "${ADOPT_FOREIGN_BRANCH}" == "true" ]]; then
+            _journal_checkpoint "session adopted (orphan foreign branch)" "${WORKTREE_PATH}" "${ADOPT_BRANCH}"
+        else
+            _journal_checkpoint "session adopted" "${WORKTREE_PATH}" "${ADOPT_BRANCH}"
+        fi
     fi
 
     echo "✅ Git author set to ${GIT_AUTHOR_EMAIL}"
-    echo "✅ Session active on ${ADOPT_IDENTITY} — resumed from previous state."
+    if [[ "${ADOPT_FOREIGN_BRANCH}" == "true" ]]; then
+        echo "✅ Session active on ${ADOPT_IDENTITY} — orphan slot adopted."
+    else
+        echo "✅ Session active on ${ADOPT_IDENTITY} — resumed from previous state."
+    fi
     echo ""
     return 0 2>/dev/null || exit 0
 fi
@@ -2060,13 +2144,16 @@ echo ""
 echo "To release the session, run: source ${AGENT_GUARD_INIT_NAME:-.agent-guard-init} --release"
 echo ""
 
-return 0 2>/dev/null || exit 0
+    return 0 2>/dev/null || exit 0
 }
 
-local _rc=0
-_agent_guard_init_body "$@" || _rc=$?
-_ag_restore_shell_flags
-return ${_rc}
-}
-
-_agent_guard_init_main "$@"
+# ---------------------------------------------------------------------------
+# Execute the main body unless this script was sourced only to load helpers.
+# The caller's shell flags are always restored before returning.
+# ---------------------------------------------------------------------------
+_RC=0
+if [[ "${AGENT_GUARD_FUNCTIONS_ONLY:-}" != "1" ]]; then
+    _agent_guard_init_main "$@" || _RC=$?
+fi
+_ag_init_restore_shell_flags
+return ${_RC}
