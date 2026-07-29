@@ -310,6 +310,7 @@ _status_reconcile_session() {
     _rec_pid="$(_load_session_field "${identity}" "pid")"
     _rec_branch="$(_load_session_field "${identity}" "branch")"
     _rec_worktree="$(_load_session_field "${identity}" "worktree_path")"
+    _rec_last_activity="$(_load_last_activity "${identity}")"
     _rec_health="-"
     _rec_drift=""
 
@@ -374,13 +375,23 @@ _status_reconcile_session() {
         fi
     fi
 
-    # Determine final health label.
+    # Determine final health label. A live PID with no recent activity is
+    # reported as stale so operators can recover slots left behind by idle
+    # IDE tabs/conversations.
+    local stale_marker=""
+    if [[ "${pid_health}" == "live" ]] && _is_session_stale "${identity}"; then
+        stale_marker="stale"
+    fi
+
     if [[ "${pid_health}" == "dead" ]]; then
         _rec_health="dead"
         _rec_drift="session PID is dead"
     elif [[ -n "${worktree_drift}" || -n "${branch_drift}" ]]; then
         _rec_health="drift"
         _rec_drift="${worktree_drift}${worktree_drift:+, }${branch_drift}"
+    elif [[ -n "${stale_marker}" ]]; then
+        _rec_health="stale"
+        _rec_drift="inactive since $(date -d "@${_rec_last_activity}" '+%Y-%m-%d %H:%M' 2>/dev/null || echo "unknown")"
     elif [[ "${pid_health}" == "live" ]]; then
         _rec_health="live"
     fi
@@ -500,6 +511,106 @@ with open('${session_file}', 'w') as f:
 " >/dev/null 2>&1
 }
 
+# Update the last_activity timestamp for an active session.
+# Called by Kimi hooks and the wrapper heartbeat.
+_update_last_activity() {
+    local identity="$1"
+    local session_file
+    session_file="$(_get_session_file "${identity}")"
+    [[ -f "${session_file}" ]] || return 1
+
+    ${AG_PYTHON} -c "
+import json, time, os
+with open('${session_file}') as f:
+    d = json.load(f)
+if d.get('status') != 'active':
+    raise SystemExit(1)
+d['last_activity'] = time.time()
+with open('${session_file}', 'w') as f:
+    json.dump(d, f, indent=2)
+" >/dev/null 2>&1
+}
+
+# Load last_activity from a session file (empty if missing/not active).
+_load_last_activity() {
+    local identity="$1"
+    ${AG_PYTHON} -c "
+import json, sys
+try:
+    with open('$(_get_session_file "${identity}")') as f:
+        d = json.load(f)
+    if d.get('status') == 'active':
+        print(d.get('last_activity', '') or d.get('timestamp', '') or '')
+except Exception:
+    pass
+" 2>/dev/null
+}
+
+# Return the configured stale threshold in seconds (default 24h).
+_stale_threshold_seconds() {
+    local hours
+    hours="$(_guard_get_str "session.stale_threshold_hours" "24" 2>/dev/null || echo "24")"
+    if [[ -z "${hours}" || "${hours}" == "None" || ! "${hours}" =~ ^[0-9]+$ ]]; then
+        hours=24
+    fi
+    echo $((hours * 3600))
+}
+
+# Return true if the session is active but last_activity is older than the threshold.
+_is_session_stale() {
+    local identity="$1"
+    local session_file
+    session_file="$(_get_session_file "${identity}")"
+    [[ -f "${session_file}" ]] || return 1
+
+    local last_activity threshold now
+    last_activity="$(_load_last_activity "${identity}")"
+    [[ -n "${last_activity}" ]] || return 1
+    threshold="$(_stale_threshold_seconds)"
+    now="$(date +%s)"
+
+    if [[ $((now - ${last_activity%.*})) -gt ${threshold} ]]; then
+        return 0
+    fi
+    return 1
+}
+
+# Build a map of active PIDs to identities. Print lines "pid identity".
+_active_pid_identity_map() {
+    local session_dir
+    session_dir="$(dirname "$(_get_session_file "kimi1")")"
+    [[ -d "${session_dir}" ]] || return 0
+
+    for f in "${session_dir}"/*.json; do
+        [[ -e "${f}" ]] || continue
+        ${AG_PYTHON} -c "
+import json, os, sys
+try:
+    with open('${f}') as fh:
+        d = json.load(fh)
+    if d.get('status') == 'active' and d.get('pid'):
+        print(f\"{d['pid']} {d['identity']}\")
+except Exception:
+    pass
+" 2>/dev/null
+    done
+}
+
+# Return identities that share the same active PID as another slot.
+_detect_shared_pids() {
+    local duplicates=""
+    declare -A pid_to_identity
+    while read -r pid ident; do
+        [[ -z "${pid}" || -z "${ident}" ]] && continue
+        if [[ -n "${pid_to_identity[${pid}]:-}" ]]; then
+            duplicates="${duplicates}${duplicates:+, }${pid_to_identity[${pid}]}&${ident}"
+        else
+            pid_to_identity["${pid}"]="${ident}"
+        fi
+    done < <(_active_pid_identity_map)
+    echo "${duplicates}"
+}
+
 _save_session() {
     local identity="$1"
     local status="$2"
@@ -525,7 +636,7 @@ _save_session() {
     export _AG_S_SESSION_FILE="${session_file}"
 
     ${AG_PYTHON} -c "
-import json, os
+import json, os, time
 role = os.environ.get('_AG_S_ROLE') or None
 data = {
     'identity': os.environ['_AG_S_IDENTITY'],
@@ -533,7 +644,8 @@ data = {
     'role': role,
     'branch': os.environ['_AG_S_BRANCH'],
     'pid': int(os.environ['_AG_S_PID']),
-    'timestamp': __import__('time').time(),
+    'timestamp': time.time(),
+    'last_activity': time.time(),
     'worktree_path': os.environ['_AG_S_WORKTREE'],
     'impact_plugins': json.loads(os.environ.get('_AG_S_IMPACT','[]'))
 }
@@ -710,9 +822,16 @@ _acquire_slot() {
             sess_pid="$(_load_session_field "${identity}" "pid")"
             if [[ "${sess_status}" == "active" ]]; then
                 if _is_pid_alive "${sess_pid}"; then
-                    return 1
+                    # A live but stale session is treated as free so idle IDE
+                    # tabs/conversations do not permanently exhaust slots.
+                    if _is_session_stale "${identity}"; then
+                        _clear_session "${identity}"
+                    else
+                        return 1
+                    fi
+                else
+                    _clear_session "${identity}"
                 fi
-                _clear_session "${identity}"
             fi
 
             # Cooldown: slots released in the last 60s are treated as occupied
@@ -1282,6 +1401,10 @@ while [[ $# -gt 0 ]]; do
                 return 1 2>/dev/null || exit 1
             fi
             ;;
+        --cleanup-stale)
+            MODE="cleanup-stale"
+            shift
+            ;;
         --impact)
             if [[ -n "${2:-}" ]]; then
                 IMPACT_PLUGINS="$2"
@@ -1549,6 +1672,86 @@ _release_pending_work_guard() {
 }
 
 # ---------------------------------------------------------------------------
+# Helper: attempt to release a stale session only when it is safe.
+# Safe means: worktree is release-ready and there are no open PRs.
+# Returns 0 if released, 1 otherwise (without emitting blocking errors).
+# ---------------------------------------------------------------------------
+_auto_release_if_safe() {
+    local identity="$1"
+    local worktree_path="$2"
+    local reason="${3:-stale}"
+
+    if ! _validate_worktree_release_ready "${worktree_path}" >/dev/null 2>&1; then
+        return 1
+    fi
+
+    if ! _release_pending_work_guard "${identity}" "${worktree_path}" "false" >/dev/null 2>&1; then
+        return 1
+    fi
+
+    _clear_session "${identity}"
+
+    if command -v _journal_release >/dev/null 2>&1; then
+        _journal_release
+    fi
+
+    local neutral_branch="_released/${identity}"
+    local base_ref=""
+    if git -C "${worktree_path}" rev-parse --verify --quiet "origin/develop" >/dev/null 2>&1; then
+        base_ref="origin/develop"
+    elif git -C "${worktree_path}" rev-parse --verify --quiet "develop" >/dev/null 2>&1; then
+        base_ref="develop"
+    fi
+
+    if [[ -n "${base_ref}" ]]; then
+        git -C "${worktree_path}" checkout -B "${neutral_branch}" "${base_ref}" >/dev/null 2>&1 || \
+            git -C "${worktree_path}" checkout --detach "${base_ref}" >/dev/null 2>&1 || true
+    fi
+
+    echo "🔓 Auto-released ${identity} (${reason})"
+    return 0
+}
+
+# ---------------------------------------------------------------------------
+# Helper: scan all slots and auto-release stale ones that are safe to release.
+# ---------------------------------------------------------------------------
+_cleanup_stale_sessions() {
+    local identity_list prefix i identity worktree_path
+    local released=0 skipped=0
+
+    identity_list="$(bash "${AGENT_GUARD_CONFIG_BIN}" keys identities 2>/dev/null || true)"
+    for prefix in ${identity_list}; do
+        [[ -z "${prefix}" ]] && continue
+        local base_slots max_slots
+        base_slots="$(_guard_get "identities.${prefix}.slots" 2>/dev/null || echo "0")"
+        max_slots="$(_guard_get "identities.${prefix}.max_slots" "${base_slots}" 2>/dev/null || echo "${base_slots}")"
+        for i in $(seq 1 "${max_slots}"); do
+            identity="${prefix}${i}"
+            worktree_path="$(_get_worktree_path "${identity}")"
+
+            local sess_status sess_pid
+            sess_status="$(_load_session_field "${identity}" "status")"
+            sess_pid="$(_load_session_field "${identity}" "pid")"
+
+            [[ "${sess_status}" == "active" ]] || continue
+            _is_pid_alive "${sess_pid}" || continue
+            _is_session_stale "${identity}" || continue
+
+            if _auto_release_if_safe "${identity}" "${worktree_path}" "stale"; then
+                released=$((released + 1))
+            else
+                echo "🔒 ${identity} is stale but cannot be auto-released (dirty worktree or open PRs)." >&2
+                skipped=$((skipped + 1))
+            fi
+        done
+    done
+
+    echo ""
+    echo "🧹 Cleanup complete: ${released} released, ${skipped} skipped."
+    return 0 2>/dev/null || exit 0
+}
+
+# ---------------------------------------------------------------------------
 # 7. --release mode
 # ---------------------------------------------------------------------------
 if [[ "${MODE}" == "release" ]]; then
@@ -1659,6 +1862,8 @@ if [[ "${MODE}" == "status" ]]; then
                 pid_col="${_rec_pid} (live)"
             elif [[ "${_rec_health}" == "dead" ]]; then
                 pid_col="${_rec_pid} (dead)"
+            elif [[ "${_rec_health}" == "stale" ]]; then
+                pid_col="${_rec_pid} (stale)"
             fi
 
             printf "%-12s | %-8s | %-6s | %-10s | %-6s | %-8s | %-40s\n" \
@@ -1671,6 +1876,17 @@ if [[ "${MODE}" == "status" ]]; then
         done
     done
     echo "=========================================================="
+
+    # Shared-PID guard: surface when one IDE process holds multiple leases.
+    local shared_pids
+    shared_pids="$(_detect_shared_pids)"
+    if [[ -n "${shared_pids}" ]]; then
+        echo ""
+        echo "⚠️  Shared PID detected (one IDE process holding multiple slots):"
+        echo "   ${shared_pids}"
+        echo ""
+    fi
+
     if [[ -n "${any_drift}" ]]; then
         echo ""
         echo "⚠️  Issues detected:"
@@ -1679,6 +1895,14 @@ if [[ "${MODE}" == "status" ]]; then
         echo "Use: source .hmvip-agent-init --adopt <identity>  to inspect/recover"
     fi
     echo ""
+    return 0 2>/dev/null || exit 0
+fi
+
+# ---------------------------------------------------------------------------
+# 8.5 --cleanup-stale mode
+# ---------------------------------------------------------------------------
+if [[ "${MODE}" == "cleanup-stale" ]]; then
+    _cleanup_stale_sessions
     return 0 2>/dev/null || exit 0
 fi
 
