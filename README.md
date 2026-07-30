@@ -297,6 +297,12 @@ Notas de implementação:
   ```bash
   bash /path/to/agent-guard-core/install.sh --target /path/to/your/repo --install-wrapper
   ```
+  Uma vez instalado, o comando do dia a dia continua sendo o habitual:
+  ```bash
+  kimi                # adquire/adota o slot padrão e lança o agente
+  kimi --slot kimi3   # usa um slot específico da família Kimi
+  ```
+  Não é necessário invocar `source agent-guard init` manualmente — o wrapper delega automaticamente para o init stub do repositório.
 - Instalação manual do wrapper:
   ```bash
   mv <bin_dir>/kimi <bin_dir>/kimi.real
