@@ -119,6 +119,10 @@ function _agent_guard_main() {
             source "${INIT_SCRIPT}" --triage "$@"
             return $?
             ;;
+        cleanup-stale|cs)
+            source "${INIT_SCRIPT}" --cleanup-stale
+            return $?
+            ;;
         journal|j)
             _journal_list "$@"
             return $?

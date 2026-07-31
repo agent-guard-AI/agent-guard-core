@@ -1,0 +1,56 @@
+#!/usr/bin/env bash
+#
+# Agent Guard SessionEnd hook for Kimi Code.
+# Attempts to auto-release the current slot when the conversation ends,
+# but only if the worktree is clean and there are no open PRs.
+#
+# Safety: this script is sourced by Kimi Code hooks. It must not leak strict
+# mode or change the caller's working directory.
+
+_AG_SE_OLD_FLAGS="$(set +o)"
+_ag_se_restore_flags() {
+    eval "${_AG_SE_OLD_FLAGS}" 2>/dev/null || true
+}
+
+function _ag_session_end_main() {
+    set -euo pipefail
+
+    local repo_root=""
+    repo_root="$(git -C "${PWD}" rev-parse --show-toplevel 2>/dev/null || true)"
+    if [[ -z "${repo_root}" || ! -f "${repo_root}/agent-guard.yaml" ]]; then
+        return 0
+    fi
+
+    local init_stub="${repo_root}/.hmvip-agent-init"
+    if [[ ! -f "${init_stub}" ]]; then
+        return 0
+    fi
+
+    AGENT_GUARD_FUNCTIONS_ONLY=1
+    # shellcheck source=/dev/null
+    if ! source "${init_stub}" >/dev/null 2>&1; then
+        return 0
+    fi
+
+    local worktree_name identity
+    worktree_name="$(basename "${PWD}" 2>/dev/null || true)"
+    identity="$(_detect_identity_from_worktree_name "${worktree_name}" 2>/dev/null | awk '{print $1 $2}' || true)"
+    if [[ -z "${identity}" ]]; then
+        return 0
+    fi
+
+    local session_status
+    session_status="$(_load_session_field "${identity}" "status" 2>/dev/null || true)"
+    [[ "${session_status}" == "active" ]] || return 0
+
+    local worktree_path
+    worktree_path="$(_get_worktree_path "${identity}" 2>/dev/null || true)"
+    [[ -n "${worktree_path}" ]] || return 0
+
+    # Only auto-release when safe; failures are silent to avoid blocking Kimi shutdown.
+    _auto_release_if_safe "${identity}" "${worktree_path}" "session-end" >/dev/null 2>&1 || true
+    return 0
+}
+
+_ag_session_end_main "$@" || true
+_ag_se_restore_flags
