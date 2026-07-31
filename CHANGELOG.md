@@ -1,6 +1,44 @@
 # Changelog — agent-guard-core
 
+## 0.9.6 — Heartbeat, stale detection e auto-release seguro (ADR-0033)
+
+- `agent-guard.yaml`:
+  - Nova seção `session` com `stale_threshold_hours: 24` e `auto_release_stale: true`.
+- `src/init.sh`:
+  - `_save_session()` grava `last_activity` no lease JSON.
+  - Novos helpers `_update_last_activity()`, `_load_last_activity()`,
+    `_stale_threshold_seconds()`, `_is_session_stale()`.
+  - `_status_reconcile_session()` reporta health `stale` quando o PID está vivo
+    mas `last_activity` ultrapassou o threshold configurado.
+  - `_detect_shared_pids()` e alerta no `--status` quando um mesmo PID de IDE
+    detém múltiplos leases ativos.
+  - `_slot_is_free()` trata sessões `stale` com worktree limpo como livres,
+    permitindo reutilização de slots abandonados por abas ociosas do Kimi Code.
+  - `_auto_release_if_safe()` e `_cleanup_stale_sessions()` implementam liberação
+    condicional: só liberam se worktree estiver limpo, sem stashes e sem PRs
+    abertos da identidade.
+  - Novo modo `--cleanup-stale` (também via `source agent-guard cleanup-stale`).
+- Hooks do Kimi Code:
+  - `~/.kimi-code/hooks/agent-guard-heartbeat.sh` atualiza `last_activity` a cada
+    `UserPromptSubmit`.
+  - `~/.kimi-code/hooks/agent-guard-session-end.sh` tenta liberar o slot no
+    `SessionEnd` quando seguro.
+  - `~/.kimi-code/config.toml` ganha entradas `[[hooks]]` para os dois eventos.
+- Watcher local:
+  - `.kiro/scripts/agent-guard-cleanup.sh` para execução periódica via cron.
+- `tests/agent-guard/agent-guard-stale-cleanup-test.sh` (novo):
+  - Valida stale detection, heartbeat, auto-release de slot limpo, recusa de
+    release de slot sujo e dispatch do comando `cleanup-stale`.
+- `wrappers/kimi/wrapper.sh`:
+  - Watcher de sessão Kimi em background agora desacopla stdin/stdout/stderr
+    (`</dev/null >/dev/null 2>&1`) antes do `disown`, evitando que o watcher
+    segure pipes do processo pai em command substitution (`$(...)`). Corrige
+    travamento do `kimi-wrapper-test.sh` e de scripts que invocam `kimi` via
+    subshell.
+
 ## 0.9.5 — Adoção segura de slots órfãos, shell isolation e guarda de PRs preservada (ADR-0023)
+
+> Sync upstream: enviado para `agent-guard-AI/agent-guard-core@main` em 2026-07-25 (commit `106e748443`).
 
 - `src/init.sh`:
   - Novo helper `_branch_belongs_to_identity_or_base()` que identifica se a branch
