@@ -547,13 +547,20 @@ except Exception:
 }
 
 # Return the configured stale threshold in seconds (default 24h).
+# Aplica um floor de 60s para evitar falsos positivos de stale quando o
+# threshold esta muito baixo (ex: 0h em testes) e ha latencia entre o
+# heartbeat e a checagem.
 _stale_threshold_seconds() {
     local hours
     hours="$(_guard_get_str "session.stale_threshold_hours" "24" 2>/dev/null || echo "24")"
     if [[ -z "${hours}" || "${hours}" == "None" || ! "${hours}" =~ ^[0-9]+$ ]]; then
         hours=24
     fi
-    echo $((hours * 3600))
+    local seconds=$((hours * 3600))
+    if [[ "${seconds}" -lt 60 ]]; then
+        seconds=60
+    fi
+    echo "${seconds}"
 }
 
 # Return true if the session is active but last_activity is older than the threshold.
