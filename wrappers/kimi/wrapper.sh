@@ -869,10 +869,14 @@ if [[ -f "${_ag_session_trace_script}" && -n "${_AG_WORKTREE:-}" && -n "${_AG_ID
     # explicit checkpoint. The watcher is best-effort and never blocks Kimi.
     watch_interval="${AGENT_GUARD_KIMI_WATCH_INTERVAL_SECONDS:-60}"
     if [[ "${watch_interval}" -gt 0 && -n "${_AG_WORKTREE:-}" ]]; then
+        # Detach all file descriptors so the background watcher never keeps the
+        # caller's pipes (e.g. command substitution $(...)) open after the real
+        # Kimi process exits. This is a best-effort trace; losing its output is
+        # acceptable.
         (
             source "${_ag_session_trace_script}" >/dev/null 2>&1
             _trace_watch_kimi_session "$$" "${_AG_WORKTREE}" "${_ag_session_trace_dir}" "${watch_interval}" "${AGENT_GUARD_KIMI_WATCH_CHECKPOINT_INTERVAL_SECONDS:-300}" >/dev/null 2>&1
-        ) &
+        ) </dev/null >/dev/null 2>&1 &
         disown 2>/dev/null || true
     fi
 fi
