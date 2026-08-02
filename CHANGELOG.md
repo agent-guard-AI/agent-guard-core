@@ -1,6 +1,96 @@
 # Changelog — agent-guard-core
 
+## 0.9.8 — Performance: abertura de slots abaixo de 5s, scan /proc único e rotação de journal
+
+- `wrappers/kimi/wrapper.sh`:
+  - `_ag_scan_proc_once()` faz uma única passagem por `/proc` e cacheia PIDs de
+    agentes e PIDs cujo `cwd` está dentro de worktrees conhecidos.
+  - `_ag_worktree_has_live_agent()` e `_ag_find_resumable_worktree()` reutilizam
+    esse cache, eliminando múltiplos scans de `/proc` por invocação.
+  - `_ag_find_resumable_worktree()` lê apenas as últimas 2000 linhas do journal
+    via `tail`, em vez de carregar o arquivo JSONL inteiro (que já passava de 9 MB).
+  - Log de lease agora usa caminho por slot (`/tmp/ag-wrapper-lease-<slot>.log`),
+    evitando que abas paralelas sobrescrevam o mesmo arquivo.
+  - Novo helper `_ag_find_agent_ancestor()` identifica a sessão IDE/agente raiz
+    (topo da cadeia de processos) em vez de comparar com `$$`. Isso evita que o
+    próprio wrapper/teste seja confundido com ocupante e impede que sessões
+    distintas do mesmo IDE compartilhem um slot.
+  - Watcher de session trace inicia com `cd /` para que um processo de fundo
+    sobrevivente não segure o `cwd` do worktree e bloqueie reabertura do slot.
+- `src/init.sh`:
+  - Novo helper `_ag_build_proc_cache()` com a mesma lógica single-pass do wrapper,
+    usado por `_worktree_has_other_live_agent()`.
+  - `_worktree_has_other_live_agent()` usa `_ag_find_agent_ancestor()` para
+    distinguir a própria sessão IDE de outras sessões no mesmo worktree,
+    alinhando-se com a lógica do wrapper.
+  - `git fetch origin` em todos os caminhos de inicialização agora usa `timeout 15s`,
+    impedindo que uma rede lenta congele a abertura do slot.
+  - Verificação de stale global lock via `lslocks` passa de a cada 5s para a cada
+    10s, reduzindo overhead sem comprometer a recuperação.
+- `src/journal.sh`:
+  - Rotação automática no momento da escrita quando o journal ultrapassa 50 MiB;
+    preserva os 10 MiB mais recentes e arquiva o restante compactado com `gzip`.
+- `tests/agent-guard/*`:
+  - Testes existentes de shell isolation, init, lease-owner, wrapper, proteção do
+    repo principal, diff regression e PID collision continuam passando.
+  - `agent-init-test.sh` e `kimi-wrapper-test.sh`: fake agents usam `setsid` em
+    subshell transitória para serem re-parentizados ao init, simulando agentes de
+    sessões IDE separadas no teste de bloqueio de worktree ocupado.
+
+## 0.9.7 — Fix: --adopt recusa PID vivo sem exceção de "mesmo processo"
+
+- `src/init.sh`:
+  - A verificação de `--adopt` que recusa sessões vivas não compara mais o PID
+    armazenado contra o PID da sessão atual (`_ag_session_pid`). A comparação
+    anterior permitia que um único processo (mesmo shell/IDE) adotasse vários
+    slots sucessivamente, violando o invariante de 1 slot por sessão e
+    prendendo múltiplas identidades ao mesmo PID compartilhado.
+  - Agora `--adopt` recusa **sempre** que o PID registrado estiver vivo;
+    adotar é estritamente para sessões mortas. Reattach do próprio slot vivo
+    deve usar init normal, reuse ou `--attach`.
+- `tests/agent-guard/agent-init-test.sh`:
+  - Novo teste de regressão: `--adopt` recusa slot cujo PID registrado está
+    vivo, mesmo quando o processo de teste compartilharia o mesmo PID.
+
+## 0.9.6 — Heartbeat, stale detection e auto-release seguro (ADR-0033)
+
+- `agent-guard.yaml`:
+  - Nova seção `session` com `stale_threshold_hours: 24` e `auto_release_stale: true`.
+- `src/init.sh`:
+  - `_save_session()` grava `last_activity` no lease JSON.
+  - Novos helpers `_update_last_activity()`, `_load_last_activity()`,
+    `_stale_threshold_seconds()`, `_is_session_stale()`.
+  - `_status_reconcile_session()` reporta health `stale` quando o PID está vivo
+    mas `last_activity` ultrapassou o threshold configurado.
+  - `_detect_shared_pids()` e alerta no `--status` quando um mesmo PID de IDE
+    detém múltiplos leases ativos.
+  - `_slot_is_free()` trata sessões `stale` com worktree limpo como livres,
+    permitindo reutilização de slots abandonados por abas ociosas do Kimi Code.
+  - `_auto_release_if_safe()` e `_cleanup_stale_sessions()` implementam liberação
+    condicional: só liberam se worktree estiver limpo, sem stashes e sem PRs
+    abertos da identidade.
+  - Novo modo `--cleanup-stale` (também via `source agent-guard cleanup-stale`).
+- Hooks do Kimi Code:
+  - `~/.kimi-code/hooks/agent-guard-heartbeat.sh` atualiza `last_activity` a cada
+    `UserPromptSubmit`.
+  - `~/.kimi-code/hooks/agent-guard-session-end.sh` tenta liberar o slot no
+    `SessionEnd` quando seguro.
+  - `~/.kimi-code/config.toml` ganha entradas `[[hooks]]` para os dois eventos.
+- Watcher local:
+  - `.kiro/scripts/agent-guard-cleanup.sh` para execução periódica via cron.
+- `tests/agent-guard/agent-guard-stale-cleanup-test.sh` (novo):
+  - Valida stale detection, heartbeat, auto-release de slot limpo, recusa de
+    release de slot sujo e dispatch do comando `cleanup-stale`.
+- `wrappers/kimi/wrapper.sh`:
+  - Watcher de sessão Kimi em background agora desacopla stdin/stdout/stderr
+    (`</dev/null >/dev/null 2>&1`) antes do `disown`, evitando que o watcher
+    segure pipes do processo pai em command substitution (`$(...)`). Corrige
+    travamento do `kimi-wrapper-test.sh` e de scripts que invocam `kimi` via
+    subshell.
+
 ## 0.9.5 — Adoção segura de slots órfãos, shell isolation e guarda de PRs preservada (ADR-0023)
+
+> Sync upstream: enviado para `agent-guard-AI/agent-guard-core@main` em 2026-07-25 (commit `106e748443`).
 
 - `src/init.sh`:
   - Novo helper `_branch_belongs_to_identity_or_base()` que identifica se a branch

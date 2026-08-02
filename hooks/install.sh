@@ -60,6 +60,19 @@ for hook in post-commit pre-push pre-commit pre-checkout commit-msg post-checkou
     echo "   ✅ Installed ${hook}"
 done
 
+# Helper scripts sourced/called by the hooks (best-effort; PAS — Protocolo de
+# Ação Sensível, SPEC-ECOSYSTEM-GUARDIAN H5 — chamado pelo pre-push com
+# `|| true` deliberado: nunca bloqueia push).
+for helper in lease-owner-check.sh pas-sensitive-scan.sh; do
+    src="${HOOKS_SRC}/${helper}"
+    dst="${HOOKS_DST}/${helper}"
+    if [[ -f "${src}" ]]; then
+        cp "${src}" "${dst}"
+        chmod +x "${dst}"
+        echo "   ✅ Installed helper ${helper}"
+    fi
+done
+
 # Configure core.hooksPath locally (worktree-scoped) to use .githooks
 git -C "${REPO_ROOT}" config --worktree core.hooksPath "${HOOKS_DST}"
 

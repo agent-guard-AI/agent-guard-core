@@ -310,6 +310,7 @@ _status_reconcile_session() {
     _rec_pid="$(_load_session_field "${identity}" "pid")"
     _rec_branch="$(_load_session_field "${identity}" "branch")"
     _rec_worktree="$(_load_session_field "${identity}" "worktree_path")"
+    _rec_last_activity="$(_load_last_activity "${identity}")"
     _rec_health="-"
     _rec_drift=""
 
@@ -374,13 +375,23 @@ _status_reconcile_session() {
         fi
     fi
 
-    # Determine final health label.
+    # Determine final health label. A live PID with no recent activity is
+    # reported as stale so operators can recover slots left behind by idle
+    # IDE tabs/conversations.
+    local stale_marker=""
+    if [[ "${pid_health}" == "live" ]] && _is_session_stale "${identity}"; then
+        stale_marker="stale"
+    fi
+
     if [[ "${pid_health}" == "dead" ]]; then
         _rec_health="dead"
         _rec_drift="session PID is dead"
     elif [[ -n "${worktree_drift}" || -n "${branch_drift}" ]]; then
         _rec_health="drift"
         _rec_drift="${worktree_drift}${worktree_drift:+, }${branch_drift}"
+    elif [[ -n "${stale_marker}" ]]; then
+        _rec_health="stale"
+        _rec_drift="inactive since $(date -d "@${_rec_last_activity}" '+%Y-%m-%d %H:%M' 2>/dev/null || echo "unknown")"
     elif [[ "${pid_health}" == "live" ]]; then
         _rec_health="live"
     fi
@@ -399,71 +410,159 @@ _status_reconcile_session() {
 # the current session PID. Used in reuse mode to detect slot collapse when
 # the lease file is missing or stale.
 #
-# Detection walks the ancestor chain of every process whose cwd is the worktree.
-# This catches not only the main agent binary (kimi-code, claude, etc.) but also
-# child processes such as MCP servers spawned via "npm exec" or "node" that have
-# a generic name but are descendants of the agent session.
-_worktree_has_other_live_agent() {
-    local worktree_path="$1"
-    local own_pid
-    own_pid="$(_ag_session_pid "${worktree_path}")"
+# Detection walks the descendant tree of every known agent process looking for a
+# process whose cwd is the worktree. This catches not only the main agent binary
+# (kimi-code, claude, etc.) but also child processes such as MCP servers spawned
+# via "npm exec" or "node" that have a generic name but are descendants of the
+# agent session.
+#
+# Performance: iterating /proc directly in shell is too slow on hosts with many
+# threads. We use `ps` (C implementation) once to get the process table, build a
+# small descendant index for agent candidates, and readlink cwd only for those.
+# Results are cached for a few seconds to avoid repeated scans during a single
+# init invocation.
+_AG_OTHER_AGENT_CACHE_TS=""
+_AG_OTHER_AGENT_CACHE_WORKTREE=""
+_AG_OTHER_AGENT_CACHE_RESULT=""
 
-    # Build the set of known agent PIDs by inspecting comm/cmdline.
-    local agent_pids=""
-    local pid
-    for pid in /proc/[0-9]*; do
-        [[ -d "${pid}" ]] || continue
-        local pid_num="${pid#/proc/}"
-        local comm cmdline_argv0
-        comm="$(cat "${pid}/comm" 2>/dev/null || true)"
-        cmdline_argv0="$(tr '\0' '\n' < "${pid}/cmdline" 2>/dev/null | head -n1 || true)"
-        case "${comm}|${cmdline_argv0}" in
-            *kimi-code*|*claude*|*gemini*|*grok*|*cursor*|*antigravity*|*kiro*|*kimi*)
-                agent_pids="${agent_pids} ${pid_num}"
-                ;;
-        esac
+# Walk the cached PPID map and return the top-most (root) agent process that
+# owns this process tree. We keep walking instead of stopping at the first
+# agent because args-based detection can flag the current shell/wrapper itself
+# as an agent (e.g. its argv contains a .kimi-code path); the meaningful
+# session owner is the IDE/agent root at the top of the chain.
+_ag_find_agent_ancestor() {
+    local start_pid="$1"
+    local agent_pids="$2"
+    local ppid_map="$3"
+    local current_pid="${start_pid}"
+    local visited=""
+    local root_agent=""
+
+    while [[ -n "${current_pid}" && "${current_pid}" != "1" ]]; do
+        if [[ "${visited}" =~ (^|[[:space:]])${current_pid}([[:space:]]|$) ]]; then
+            break
+        fi
+        visited="${visited} ${current_pid}"
+
+        if [[ " ${agent_pids} " =~ [[:space:]]${current_pid}[[:space:]] ]]; then
+            root_agent="${current_pid}"
+        fi
+
+        current_pid="$(printf '%s' "${ppid_map}" | tr ' ' '\n' | grep "^${current_pid}:" | head -n1 | cut -d: -f2)"
     done
 
-    # For every process in the worktree, walk up the process tree looking for a
-    # known agent ancestor. This detects MCP child processes (npm exec, node,
-    # playwright-mcp, context7-mcp, etc.) whose own names do not contain the
-    # agent identifier.
-    for pid in /proc/[0-9]*; do
-        [[ -d "${pid}" ]] || continue
-        local pid_num="${pid#/proc/}"
-        [[ "${pid_num}" == "${own_pid}" ]] && continue
+    if [[ -n "${root_agent}" ]]; then
+        echo "${root_agent}"
+        return 0
+    fi
+    return 1
+}
+
+_worktree_has_other_live_agent() {
+    local worktree_path="$1"
+
+    # Short-lived cache: many init paths call this helper for the same worktree
+    # within milliseconds. Reuse the last answer if still fresh.
+    local now
+    now="$(date +%s)"
+    if [[ "${_AG_OTHER_AGENT_CACHE_WORKTREE:-}" == "${worktree_path}" && -n "${_AG_OTHER_AGENT_CACHE_RESULT:-}" ]]; then
+        if [[ $((now - _AG_OTHER_AGENT_CACHE_TS)) -lt 5 ]]; then
+            return "${_AG_OTHER_AGENT_CACHE_RESULT}"
+        fi
+    fi
+
+    # Snapshot process table: pid, ppid, comm, argv.
+    local ps_output
+    ps_output="$(ps -eo pid,ppid,comm,args 2>/dev/null | tail -n +2)"
+    if [[ -z "${ps_output}" ]]; then
+        _AG_OTHER_AGENT_CACHE_WORKTREE="${worktree_path}"
+        _AG_OTHER_AGENT_CACHE_TS="${now}"
+        _AG_OTHER_AGENT_CACHE_RESULT="1"
+        return 1
+    fi
+
+    # Build children map, ppid map and identify agent PIDs from comm/args in one
+    # awk pass. We then compute the transitive descendant set of all agent
+    # processes; shell only reads cwd for those candidates.
+    local candidates
+    candidates="$(printf '%s' "${ps_output}" | awk '
+    {
+        pid=$1; ppid=$2; comm=$3;
+        args=""; for (i=4; i<=NF; i++) args = args $i " ";
+        children[ppid] = children[ppid] " " pid;
+        ppid_map[pid] = ppid;
+        if (comm == "kimi-code" || comm == "claude" || comm == "gemini" || comm == "grok" || comm == "cursor" || comm == "antigravity" || comm == "kiro" || comm == "kimi" || args ~ /(^|[^[:alnum:]_])(kimi-code|claude|gemini|grok|cursor|antigravity|kiro|kimi)([^[:alnum:]_]|$)/) {
+            agents[pid] = 1;
+        }
+    }
+    END {
+        for (p in ppid_map) {
+            print "P" p ":" ppid_map[p];
+        }
+        for (a in agents) {
+            print "C" a;
+            delete q;
+            q[0] = a; qi = 0; qn = 1;
+            while (qi < qn) {
+                cur = q[qi++];
+                if (children[cur] != "") {
+                    n = split(children[cur], cands, " ");
+                    for (j=1; j<=n; j++) {
+                        cand = cands[j];
+                        if (cand != "" && !seen[cand]) {
+                            seen[cand] = 1;
+                            q[qn++] = cand;
+                            print "C" cand;
+                        }
+                    }
+                }
+            }
+        }
+    }')"
+
+    # Extract ppid map and candidate PIDs.
+    local ppid_map=""
+    local candidate_pids=""
+    local agent_pids=""
+    ppid_map="$(printf '%s' "${candidates}" | grep '^P' | cut -c2- | tr '\n' ' ')"
+    candidate_pids="$(printf '%s' "${candidates}" | grep '^C' | cut -c2- | tr '\n' ' ')"
+    # Agent PIDs are the candidates that are agents themselves (the roots before
+    # descendant expansion). We reconstruct this set from the first "C" entries
+    # printed by awk before any children are enumerated.
+    agent_pids="$(printf '%s' "${candidates}" | awk '
+        /^C/ { pid=substr($0,2); if (!printed[pid]) { print pid; printed[pid]=1 } }
+        !/^C/ { next }
+    ' | tr '\n' ' ')"
+
+    # Identify the agent IDE/session that owns this init invocation. Processes
+    # belonging to the same agent session are ignored; any other agent session in
+    # the worktree counts as a live occupant.
+    local own_agent_ancestor
+    own_agent_ancestor="$(_ag_find_agent_ancestor "$$" "${agent_pids}" "${ppid_map}")"
+
+    # Check cwd for every agent and descendant candidate. Ignore candidates that
+    # belong to our own agent session.
+    local candidate
+    for candidate in ${candidate_pids}; do
         local cwd_link
-        cwd_link="$(readlink "${pid}/cwd" 2>/dev/null || true)"
+        cwd_link="$(readlink "/proc/${candidate}/cwd" 2>/dev/null || true)"
         [[ "${cwd_link}" != "${worktree_path}" ]] && continue
 
-        # Collect this process's ancestor chain.
-        local current_pid="${pid_num}"
-        local ancestors=""
-        local visited=""
-        while [[ -n "${current_pid}" && "${current_pid}" != "1" ]]; do
-            # Avoid infinite loops in malformed /proc entries.
-            if [[ "${visited}" =~ (^|[[:space:]])${current_pid}([[:space:]]|$) ]]; then
-                break
-            fi
-            visited="${visited} ${current_pid}"
-            ancestors="${ancestors} ${current_pid}"
-            current_pid="$(grep '^PPid:' "/proc/${current_pid}/status" 2>/dev/null | awk '{print $2}' || true)"
-        done
-
-        # If our own session is in the ancestor chain, this process is just our
-        # own subprocess visiting the worktree (e.g. a test or build). Ignore it.
-        if [[ "${ancestors}" =~ (^|[[:space:]])${own_pid}([[:space:]]|$) ]]; then
+        local cand_agent_ancestor
+        cand_agent_ancestor="$(_ag_find_agent_ancestor "${candidate}" "${agent_pids}" "${ppid_map}")"
+        if [[ -n "${own_agent_ancestor}" && "${cand_agent_ancestor}" == "${own_agent_ancestor}" ]]; then
             continue
         fi
 
-        # If any known agent is in the ancestor chain, the worktree is held by
-        # another live session.
-        for apid in ${agent_pids}; do
-            if [[ "${ancestors}" =~ (^|[[:space:]])${apid}([[:space:]]|$) ]]; then
-                return 0
-            fi
-        done
+        _AG_OTHER_AGENT_CACHE_WORKTREE="${worktree_path}"
+        _AG_OTHER_AGENT_CACHE_TS="${now}"
+        _AG_OTHER_AGENT_CACHE_RESULT="0"
+        return 0
     done
+
+    _AG_OTHER_AGENT_CACHE_WORKTREE="${worktree_path}"
+    _AG_OTHER_AGENT_CACHE_TS="${now}"
+    _AG_OTHER_AGENT_CACHE_RESULT="1"
     return 1
 }
 
@@ -500,6 +599,113 @@ with open('${session_file}', 'w') as f:
 " >/dev/null 2>&1
 }
 
+# Update the last_activity timestamp for an active session.
+# Called by Kimi hooks and the wrapper heartbeat.
+_update_last_activity() {
+    local identity="$1"
+    local session_file
+    session_file="$(_get_session_file "${identity}")"
+    [[ -f "${session_file}" ]] || return 1
+
+    ${AG_PYTHON} -c "
+import json, time, os
+with open('${session_file}') as f:
+    d = json.load(f)
+if d.get('status') != 'active':
+    raise SystemExit(1)
+d['last_activity'] = time.time()
+with open('${session_file}', 'w') as f:
+    json.dump(d, f, indent=2)
+" >/dev/null 2>&1
+}
+
+# Load last_activity from a session file (empty if missing/not active).
+_load_last_activity() {
+    local identity="$1"
+    ${AG_PYTHON} -c "
+import json, sys
+try:
+    with open('$(_get_session_file "${identity}")') as f:
+        d = json.load(f)
+    if d.get('status') == 'active':
+        print(d.get('last_activity', '') or d.get('timestamp', '') or '')
+except Exception:
+    pass
+" 2>/dev/null
+}
+
+# Return the configured stale threshold in seconds (default 24h).
+# Aplica um floor de 60s para evitar falsos positivos de stale quando o
+# threshold esta muito baixo (ex: 0h em testes) e ha latencia entre o
+# heartbeat e a checagem.
+_stale_threshold_seconds() {
+    local hours
+    hours="$(_guard_get_str "session.stale_threshold_hours" "24" 2>/dev/null || echo "24")"
+    if [[ -z "${hours}" || "${hours}" == "None" || ! "${hours}" =~ ^[0-9]+$ ]]; then
+        hours=24
+    fi
+    local seconds=$((hours * 3600))
+    if [[ "${seconds}" -lt 60 ]]; then
+        seconds=60
+    fi
+    echo "${seconds}"
+}
+
+# Return true if the session is active but last_activity is older than the threshold.
+_is_session_stale() {
+    local identity="$1"
+    local session_file
+    session_file="$(_get_session_file "${identity}")"
+    [[ -f "${session_file}" ]] || return 1
+
+    local last_activity threshold now
+    last_activity="$(_load_last_activity "${identity}")"
+    [[ -n "${last_activity}" ]] || return 1
+    threshold="$(_stale_threshold_seconds)"
+    now="$(date +%s)"
+
+    if [[ $((now - ${last_activity%.*})) -gt ${threshold} ]]; then
+        return 0
+    fi
+    return 1
+}
+
+# Build a map of active PIDs to identities. Print lines "pid identity".
+_active_pid_identity_map() {
+    local session_dir
+    session_dir="$(dirname "$(_get_session_file "kimi1")")"
+    [[ -d "${session_dir}" ]] || return 0
+
+    for f in "${session_dir}"/*.json; do
+        [[ -e "${f}" ]] || continue
+        ${AG_PYTHON} -c "
+import json, os, sys
+try:
+    with open('${f}') as fh:
+        d = json.load(fh)
+    if d.get('status') == 'active' and d.get('pid'):
+        print(f\"{d['pid']} {d['identity']}\")
+except Exception:
+    pass
+" 2>/dev/null
+    done
+}
+
+# Return identities that share the same active PID as another slot.
+_detect_shared_pids() {
+    local duplicates=""
+    declare -A pid_to_identity
+    while read -r pid ident; do
+        [[ -z "${pid}" || -z "${ident}" ]] && continue
+        if [[ -n "${pid_to_identity[${pid}]:-}" ]]; then
+            duplicates="${duplicates}${duplicates:+, }${pid_to_identity[${pid}]}&${ident}"
+        else
+            pid_to_identity["${pid}"]="${ident}"
+        fi
+    done < <(_active_pid_identity_map)
+    echo "${duplicates}"
+}
+
 _save_session() {
     local identity="$1"
     local status="$2"
@@ -525,7 +731,7 @@ _save_session() {
     export _AG_S_SESSION_FILE="${session_file}"
 
     ${AG_PYTHON} -c "
-import json, os
+import json, os, time
 role = os.environ.get('_AG_S_ROLE') or None
 data = {
     'identity': os.environ['_AG_S_IDENTITY'],
@@ -533,7 +739,8 @@ data = {
     'role': role,
     'branch': os.environ['_AG_S_BRANCH'],
     'pid': int(os.environ['_AG_S_PID']),
-    'timestamp': __import__('time').time(),
+    'timestamp': time.time(),
+    'last_activity': time.time(),
     'worktree_path': os.environ['_AG_S_WORKTREE'],
     'impact_plugins': json.loads(os.environ.get('_AG_S_IMPACT','[]'))
 }
@@ -661,7 +868,7 @@ _acquire_slot() {
         # Recover from a stale lock file: if no live process holds the lock,
         # the file is leftover from a crashed/killed holder. Back it up and
         # recreate it, then retry immediately.
-        if [[ $((_lock_attempt % 5)) -eq 0 ]]; then
+        if [[ $((_lock_attempt % 10)) -eq 0 ]]; then
             if ! lslocks | grep -qF "${global_lock}"; then
                 echo "⚠️  Agent Guard: stale global lock detected; recovering..." >&2
                 eval "exec ${lock_fd}>&-" 2>/dev/null || true
@@ -710,9 +917,16 @@ _acquire_slot() {
             sess_pid="$(_load_session_field "${identity}" "pid")"
             if [[ "${sess_status}" == "active" ]]; then
                 if _is_pid_alive "${sess_pid}"; then
-                    return 1
+                    # A live but stale session is treated as free so idle IDE
+                    # tabs/conversations do not permanently exhaust slots.
+                    if _is_session_stale "${identity}"; then
+                        _clear_session "${identity}"
+                    else
+                        return 1
+                    fi
+                else
+                    _clear_session "${identity}"
                 fi
-                _clear_session "${identity}"
             fi
 
             # Cooldown: slots released in the last 60s are treated as occupied
@@ -1151,7 +1365,7 @@ _create_or_reuse_worktree() {
     else
         echo "🌿 Existing worktree found: ${worktree_path}" >&2
         cd "${worktree_path}" || return 1
-        git fetch origin >/dev/null 2>&1 || true
+        timeout 15s git fetch origin >/dev/null 2>&1 || true
 
         local current_wt_branch
         current_wt_branch="$(git branch --show-current 2>/dev/null || echo "")"
@@ -1281,6 +1495,10 @@ while [[ $# -gt 0 ]]; do
                 echo "❌ --triage requires a prefix." >&2
                 return 1 2>/dev/null || exit 1
             fi
+            ;;
+        --cleanup-stale)
+            MODE="cleanup-stale"
+            shift
             ;;
         --impact)
             if [[ -n "${2:-}" ]]; then
@@ -1549,6 +1767,86 @@ _release_pending_work_guard() {
 }
 
 # ---------------------------------------------------------------------------
+# Helper: attempt to release a stale session only when it is safe.
+# Safe means: worktree is release-ready and there are no open PRs.
+# Returns 0 if released, 1 otherwise (without emitting blocking errors).
+# ---------------------------------------------------------------------------
+_auto_release_if_safe() {
+    local identity="$1"
+    local worktree_path="$2"
+    local reason="${3:-stale}"
+
+    if ! _validate_worktree_release_ready "${worktree_path}" >/dev/null 2>&1; then
+        return 1
+    fi
+
+    if ! _release_pending_work_guard "${identity}" "${worktree_path}" "false" >/dev/null 2>&1; then
+        return 1
+    fi
+
+    _clear_session "${identity}"
+
+    if command -v _journal_release >/dev/null 2>&1; then
+        _journal_release
+    fi
+
+    local neutral_branch="_released/${identity}"
+    local base_ref=""
+    if git -C "${worktree_path}" rev-parse --verify --quiet "origin/develop" >/dev/null 2>&1; then
+        base_ref="origin/develop"
+    elif git -C "${worktree_path}" rev-parse --verify --quiet "develop" >/dev/null 2>&1; then
+        base_ref="develop"
+    fi
+
+    if [[ -n "${base_ref}" ]]; then
+        git -C "${worktree_path}" checkout -B "${neutral_branch}" "${base_ref}" >/dev/null 2>&1 || \
+            git -C "${worktree_path}" checkout --detach "${base_ref}" >/dev/null 2>&1 || true
+    fi
+
+    echo "🔓 Auto-released ${identity} (${reason})"
+    return 0
+}
+
+# ---------------------------------------------------------------------------
+# Helper: scan all slots and auto-release stale ones that are safe to release.
+# ---------------------------------------------------------------------------
+_cleanup_stale_sessions() {
+    local identity_list prefix i identity worktree_path
+    local released=0 skipped=0
+
+    identity_list="$(bash "${AGENT_GUARD_CONFIG_BIN}" keys identities 2>/dev/null || true)"
+    for prefix in ${identity_list}; do
+        [[ -z "${prefix}" ]] && continue
+        local base_slots max_slots
+        base_slots="$(_guard_get "identities.${prefix}.slots" 2>/dev/null || echo "0")"
+        max_slots="$(_guard_get "identities.${prefix}.max_slots" "${base_slots}" 2>/dev/null || echo "${base_slots}")"
+        for i in $(seq 1 "${max_slots}"); do
+            identity="${prefix}${i}"
+            worktree_path="$(_get_worktree_path "${identity}")"
+
+            local sess_status sess_pid
+            sess_status="$(_load_session_field "${identity}" "status")"
+            sess_pid="$(_load_session_field "${identity}" "pid")"
+
+            [[ "${sess_status}" == "active" ]] || continue
+            _is_pid_alive "${sess_pid}" || continue
+            _is_session_stale "${identity}" || continue
+
+            if _auto_release_if_safe "${identity}" "${worktree_path}" "stale"; then
+                released=$((released + 1))
+            else
+                echo "🔒 ${identity} is stale but cannot be auto-released (dirty worktree or open PRs)." >&2
+                skipped=$((skipped + 1))
+            fi
+        done
+    done
+
+    echo ""
+    echo "🧹 Cleanup complete: ${released} released, ${skipped} skipped."
+    return 0 2>/dev/null || exit 0
+}
+
+# ---------------------------------------------------------------------------
 # 7. --release mode
 # ---------------------------------------------------------------------------
 if [[ "${MODE}" == "release" ]]; then
@@ -1659,6 +1957,8 @@ if [[ "${MODE}" == "status" ]]; then
                 pid_col="${_rec_pid} (live)"
             elif [[ "${_rec_health}" == "dead" ]]; then
                 pid_col="${_rec_pid} (dead)"
+            elif [[ "${_rec_health}" == "stale" ]]; then
+                pid_col="${_rec_pid} (stale)"
             fi
 
             printf "%-12s | %-8s | %-6s | %-10s | %-6s | %-8s | %-40s\n" \
@@ -1671,6 +1971,17 @@ if [[ "${MODE}" == "status" ]]; then
         done
     done
     echo "=========================================================="
+
+    # Shared-PID guard: surface when one IDE process holds multiple leases.
+    local shared_pids
+    shared_pids="$(_detect_shared_pids)"
+    if [[ -n "${shared_pids}" ]]; then
+        echo ""
+        echo "⚠️  Shared PID detected (one IDE process holding multiple slots):"
+        echo "   ${shared_pids}"
+        echo ""
+    fi
+
     if [[ -n "${any_drift}" ]]; then
         echo ""
         echo "⚠️  Issues detected:"
@@ -1679,6 +1990,14 @@ if [[ "${MODE}" == "status" ]]; then
         echo "Use: source .hmvip-agent-init --adopt <identity>  to inspect/recover"
     fi
     echo ""
+    return 0 2>/dev/null || exit 0
+fi
+
+# ---------------------------------------------------------------------------
+# 8.5 --cleanup-stale mode
+# ---------------------------------------------------------------------------
+if [[ "${MODE}" == "cleanup-stale" ]]; then
+    _cleanup_stale_sessions
     return 0 2>/dev/null || exit 0
 fi
 
@@ -1715,7 +2034,7 @@ if [[ "${MODE}" == "attach" ]]; then
     fi
 
     cd "${WORKTREE_PATH}" || return 1 2>/dev/null || exit 1
-    git fetch origin >/dev/null 2>&1 || true
+    timeout 15s git fetch origin >/dev/null 2>&1 || true
 
     if ! git show-ref --verify --quiet "refs/heads/${ATTACH_BRANCH}"; then
         echo "❌ Branch '${ATTACH_BRANCH}' does not exist locally." >&2
@@ -1787,9 +2106,15 @@ if [[ "${MODE}" == "adopt" ]]; then
     fi
 
     # Refuse takeover of a live session.
+    # NOTE: we intentionally do NOT compare the stored PID against the current
+    # session's PID. A previous version of this guard allowed the current
+    # process to adopt another slot when both happened to share the same PID
+    # (e.g. multiple adopts sourced from the same shell / IDE process), which
+    # violates the 1-slot-per-session invariant and causes slots to become
+    # pinned to a single shared PID. Adopt is strictly for dead sessions.
     adopt_sess_status="$(_load_session_field "${ADOPT_IDENTITY}" "status")"
     adopt_sess_pid="$(_load_session_field "${ADOPT_IDENTITY}" "pid")"
-    if [[ "${adopt_sess_status}" == "active" && -n "${adopt_sess_pid}" && "${adopt_sess_pid}" != "$(_ag_session_pid "${WORKTREE_PATH}")" ]]; then
+    if [[ "${adopt_sess_status}" == "active" && -n "${adopt_sess_pid}" ]]; then
         if _is_pid_alive "${adopt_sess_pid}"; then
             echo "" >&2
             echo "❌❌❌ ERROR: SLOT STILL IN USE ❌❌❌" >&2
@@ -1816,7 +2141,7 @@ if [[ "${MODE}" == "adopt" ]]; then
     fi
 
     cd "${WORKTREE_PATH}" || return 1 2>/dev/null || exit 1
-    git fetch origin >/dev/null 2>&1 || true
+    timeout 15s git fetch origin >/dev/null 2>&1 || true
 
     ADOPT_BRANCH="$(git branch --show-current 2>/dev/null || echo "")"
     ADOPT_FOREIGN_BRANCH="false"
