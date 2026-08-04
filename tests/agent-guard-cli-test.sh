@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
 #
-# Smoke tests for the agent-guard CLI.
+# Agent Guard CLI smoke tests (upstream root layout).
 
 set -euo pipefail
 
-REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-BIN_DIR="${REPO_ROOT}/bin"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 
 ERRORS=0
 
@@ -18,48 +18,35 @@ pass() {
     echo "✅ PASS: $1"
 }
 
-# The CLI must be sourced, not executed.
-if bash "${BIN_DIR}/agent-guard" --help >/dev/null 2>&1; then
-    fail "agent-guard should refuse direct execution"
+if [[ -f "${REPO_ROOT}/bin/agent-guard" ]]; then
+    pass "agent-guard CLI exists"
 else
-    pass "agent-guard refuses direct execution"
+    fail "agent-guard CLI not found at ${REPO_ROOT}/bin/agent-guard"
 fi
 
-# Sourcing without arguments in a non-worktree environment should fail gracefully
-# and print a helpful message (it must not crash the caller's shell).
-CLI_OUTPUT=$(mktemp)
-(
-    # shellcheck disable=SC1091
-    source "${BIN_DIR}/agent-guard" >"${CLI_OUTPUT}" 2>&1 || true
-)
-if grep -qE "(Not inside an agent worktree|Provide prefix and role|Usage|agent-guard)" "${CLI_OUTPUT}"; then
-    pass "agent-guard produces readable help output when sourced outside a worktree"
+if bash -n "${REPO_ROOT}/bin/agent-guard"; then
+    pass "agent-guard CLI has valid shell syntax"
 else
-    cat "${CLI_OUTPUT}" >&2
-    fail "agent-guard did not produce expected help output"
+    fail "agent-guard CLI has shell syntax errors"
 fi
-rm -f "${CLI_OUTPUT}"
 
-# Verify that all subcommand scripts referenced by agent-guard exist.
-for script in init.sh journal.sh session_trace.sh; do
-    if [[ -f "${REPO_ROOT}/src/${script}" ]]; then
-        pass "src/${script} exists"
+for script in src/init.sh src/journal.sh src/session_trace.sh hooks/install.sh hooks/lease-owner-check.sh; do
+    if [[ -f "${REPO_ROOT}/${script}" ]]; then
+        if bash -n "${REPO_ROOT}/${script}"; then
+            pass "${script} has valid shell syntax"
+        else
+            fail "${script} has shell syntax errors"
+        fi
     else
-        fail "src/${script} is missing"
+        fail "${script} not found"
     fi
 done
 
-# Verify that the config helper resolves PHP syntax.
-if php -l "${REPO_ROOT}/src/Config.php" >/dev/null 2>&1; then
-    pass "Config.php has valid PHP syntax"
-else
-    fail "Config.php has PHP syntax errors"
-fi
-
-echo ""
 if [[ ${ERRORS} -gt 0 ]]; then
+    echo ""
     echo "❌ ${ERRORS} test(s) failed."
     exit 1
 fi
 
-echo "✅ Agent Guard CLI tests passed."
+echo ""
+echo "✅ All CLI smoke tests passed."

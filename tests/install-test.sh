@@ -1,10 +1,14 @@
 #!/usr/bin/env bash
 #
-# Agent Guard Core installer tests (standalone package).
+# Agent Guard Core installer tests (upstream root layout).
+#
+# This test runs against the standalone agent-guard-core repository layout,
+# where the package root is the repository root.
 
 set -euo pipefail
 
-REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 INSTALL_SCRIPT="${REPO_ROOT}/install.sh"
 
 ERRORS=0
@@ -31,11 +35,10 @@ trap _cleanup_tmp EXIT
     git config user.name "Test Agent"
 )
 
-INSTALL_LOG="${TMP_DIR}/install.log"
-if bash "${INSTALL_SCRIPT}" --target "${TMP_DIR}" --skip-wrapper --yes >"${INSTALL_LOG}" 2>&1; then
+if bash "${INSTALL_SCRIPT}" --target "${TMP_DIR}" --package-root agent-guard-core --skip-wrapper --yes >/tmp/install-test.log 2>&1; then
     pass "install.sh succeeds in a fresh Git repo"
 else
-    cat "${INSTALL_LOG}" >&2
+    cat /tmp/install-test.log >&2
     fail "install.sh should succeed in a fresh Git repo"
 fi
 
@@ -51,7 +54,7 @@ else
     fail "agent-guard.yaml not found"
 fi
 
-if [[ -d "${TMP_DIR}/packages/agent-guard-core" ]]; then
+if [[ -d "${TMP_DIR}/agent-guard-core" ]]; then
     pass "Package copied to target repo"
 else
     fail "Package not copied"
@@ -69,16 +72,17 @@ else
     fail ".gitattributes not created"
 fi
 
-if [[ ! -d "${TMP_DIR}/packages/agent-guard-core/shell" ]]; then
+if [[ ! -d "${TMP_DIR}/agent-guard-core/shell" ]]; then
     pass "No dangling 'shell' directory copied by installer"
 else
     fail "Installer copied a non-existent 'shell' directory"
 fi
 
-echo ""
 if [[ ${ERRORS} -gt 0 ]]; then
+    echo ""
     echo "❌ ${ERRORS} test(s) failed."
     exit 1
 fi
 
-echo "✅ Installer tests passed."
+echo ""
+echo "✅ All installer tests passed."
