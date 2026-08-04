@@ -38,10 +38,11 @@ fi
 function _agent_guard_main() {
     set -euo pipefail
 
+    local SCRIPT_DIR
     SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-    INIT_SCRIPT="${SCRIPT_DIR}/src/init.sh"
-    JOURNAL_SCRIPT="${SCRIPT_DIR}/src/journal.sh"
-    SESSION_TRACE_SCRIPT="${SCRIPT_DIR}/src/session_trace.sh"
+    local INIT_SCRIPT="${SCRIPT_DIR}/src/init.sh"
+    local JOURNAL_SCRIPT="${SCRIPT_DIR}/src/journal.sh"
+    local SESSION_TRACE_SCRIPT="${SCRIPT_DIR}/src/session_trace.sh"
 
     if [[ ! -f "${INIT_SCRIPT}" ]]; then
         echo "❌ agent-guard init script not found: ${INIT_SCRIPT}" >&2
@@ -121,6 +122,10 @@ function _agent_guard_main() {
             ;;
         cleanup-stale|cs)
             source "${INIT_SCRIPT}" --cleanup-stale
+            return $?
+            ;;
+        orphan-sweep|os)
+            source "${INIT_SCRIPT}" --orphan-sweep "$@"
             return $?
             ;;
         journal|j)
@@ -220,7 +225,7 @@ function _agent_guard_main() {
             ;;
         *)
             echo "❌ Unknown command or identity: ${COMMAND}" >&2
-            echo "   Commands: init, status, release, attach, triage, journal, resume, checkpoint, session, prune" >&2
+            echo "   Commands: init, status, release, attach, triage, journal, resume, checkpoint, session, prune, cleanup-stale, orphan-sweep" >&2
             echo "   Legacy:   <kimi|claude|gemini|grok> <role>" >&2
             return 1
             ;;

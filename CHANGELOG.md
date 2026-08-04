@@ -1,5 +1,35 @@
 # Changelog — agent-guard-core
 
+## 0.9.9 — Orphan Rescue Protocol (ADR-0037)
+
+- `src/init.sh`:
+  - Novo modo `--orphan-sweep` com subcomandos `--dry-run` (padrão) e `--auto`.
+  - Helpers `_orphan_sweep()`, `_orphan_sweep_identity()`, `_rescue_orphan_slot()`,
+    `_cleanup_rescued_slot()`, `_is_orphan_sweep_candidate()`, `_has_open_prs_for_identity()`.
+  - Ao detectar um slot morto com worktree sujo, cria branch
+    `ia-<identidade>/orphan-rescue/YYYYMMDD-HHMMSS`, committa o estado atual,
+    faz push para `origin`, reseta o worktree para `_released/<identidade>` no
+    `origin/develop` e libera a sessão.
+  - Preserva trabalho não commitado sem poluir a branch neutra; adiciona entrada
+    na nota do slot (`.agent-guard/tasks/<slot>.md`) e evento `orphan_rescued`
+    no journal.
+  - Só resgata slots em branches próprias (`ia-<id>/*` ou `_released/<id>`),
+    com sessão morta, sem agente vivo no worktree e sem PRs abertos.
+- `bin/agent-guard`:
+  - Novo subcomando `orphan-sweep` (atalho `os`) mapeado para `--orphan-sweep`.
+- `agent-guard.yaml`:
+  - Nova seção `session.orphan_rescue` com `enabled: true`, `ttl_days: 7` e
+    `workflow_auto: false`.
+- `.kiro/scripts/agent-guard-cleanup.sh`:
+  - Após `--cleanup-stale`, executa `--orphan-sweep --auto` como rede de segurança.
+- `.github/workflows/agent-guard-orphan-sweep.yml`:
+  - Workflow diário que lista branches `ia-*/orphan-rescue/*` no origin e abre/
+    atualiza issue `guardian` quando encontram branches mais velhas que o TTL.
+- `.github/scripts/agent-guard-orphan-check.sh` (gate `G-AGENT-GUARD-ORPHAN`):
+  - Falha se houver branches de resgate no origin com mais de 48h.
+- `tests/agent-guard/agent-init-test.sh`:
+  - Novos cenários de smoke test para `--orphan-sweep`.
+
 ## 0.9.8 — Performance: abertura de slots abaixo de 5s, scan /proc único e rotação de journal
 
 - `wrappers/kimi/wrapper.sh`:

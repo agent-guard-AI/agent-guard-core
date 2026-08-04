@@ -1560,6 +1560,15 @@ while [[ $# -gt 0 ]]; do
             MODE="cleanup-stale"
             shift
             ;;
+        --orphan-sweep)
+            MODE="orphan-sweep"
+            ORPHAN_SWEEP_MODE="${2:---dry-run}"
+            if [[ "${ORPHAN_SWEEP_MODE}" == "--auto" || "${ORPHAN_SWEEP_MODE}" == "--dry-run" ]]; then
+                shift 2
+            else
+                shift
+            fi
+            ;;
         --impact)
             if [[ -n "${2:-}" ]]; then
                 IMPACT_PLUGINS="$2"
@@ -1907,6 +1916,286 @@ _cleanup_stale_sessions() {
 }
 
 # ---------------------------------------------------------------------------
+# Orphan Rescue Protocol helpers
+# ---------------------------------------------------------------------------
+# Return the configured orphan rescue TTL in days (default 7).
+_orphan_rescue_ttl_days() {
+    local days
+    days="$(_guard_get_str "session.orphan_rescue.ttl_days" "7" 2>/dev/null || echo "7")"
+    if [[ -z "${days}" || "${days}" == "None" || ! "${days}" =~ ^[0-9]+$ ]]; then
+        days=7
+    fi
+    echo "${days}"
+}
+
+# Return whether orphan rescue sweep is enabled (default true).
+_orphan_sweep_enabled() {
+    local enabled
+    enabled="$(_guard_get_str "session.orphan_rescue.enabled" "true" 2>/dev/null || echo "true")"
+    enabled="${enabled,,}"
+    [[ "${enabled}" == "true" || "${enabled}" == "1" || "${enabled}" == "yes" ]]
+}
+
+# Return true if the identity has open PRs from ia-<identity>/* branches.
+_has_open_prs_for_identity() {
+    local identity="$1"
+    local worktree_path="$2"
+
+    if ! command -v gh >/dev/null 2>&1; then
+        # Fail-open when gh is unavailable: assume no PRs so sweep can proceed.
+        return 1
+    fi
+
+    local pr_count
+    pr_count="$(cd "${worktree_path}" 2>/dev/null && gh pr list --state open --limit 100 \
+        --json number,headRefName \
+        --jq ".[] | select(.headRefName | startswith(\"ia-${identity}/\")) | .number" 2>/dev/null | wc -l || true)"
+    [[ "${pr_count}" -gt 0 ]]
+}
+
+# Check whether a slot qualifies for orphan rescue sweep.
+# Returns 0 when the slot is an orphan with a dirty worktree that we can safely
+# rescue and clean. Sets _OS_REASON with a human-readable classification.
+_is_orphan_sweep_candidate() {
+    local identity="$1"
+    local worktree_path="$2"
+
+    _OS_REASON=""
+
+    if [[ ! -e "${worktree_path}/.git" ]]; then
+        _OS_REASON="no worktree"
+        return 1
+    fi
+
+    local current_branch
+    current_branch="$(git -C "${worktree_path}" branch --show-current 2>/dev/null || echo "")"
+
+    # Only process the identity's own branches or its neutral branch.
+    if [[ "${current_branch}" != "ia-${identity}/"* && "${current_branch}" != "_released/${identity}" ]]; then
+        _OS_REASON="foreign or protected branch: ${current_branch}"
+        return 1
+    fi
+
+    # Session must be dead (or no session file). Live sessions are never orphans.
+    local sess_status sess_pid
+    sess_status="$(_load_session_field "${identity}" "status")"
+    sess_pid="$(_load_session_field "${identity}" "pid")"
+    if [[ "${sess_status}" == "active" && -n "${sess_pid}" ]]; then
+        if _is_pid_alive "${sess_pid}"; then
+            _OS_REASON="session PID ${sess_pid} is alive"
+            return 1
+        fi
+    fi
+
+    # No other live agent process inside the worktree.
+    if _worktree_has_other_live_agent "${worktree_path}"; then
+        _OS_REASON="live agent process detected in worktree"
+        return 1
+    fi
+
+    # Must have uncommitted or untracked work; otherwise cleanup-stale handles it.
+    local dirty
+    dirty="$(git -C "${worktree_path}" status --porcelain 2>/dev/null || true)"
+    if [[ -z "${dirty}" ]]; then
+        _OS_REASON="worktree clean"
+        return 1
+    fi
+
+    # Check for open PRs to avoid destroying work referenced by a PR.
+    if _has_open_prs_for_identity "${identity}" "${worktree_path}"; then
+        _OS_REASON="open PRs from ia-${identity}/*"
+        return 1
+    fi
+
+    _OS_REASON="orphan dirty worktree"
+    return 0
+}
+
+# Create a rescue branch with the current dirty state and push it to origin.
+# Prints the rescue branch name on success, returns 1 on failure.
+_rescue_orphan_slot() {
+    local identity="$1"
+    local worktree_path="$2"
+    local timestamp
+    timestamp="$(date -u +%Y%m%d-%H%M%S)"
+    local rescue_branch="ia-${identity}/orphan-rescue/${timestamp}"
+
+    git -C "${worktree_path}" fetch origin >/dev/null 2>&1 || true
+
+    local current_branch
+    current_branch="$(git -C "${worktree_path}" branch --show-current 2>/dev/null || echo "")"
+
+    # Create the rescue branch from the current state.
+    if ! git -C "${worktree_path}" checkout -b "${rescue_branch}" >/dev/null 2>&1; then
+        echo "❌ Failed to create rescue branch ${rescue_branch}." >&2
+        return 1
+    fi
+
+    # Stage and commit everything (tracked modifications, deletions, untracked).
+    git -C "${worktree_path}" add -A >/dev/null 2>&1 || true
+    local commit_msg="rescue(${identity}): orphan worktree snapshot before cleanup [AGENT-GUARD-ORPHAN]"
+    if ! git -C "${worktree_path}" commit -m "${commit_msg}" >/dev/null 2>&1; then
+        # Empty commit is fine (only untracked that vanished, etc.); abort branch.
+        git -C "${worktree_path}" checkout "${current_branch}" >/dev/null 2>&1 || true
+        git -C "${worktree_path}" branch -D "${rescue_branch}" >/dev/null 2>&1 || true
+        echo "❌ Failed to commit rescue snapshot for ${identity} (no changes?)." >&2
+        return 1
+    fi
+
+    # Push rescue branch to origin as immutable backup.
+    if ! git -C "${worktree_path}" push -u origin "${rescue_branch}" >/dev/null 2>&1; then
+        echo "⚠️  Rescue branch created locally but push to origin failed for ${identity}." >&2
+        echo "   Branch: ${rescue_branch}" >&2
+        return 1
+    fi
+
+    echo "${rescue_branch}"
+    return 0
+}
+
+# Restore the worktree to its neutral post-release branch on top of origin/develop.
+_cleanup_rescued_slot() {
+    local identity="$1"
+    local worktree_path="$2"
+
+    local neutral_branch="_released/${identity}"
+    local base_ref=""
+    if git -C "${worktree_path}" rev-parse --verify --quiet "origin/develop" >/dev/null 2>&1; then
+        base_ref="origin/develop"
+    elif git -C "${worktree_path}" rev-parse --verify --quiet "develop" >/dev/null 2>&1; then
+        base_ref="develop"
+    fi
+
+    if [[ -z "${base_ref}" ]]; then
+        echo "❌ Cannot cleanup ${identity}: neither origin/develop nor develop exists." >&2
+        return 1
+    fi
+
+    # Remove any leftover untracked files and reset to the base ref.
+    git -C "${worktree_path}" clean -fd >/dev/null 2>&1 || true
+    git -C "${worktree_path}" checkout -B "${neutral_branch}" "${base_ref}" >/dev/null 2>&1 || {
+        echo "❌ Failed to reset ${identity} to ${neutral_branch} @ ${base_ref}." >&2
+        return 1
+    }
+
+    return 0
+}
+
+# Append a rescue record to the slot task note.
+_note_orphan_rescue() {
+    local identity="$1"
+    local rescue_branch="$2"
+    local note_file="${_AG_REPO_ROOT}/.agent-guard/tasks/${identity}.md"
+    if [[ ! -f "${note_file}" ]]; then
+        return 0
+    fi
+
+    local timestamp
+    timestamp="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    {
+        echo ""
+        echo "## Orphan Rescue — ${timestamp}"
+        echo "Slot foi detectado como órfão sujo e resgatado automaticamente."
+        echo "Branch de resgate: \`${rescue_branch}\`"
+        echo "Para retomar o trabalho resgatado: \`git checkout ${rescue_branch}\`"
+    } >> "${note_file}"
+}
+
+# Rescue and clean a single orphan slot. Prints status messages.
+# Returns 0 on success, 1 on failure.
+_orphan_sweep_identity() {
+    local identity="$1"
+    local worktree_path="$2"
+    local dry_run="${3:-false}"
+
+    if ! _is_orphan_sweep_candidate "${identity}" "${worktree_path}"; then
+        echo "   ${identity}: ${_OS_REASON} — skipped"
+        return 1
+    fi
+
+    echo "🚨 ${identity} is an orphan dirty slot."
+
+    if [[ "${dry_run}" == "true" ]]; then
+        echo "   [dry-run] Would create rescue branch ia-${identity}/orphan-rescue/YYYYMMDD-HHMMSS"
+        echo "   [dry-run] Would reset worktree to _released/${identity} @ origin/develop"
+        return 0
+    fi
+
+    local rescue_branch
+    rescue_branch="$(_rescue_orphan_slot "${identity}" "${worktree_path}")"
+    if [[ -z "${rescue_branch}" ]]; then
+        echo "❌ ${identity}: rescue branch creation failed — left untouched for manual inspection." >&2
+        return 1
+    fi
+
+    echo "   🛟 Rescue branch created and pushed: ${rescue_branch}"
+
+    if ! _cleanup_rescued_slot "${identity}" "${worktree_path}"; then
+        echo "❌ ${identity}: cleanup after rescue failed." >&2
+        echo "   Rescue branch ${rescue_branch} is safe on origin; worktree needs manual repair." >&2
+        return 1
+    fi
+
+    _clear_session "${identity}"
+    _note_orphan_rescue "${identity}" "${rescue_branch}"
+
+    if command -v _journal_write_event >/dev/null 2>&1; then
+        _journal_write_event "orphan_rescued" "{\"rescue_branch\":\"${rescue_branch}\",\"identity\":\"${identity}\",\"worktree\":\"${worktree_path}\"}" "${_AG_REPO_ROOT}"
+    fi
+
+    echo "   ✅ ${identity} rescued and cleaned."
+    return 0
+}
+
+# Scan all slots and rescue/clean orphan dirty ones.
+# Usage: _orphan_sweep [--dry-run | --auto]
+_orphan_sweep() {
+    local dry_run="true"
+    if [[ "${1:-}" == "--auto" ]]; then
+        dry_run="false"
+    fi
+
+    if ! _orphan_sweep_enabled; then
+        echo "ℹ️  Orphan rescue sweep is disabled in agent-guard.yaml." >&2
+        return 0 2>/dev/null || exit 0
+    fi
+
+    local identity_list prefix i identity worktree_path
+    local rescued=0 skipped=0 failed=0
+
+    identity_list="$(bash "${AGENT_GUARD_CONFIG_BIN}" keys identities 2>/dev/null || true)"
+    for prefix in ${identity_list}; do
+        [[ -z "${prefix}" ]] && continue
+        local base_slots max_slots
+        base_slots="$(_guard_get "identities.${prefix}.slots" 2>/dev/null || echo "0")"
+        max_slots="$(_guard_get "identities.${prefix}.max_slots" "${base_slots}" 2>/dev/null || echo "${base_slots}")"
+        for i in $(seq 1 "${max_slots}"); do
+            identity="${prefix}${i}"
+            worktree_path="$(_get_worktree_path "${identity}")"
+
+            if _orphan_sweep_identity "${identity}" "${worktree_path}" "${dry_run}"; then
+                rescued=$((rescued + 1))
+            else
+                # Distinguish between "not a candidate" (skipped) and real failure.
+                if [[ "${_OS_REASON:-}" == "orphan dirty worktree" ]]; then
+                    failed=$((failed + 1))
+                else
+                    skipped=$((skipped + 1))
+                fi
+            fi
+        done
+    done
+
+    echo ""
+    if [[ "${dry_run}" == "true" ]]; then
+        echo "🔍 Orphan sweep (dry-run): ${rescued} would rescue, ${skipped} skipped, ${failed} failed."
+    else
+        echo "🧹 Orphan sweep complete: ${rescued} rescued, ${skipped} skipped, ${failed} failed."
+    fi
+    return 0 2>/dev/null || exit 0
+}
+
+# ---------------------------------------------------------------------------
 # 7. --release mode
 # ---------------------------------------------------------------------------
 if [[ "${MODE}" == "release" ]]; then
@@ -2058,6 +2347,14 @@ fi
 # ---------------------------------------------------------------------------
 if [[ "${MODE}" == "cleanup-stale" ]]; then
     _cleanup_stale_sessions
+    return 0 2>/dev/null || exit 0
+fi
+
+# ---------------------------------------------------------------------------
+# 8.6 --orphan-sweep mode
+# ---------------------------------------------------------------------------
+if [[ "${MODE}" == "orphan-sweep" ]]; then
+    _orphan_sweep "${ORPHAN_SWEEP_MODE:---dry-run}"
     return 0 2>/dev/null || exit 0
 fi
 
