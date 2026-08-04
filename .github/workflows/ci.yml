@@ -1,0 +1,58 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  shell-syntax:
+    name: Shell script syntax
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Validate shell script syntax
+        run: |
+          find . -type f -name '*.sh' -print0 | while IFS= read -r -d '' file; do
+            echo "Checking ${file}"
+            bash -n "${file}"
+          done
+
+  php-syntax:
+    name: PHP syntax
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Validate PHP syntax
+        run: php -l src/Config.php
+
+  installer-test:
+    name: Installer smoke test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run installer tests
+        run: bash tests/install-test.sh
+
+  agent-guard-cli:
+    name: Agent Guard CLI smoke test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run CLI smoke tests
+        run: bash tests/agent-guard-cli-test.sh
+
+  worktree-origin-audit:
+    name: Worktree origin audit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Validate worktree origin audit script
+        run: php ci/worktree-origin-audit.php
