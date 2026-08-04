@@ -161,6 +161,20 @@ if [[ -z "${IDENTITY}" ]]; then
 fi
 
 # -------------------------------------------------------------------------
+# PAS — Protocolo de Ação Sensível (SPEC-ECOSYSTEM-GUARDIAN H5, task 3.3):
+# marca `sensitive: <categorias>` nas git notes dos commits do range ANTES
+# do push das notes abaixo, aumentando a visibilidade para a revisão humana.
+# O `|| true` NO PONTO DE CHAMADA é deliberado e documentado: o PAS NUNCA
+# pode bloquear/falhar commit ou push (regra dura do dono — endurecer, nunca
+# limitar). Exceção intencional ao padrão fail-hard do G-HYGIENE (que varre
+# só .github/workflows/, não packages/). O script em si também sempre sai 0.
+# -------------------------------------------------------------------------
+PAS_SCAN="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/pas-sensitive-scan.sh"
+if [[ -f "${PAS_SCAN}" ]]; then
+    bash "${PAS_SCAN}" || true
+fi
+
+# -------------------------------------------------------------------------
 # Send worktree origin notes
 # -------------------------------------------------------------------------
 git push origin "${NOTES_REF}" --no-verify >/dev/null 2>&1 || true

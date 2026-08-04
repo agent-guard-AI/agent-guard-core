@@ -87,6 +87,47 @@ _journal_get_retention_days() {
 # Escrita
 # -----------------------------------------------------------------------------
 
+# Rotate journal if it grows too large. Keeps the last N bytes to preserve
+# recent context without unbounded growth.
+_journal_auto_rotate() {
+    local journal_path="$1"
+    [[ -f "${journal_path}" ]] || return 0
+
+    local max_bytes=52428800  # 50 MiB
+    local keep_bytes=10485760 # 10 MiB
+
+    local size
+    size="$(stat -c%s "${journal_path}" 2>/dev/null || stat -f%z "${journal_path}" 2>/dev/null || echo "0")"
+    if [[ "${size}" -le "${max_bytes}" ]]; then
+        return 0
+    fi
+
+    local rotated="${journal_path}.$(date -u +%Y%m%d-%H%M%S).rotated"
+    ${AG_PYTHON} - "${journal_path}" "${rotated}" "${keep_bytes}" <<'PY'
+import sys
+src, dst, keep_bytes = sys.argv[1:4]
+keep_bytes = int(keep_bytes)
+with open(src, 'rb') as f:
+    f.seek(0, 2)
+    total = f.tell()
+    if total <= keep_bytes:
+        sys.exit(0)
+    start = max(0, total - keep_bytes)
+    # Find the next newline after start so we keep whole lines.
+    f.seek(start)
+    f.readline()
+    start = f.tell()
+    f.seek(start)
+    data = f.read()
+with open(src, 'wb') as f:
+    f.write(data)
+with open(dst, 'wb') as f:
+    f.write(b'')
+PY
+    # Compression is best-effort; don't fail if gzip is unavailable.
+    gzip "${rotated}" >/dev/null 2>&1 || true
+}
+
 # Escreve um evento no journal de forma atômica (flock).
 # Args: action, payload_json, [repo_root]
 _journal_write_event() {
@@ -102,6 +143,8 @@ _journal_write_event() {
     local journal_dir
     journal_dir="$(dirname "${journal_path}")"
     mkdir -p "${journal_dir}"
+
+    _journal_auto_rotate "${journal_path}"
 
     local timestamp
     timestamp="$(date -u +%Y-%m-%dT%H:%M:%S.%3NZ)"

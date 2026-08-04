@@ -297,12 +297,6 @@ Notas de implementação:
   ```bash
   bash /path/to/agent-guard-core/install.sh --target /path/to/your/repo --install-wrapper
   ```
-  Uma vez instalado, o comando do dia a dia continua sendo o habitual:
-  ```bash
-  kimi                # adquire/adota o slot padrão e lança o agente
-  kimi --slot kimi3   # usa um slot específico da família Kimi
-  ```
-  Não é necessário invocar `source agent-guard init` manualmente — o wrapper delega automaticamente para o init stub do repositório.
 - Instalação manual do wrapper:
   ```bash
   mv <bin_dir>/kimi <bin_dir>/kimi.real
@@ -327,6 +321,18 @@ Notas de implementação:
 cd packages/agent-guard-core
 bash tests/run-all.sh
 ```
+
+## Sync com o repositório HMVIP
+
+O `agent-guard-core` é desenvolvido e endurecido no monorepo HMVIP (`packages/agent-guard-core/`) e sincronizado automaticamente com este repositório upstream.
+
+- O workflow `.github/workflows/agent-guard-core-sync-upstream.yml` dispara em todo push para `develop` que altere `packages/agent-guard-core/`.
+- Ele executa `git subtree split`, cria uma branch `sync/from-hmvip-<sha>-<timestamp>` e abre um PR no upstream.
+- Todo merge no upstream exige revisão humana — nunca ocorre automaticamente.
+- Commits espúrios podem ser filtrados via `.agent-guard-sync-config.json` no HMVIP.
+- Workflow ativado em produção em 2026-07-31 (teste inicial).
+
+Se você mantém um fork do `agent-guard-core`, pode reutilizar a mesma mecânica apontando o workflow para o seu repo.
 
 ## Origem
 
