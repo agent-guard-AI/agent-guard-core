@@ -365,74 +365,159 @@ _ag_worktree_is_dirty() {
     [[ -n "${output}" ]]
 }
 
-_ag_worktree_has_live_agent() {
-    local worktree="$1"
-    local own_pid="$$"
+# Caches for the single process scan performed per wrapper invocation.
+# With hundreds of thousands of threads on the host, scanning /proc multiple
+# times in shell is the dominant cost of opening a slot. We use `ps` (C
+# implementation) once, identify agent processes and their descendants, then
+# read cwd only for those candidates.
+_AG_PROC_SCAN_AGENT_PIDS=""
+_AG_PROC_SCAN_WORKTREE_PIDS=""
+_AG_PROC_SCAN_PPID_MAP=""
 
-    # Build the set of known agent PIDs by inspecting comm/cmdline.  Processes
-    # renamed via exec -a are caught by argv[0] in /proc/PID/cmdline.
-    local agent_pids=""
-    local pid
-    for pid in /proc/[0-9]*; do
-        [[ -d "${pid}" ]] || continue
-        local pid_num="${pid#/proc/}"
-        local comm cmdline_argv0
-        comm="$(cat "${pid}/comm" 2>/dev/null || true)"
-        cmdline_argv0="$(tr '\0' '\n' < "${pid}/cmdline" 2>/dev/null | head -n1 || true)"
-        case "${comm}|${cmdline_argv0}" in
-            *kimi-code*|*claude*|*gemini*|*grok*|*cursor*|*antigravity*|*kiro*|*kimi*)
-                agent_pids="${agent_pids} ${pid_num}"
-                ;;
-        esac
+# Perform one fast scan and cache the result.
+_ag_scan_proc_once() {
+    [[ -n "${_AG_PROC_SCAN_AGENT_PIDS:-}" ]] && return 0
+
+    local wt_prefixes="" prefix
+    for prefix in ${_AG_KNOWN_IDENTITIES}; do
+        local wt_prefix
+        wt_prefix="$(bash "${_AG_CONFIG_BIN}" get "identities.${prefix}.worktree_prefix" '' 2>/dev/null || true)"
+        if [[ -n "${wt_prefix}" ]]; then
+            wt_prefixes="${wt_prefixes}${wt_prefixes:+,}${_AG_BASE_DIR}/${wt_prefix}"
+        fi
     done
 
-    # For every process whose cwd is the worktree, walk the ancestor chain
-    # looking for a known agent.  This catches child processes such as MCP
-    # servers spawned via "npm exec" or "node" whose own names do not contain
-    # the agent identifier.
-    for pid in /proc/[0-9]*; do
-        [[ -d "${pid}" ]] || continue
-        local pid_num="${pid#/proc/}"
-        [[ "${pid_num}" == "${own_pid}" ]] && continue
+    local parsed
+    parsed="$(ps -eo pid,ppid,comm,args 2>/dev/null | tail -n +2 | awk '
+    {
+        pid=$1; ppid=$2; comm=$3;
+        args=""; for (i=4; i<=NF; i++) args = args $i " ";
+        children[ppid] = children[ppid] " " pid;
+        ppid_map[pid] = ppid;
+        if (comm == "kimi-code" || comm == "claude" || comm == "gemini" || comm == "grok" || comm == "cursor" || comm == "antigravity" || comm == "kiro" || comm == "kimi" || args ~ /(^|[^[:alnum:]_])(kimi-code|claude|gemini|grok|cursor|antigravity|kiro|kimi)([^[:alnum:]_]|$)/) {
+            agents[pid] = 1;
+        }
+    }
+    END {
+        for (p in ppid_map) {
+            print "P" p ":" ppid_map[p];
+        }
+        for (a in agents) {
+            print "C" a;
+            delete q;
+            q[0] = a; qi = 0; qn = 1;
+            while (qi < qn) {
+                cur = q[qi++];
+                if (children[cur] != "") {
+                    n = split(children[cur], cands, " ");
+                    for (j=1; j<=n; j++) {
+                        cand = cands[j];
+                        if (cand != "" && !seen[cand]) {
+                            seen[cand] = 1;
+                            q[qn++] = cand;
+                            print "C" cand;
+                        }
+                    }
+                }
+            }
+        }
+    }')"
+
+    _AG_PROC_SCAN_PPID_MAP="$(printf '%s' "${parsed}" | grep '^P' | cut -c2- | tr '\n' ' ')"
+    local candidates="$(printf '%s' "${parsed}" | grep '^C' | cut -c2- | tr '\n' ' ')"
+
+    local agent_pids="" worktree_pids=""
+    local pid_num cwd_link
+    for pid_num in ${candidates}; do
+        [[ -n "${pid_num}" ]] || continue
+        agent_pids="${agent_pids}${agent_pids:+ }${pid_num}"
+        cwd_link="$(readlink "/proc/${pid_num}/cwd" 2>/dev/null || true)"
+        if [[ -n "${cwd_link}" && -n "${wt_prefixes}" ]]; then
+            case ",${wt_prefixes}," in
+                *,"${cwd_link}"/*,*|*,"${cwd_link}",*)
+                    worktree_pids="${worktree_pids}${worktree_pids:+ }${pid_num}"
+                    ;;
+            esac
+        fi
+    done
+
+    _AG_PROC_SCAN_AGENT_PIDS="${agent_pids}"
+    _AG_PROC_SCAN_WORKTREE_PIDS="${worktree_pids}"
+}
+
+# Walk the parent chain using the cached PPID map and return the top-most
+# (root) agent process that owns this process tree. We keep walking instead of
+# stopping at the first agent because args-based detection can flag the current
+# shell/wrapper itself as an agent (e.g. its argv contains a .kimi-code path);
+# the meaningful session owner is the IDE/agent root at the top of the chain.
+_ag_find_agent_ancestor() {
+    local start_pid="$1"
+    local current_pid="${start_pid}"
+    local visited=""
+    local root_agent=""
+
+    while [[ -n "${current_pid}" && "${current_pid}" != "1" ]]; do
+        if [[ "${visited}" =~ (^|[[:space:]])${current_pid}([[:space:]]|$) ]]; then
+            break
+        fi
+        visited="${visited} ${current_pid}"
+
+        # Is this PID itself an agent? Track the highest one we find.
+        if [[ " ${_AG_PROC_SCAN_AGENT_PIDS} " =~ [[:space:]]${current_pid}[[:space:]] ]]; then
+            root_agent="${current_pid}"
+        fi
+
+        current_pid="$(printf '%s' "${_AG_PROC_SCAN_PPID_MAP}" | tr ' ' '\n' | grep "^${current_pid}:" | head -n1 | cut -d: -f2)"
+    done
+
+    if [[ -n "${root_agent}" ]]; then
+        echo "${root_agent}"
+        return 0
+    fi
+    return 1
+}
+
+_ag_worktree_has_live_agent() {
+    local worktree="$1"
+
+    _ag_scan_proc_once
+
+    # Identify the agent IDE/session that owns this wrapper invocation. Processes
+    # belonging to the same agent session are ignored; any other agent session in
+    # the worktree counts as a live occupant.
+    local own_agent_ancestor
+    own_agent_ancestor="$(_ag_find_agent_ancestor "$$")"
+
+    # _AG_PROC_SCAN_WORKTREE_PIDS contains agent/descendant candidates whose cwd
+    # is inside some agent worktree. Narrow to the target worktree and exclude
+    # candidates that belong to our own agent session.
+    local pid_num
+    for pid_num in ${_AG_PROC_SCAN_WORKTREE_PIDS}; do
         local cwd_link
-        cwd_link="$(readlink "${pid}/cwd" 2>/dev/null || true)"
+        cwd_link="$(readlink "/proc/${pid_num}/cwd" 2>/dev/null || true)"
         [[ "${cwd_link}" != "${worktree}" ]] && continue
 
-        # Collect this process's ancestor chain.
-        local current_pid="${pid_num}"
-        local ancestors=""
-        local visited=""
-        while [[ -n "${current_pid}" && "${current_pid}" != "1" ]]; do
-            if [[ "${visited}" =~ (^|[[:space:]])${current_pid}([[:space:]]|$) ]]; then
-                break
-            fi
-            visited="${visited} ${current_pid}"
-            ancestors="${ancestors} ${current_pid}"
-            current_pid="$(grep '^PPid:' "/proc/${current_pid}/status" 2>/dev/null | awk '{print $2}' || true)"
-        done
-
-        # Ignore our own subprocesses that happen to visit the worktree.
-        if [[ "${ancestors}" =~ (^|[[:space:]])${own_pid}([[:space:]]|$) ]]; then
+        local cand_agent_ancestor
+        cand_agent_ancestor="$(_ag_find_agent_ancestor "${pid_num}")"
+        if [[ -n "${own_agent_ancestor}" && "${cand_agent_ancestor}" == "${own_agent_ancestor}" ]]; then
             continue
         fi
 
-        # Any known agent ancestor means another session holds the worktree.
-        for apid in ${agent_pids}; do
-            if [[ "${ancestors}" =~ (^|[[:space:]])${apid}([[:space:]]|$) ]]; then
-                return 0
-            fi
-        done
+        return 0
     done
 
     return 1
 }
 
+# Per-invocation log file. Using a slot-specific path prevents parallel wrapper
+# invocations from clobbering each other's lease output in /tmp.
+_AG_WRAPPER_LOG="/tmp/ag-wrapper-lease-${_AG_SLOT:-$$}.log"
+
 # Return the most recent resumable worktree for a given identity prefix.
-# Reads the Agent Guard journal and, for the newest init/attach event whose
+# Reads the newest entries from the Agent Guard journal and, for the newest
 # identity matches ${prefix}<number>, checks whether the recorded worktree is
-# available and not held by another live agent process. This enables "sticky
-# sessions": restarting Kimi from the main repository returns to the last
-# active worktree instead of allocating the first free slot.
+# available and not held by another live agent process.
+# This enables "sticky sessions" without reading a multi-MB journal in full.
 _ag_find_resumable_worktree() {
     local prefix="$1"
     local journal_path
@@ -442,101 +527,90 @@ _ag_find_resumable_worktree() {
     local session_dir
     session_dir="${_AG_MAIN_REPO}/$(bash "${_AG_CONFIG_BIN}" get paths.session_storage ".agent-guard/sessions")"
 
-    # Own PID is used to exclude the current wrapper process from the live-agent
-    # scan; otherwise a resuming session would see itself as an intruder.
-    local own_pid="$$"
+    # Identify the agent IDE/session that owns this wrapper invocation so the
+    # Python helper can ignore processes from the same session.
+    local own_agent_ancestor
+    _ag_scan_proc_once
+    own_agent_ancestor="$(_ag_find_agent_ancestor "$$")"
 
-    ${AG_PYTHON} - "${journal_path}" "${prefix}" "${session_dir}" "${own_pid}" <<'PY'
+    ${AG_PYTHON} - "${journal_path}" "${prefix}" "${session_dir}" "${own_agent_ancestor}" "${_AG_PROC_SCAN_AGENT_PIDS}" "${_AG_PROC_SCAN_WORKTREE_PIDS}" "${_AG_PROC_SCAN_PPID_MAP}" <<'PY'
 import json, sys, os, re, subprocess
-journal_path, prefix, session_dir, own_pid = sys.argv[1:5]
-own_pid = str(own_pid)
+journal_path, prefix, session_dir, own_agent_ancestor, agent_pids_str, worktree_pids_str, ppid_map_str = sys.argv[1:8]
 identity_re = re.compile(rf'^{re.escape(prefix)}\\d+$')
-AGENT_NAMES = {'kimi-code', 'claude', 'gemini', 'grok', 'cursor', 'antigravity', 'kiro', 'kimi'}
 
-def worktree_has_live_agent(worktree, own_pid):
-    """Return True if an agent process (other than own_pid) holds worktree.
+# Reuse the single /proc scan performed by the bash wrapper.
+agent_pids = set(agent_pids_str.split())
+worktree_pids = set(worktree_pids_str.split())
+ppid_map = {}
+for entry in ppid_map_str.split():
+    if ':' in entry:
+        pid, ppid = entry.split(':', 1)
+        ppid_map[pid] = ppid
 
-    Detection walks the ancestor chain of every process whose cwd is the
-    worktree. This catches not only the main agent binary but also child
-    processes such as MCP servers spawned via npm exec or node.
+def find_agent_ancestor(start_pid):
+    """Return the first ancestor (or start_pid itself) that is an agent."""
+    current = str(start_pid)
+    visited = set()
+    while current and current != '1' and current not in visited:
+        visited.add(current)
+        if current in agent_pids:
+            return current
+        current = ppid_map.get(current)
+    return None
+
+def worktree_has_live_agent(worktree, own_agent_ancestor, ppid_map):
+    """Return True if an agent process from another session holds worktree.
+
+    The wrapper pre-filters worktree_pids to agent processes and their
+    descendants whose cwd is inside some agent worktree. We confirm the cwd
+    matches the target worktree, then compare agent ancestors to exclude
+    processes belonging to this wrapper's own agent session.
     """
     try:
-        # Build the set of known agent PIDs.
-        agent_pids = set()
-        for entry in os.listdir('/proc'):
-            if not entry.isdigit():
-                continue
-            names = set()
+        for pid in worktree_pids:
             try:
-                with open(f'/proc/{entry}/comm', 'r') as f:
-                    names.add(f.read().strip())
-            except (OSError, FileNotFoundError):
-                pass
-            try:
-                with open(f'/proc/{entry}/cmdline', 'rb') as f:
-                    argv0 = f.read().split(b'\0', 1)[0].decode('utf-8', 'replace')
-                    if argv0:
-                        names.add(argv0)
-            except (OSError, FileNotFoundError):
-                pass
-            if names & AGENT_NAMES:
-                agent_pids.add(entry)
-
-        # For every process in the worktree, collect its ancestor chain. If our
-        # own PID is in the chain, it is just our own subprocess visiting the
-        # worktree (e.g. a test); ignore it. Any known agent ancestor means the
-        # worktree is held by another live session.
-        for entry in os.listdir('/proc'):
-            if not entry.isdigit() or entry == str(own_pid):
-                continue
-            try:
-                cwd = os.readlink(f'/proc/{entry}/cwd')
+                cwd = os.readlink(f'/proc/{pid}/cwd')
             except (OSError, FileNotFoundError):
                 continue
             if cwd != worktree:
                 continue
 
-            current = entry
-            visited = set()
-            ancestors = []
-            while current and current != '1' and current not in visited:
-                visited.add(current)
-                ancestors.append(current)
-                try:
-                    with open(f'/proc/{current}/status') as f:
-                        for line in f:
-                            if line.startswith('PPid:'):
-                                current = line.split()[1]
-                                break
-                        else:
-                            break
-                except (OSError, FileNotFoundError):
-                    break
-
-            if str(own_pid) in ancestors:
+            cand_agent_ancestor = find_agent_ancestor(pid)
+            if own_agent_ancestor and cand_agent_ancestor == own_agent_ancestor:
                 continue
-            if agent_pids.intersection(ancestors):
-                return True
+            return True
     except Exception:
         pass
     return False
 
+# Only read the newest journal entries; old entries cannot represent a session
+# that should be resumed ahead of more recent ones. 2000 lines covers several
+# days of heavy usage.
+MAX_JOURNAL_LINES = 2000
+try:
+    import subprocess as sp
+    proc = sp.run(['tail', '-n', str(MAX_JOURNAL_LINES), journal_path],
+                  capture_output=True, text=True, encoding='utf-8', errors='replace')
+    raw_lines = proc.stdout.splitlines()
+except Exception:
+    with open(journal_path, 'r', encoding='utf-8', errors='replace') as f:
+        raw_lines = f.readlines()
+
 events = []
-with open(journal_path, 'r', encoding='utf-8') as f:
-    for line in f:
-        line = line.strip()
-        if not line:
-            continue
-        try:
-            e = json.loads(line)
-        except json.JSONDecodeError:
-            continue
-        if e.get('action') not in ('init', 'attach'):
-            continue
-        ident = e.get('identity', '')
-        if not identity_re.match(ident):
-            continue
-        events.append(e)
+for line in raw_lines:
+    line = line.strip()
+    if not line:
+        continue
+    try:
+        e = json.loads(line)
+    except json.JSONDecodeError:
+        continue
+    if e.get('action') not in ('init', 'attach'):
+        continue
+    ident = e.get('identity', '')
+    if not identity_re.match(ident):
+        continue
+    events.append(e)
 
 # Most recent first.
 events.reverse()
@@ -583,7 +657,7 @@ for e in events:
 
     # Even when the session file is missing or stale, refuse to resume a
     # worktree that currently hosts another live agent process.
-    if worktree_has_live_agent(worktree, own_pid):
+    if worktree_has_live_agent(worktree, own_agent_ancestor, ppid_map):
         continue
 
     print(worktree)
@@ -734,25 +808,25 @@ if ! _ag_have_lease; then
         set --
         if [[ "${_ag_slot_mode}" == "adopt" ]]; then
             echo "🔄 AG WRAPPER: slot '${_AG_SLOT}' has a stale session with uncommitted work; adopting..." >&2
-            if ! source "${_AG_INIT_SCRIPT}" --adopt "${_AG_SLOT}" >/tmp/ag-wrapper-lease.log 2>&1; then
+            if ! source "${_AG_INIT_SCRIPT}" --adopt "${_AG_SLOT}" >"${_AG_WRAPPER_LOG}" 2>&1; then
                 echo "❌ AG WRAPPER: failed to adopt slot '${_AG_SLOT}'." >&2
-                echo "   Log: /tmp/ag-wrapper-lease.log" >&2
-                cat /tmp/ag-wrapper-lease.log >&2
+                echo "   Log: ${_AG_WRAPPER_LOG}" >&2
+                cat "${_AG_WRAPPER_LOG}" >&2
                 exit 1
             fi
             # Adopt output lists uncommitted work and stashes left by the dead
             # session; it must stay visible to the user.
-            cat /tmp/ag-wrapper-lease.log
+            cat "${_AG_WRAPPER_LOG}"
             # The adopted worktree legitimately carries the dead session's
             # uncommitted work (surfaced above). The generic cleanliness guard
             # must not block the launch it just adopted; AG_ALLOW_DIRTY_WORKTREE
             # is scoped to this process and documented as the recovery escape.
             export AG_ALLOW_DIRTY_WORKTREE=1
         else
-            if ! source "${_AG_INIT_SCRIPT}" "${_ag_slot_prefix}" "${_ag_default_role}" --slot "${_AG_SLOT}" >/tmp/ag-wrapper-lease.log 2>&1; then
+            if ! source "${_AG_INIT_SCRIPT}" "${_ag_slot_prefix}" "${_ag_default_role}" --slot "${_AG_SLOT}" >"${_AG_WRAPPER_LOG}" 2>&1; then
                 echo "❌ AG WRAPPER: failed to acquire slot '${_AG_SLOT}'." >&2
-                echo "   Log: /tmp/ag-wrapper-lease.log" >&2
-                cat /tmp/ag-wrapper-lease.log >&2
+                echo "   Log: ${_AG_WRAPPER_LOG}" >&2
+                cat "${_AG_WRAPPER_LOG}" >&2
                 exit 1
             fi
         fi
@@ -781,10 +855,10 @@ if ! _ag_have_lease; then
                 echo "🔄 AG WRAPPER: no free worktree available; allocating new slot..." >&2
                 ORIGINAL_ARGS=("$@")
                 set --
-                if ! source "${_AG_INIT_SCRIPT}" kimi "${default_role}" >/tmp/ag-wrapper-lease.log 2>&1; then
+                if ! source "${_AG_INIT_SCRIPT}" kimi "${default_role}" >"${_AG_WRAPPER_LOG}" 2>&1; then
                     echo "❌ AG WRAPPER: failed to acquire agent lease." >&2
-                    echo "   Log: /tmp/ag-wrapper-lease.log" >&2
-                    cat /tmp/ag-wrapper-lease.log >&2
+                    echo "   Log: ${_AG_WRAPPER_LOG}" >&2
+                    cat "${_AG_WRAPPER_LOG}" >&2
                     exit 1
                 fi
                 set -- "${ORIGINAL_ARGS[@]}"
@@ -804,10 +878,10 @@ if ! _ag_have_lease; then
     if [[ "${_AG_SKIP_INIT}" != "true" ]]; then
         ORIGINAL_ARGS=("$@")
         set --
-        if ! source "${_AG_INIT_SCRIPT}" >/tmp/ag-wrapper-lease.log 2>&1; then
+        if ! source "${_AG_INIT_SCRIPT}" >"${_AG_WRAPPER_LOG}" 2>&1; then
             echo "❌ AG WRAPPER: failed to acquire agent lease." >&2
-            echo "   Log: /tmp/ag-wrapper-lease.log" >&2
-            cat /tmp/ag-wrapper-lease.log >&2
+            echo "   Log: ${_AG_WRAPPER_LOG}" >&2
+            cat "${_AG_WRAPPER_LOG}" >&2
             exit 1
         fi
         set -- "${ORIGINAL_ARGS[@]}"
@@ -869,10 +943,17 @@ if [[ -f "${_ag_session_trace_script}" && -n "${_AG_WORKTREE:-}" && -n "${_AG_ID
     # explicit checkpoint. The watcher is best-effort and never blocks Kimi.
     watch_interval="${AGENT_GUARD_KIMI_WATCH_INTERVAL_SECONDS:-60}"
     if [[ "${watch_interval}" -gt 0 && -n "${_AG_WORKTREE:-}" ]]; then
+        # Detach all file descriptors so the background watcher never keeps the
+        # caller's pipes (e.g. command substitution $(...)) open after the real
+        # Kimi process exits. This is a best-effort trace; losing its output is
+        # acceptable.
         (
+            # Change cwd so a surviving watcher is not mistaken for a live agent
+            # session inside the worktree after the parent wrapper exits.
+            cd / >/dev/null 2>&1 || true
             source "${_ag_session_trace_script}" >/dev/null 2>&1
             _trace_watch_kimi_session "$$" "${_AG_WORKTREE}" "${_ag_session_trace_dir}" "${watch_interval}" "${AGENT_GUARD_KIMI_WATCH_CHECKPOINT_INTERVAL_SECONDS:-300}" >/dev/null 2>&1
-        ) &
+        ) </dev/null >/dev/null 2>&1 &
         disown 2>/dev/null || true
     fi
 fi
