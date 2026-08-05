@@ -1,5 +1,21 @@
 # Changelog — agent-guard-core
 
+## 0.9.10 — SessionEnd hook restaura o wrapper Kimi (janela do cron zerada)
+
+- `wrappers/kimi/hooks/agent-guard-session-end.sh`:
+  - Ao encerrar a sessão num repo gerenciado, executa
+    `wrappers/kimi/recovery.sh --repo-root <repo>` de forma best-effort
+    (silenciosa, `|| true`), antes de qualquer lógica de lease/auto-release.
+  - Motivo: o self-update do Kimi CLI sobrescreve `<bin_dir>/kimi` tipicamente
+    ao sair da sessão, e o cron de recovery (`*/5`) deixava uma janela de até
+    5 minutos em que um relançamento rodava o binário cru — sem slot, no repo
+    principal (incidente 2026-08-05, update 0.33.0: sessão lançada ~47s após
+    a sobrescrita rodou sem lease). Com o recovery no SessionEnd, a janela vai
+    a zero para o próximo lançamento; o cron vira apenas backstop.
+- `tests/agent-guard/kimi-session-end-recovery-test.sh`:
+  - 4 casos: recovery invocado mesmo sem lease, skipped fora de repo
+    gerenciado, hook sai 0 com recovery.sh ausente e com recovery.sh falhando.
+
 ## 0.9.9 — Orphan Rescue Protocol (ADR-0037)
 
 - `src/init.sh`:

@@ -21,6 +21,16 @@ function _ag_session_end_main() {
         return 0
     fi
 
+    # Kimi CLI self-updates replace <bin_dir>/kimi with the raw binary, usually
+    # when a session exits. Restore the Agent Guard wrapper now (best-effort,
+    # no-op when intact) so the next launch never finds an unwrapped binary —
+    # the periodic cron recovery leaves a window of several minutes in which a
+    # relaunch would bypass slot isolation entirely.
+    local recovery_script="${repo_root}/packages/agent-guard-core/wrappers/kimi/recovery.sh"
+    if [[ -f "${recovery_script}" ]]; then
+        bash "${recovery_script}" --repo-root "${repo_root}" >/dev/null 2>&1 || true
+    fi
+
     local init_stub="${repo_root}/.hmvip-agent-init"
     if [[ ! -f "${init_stub}" ]]; then
         return 0
