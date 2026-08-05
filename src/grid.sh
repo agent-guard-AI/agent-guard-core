@@ -30,7 +30,8 @@
 # Requer: X11, xrandr, xdotool, kitty. Wayland nao suportado.
 #
 
-HMVIP_GRID_CLASS="${HMVIP_GRID_CLASS:-hmvip-grid}"
+HMVIP_GRID_CLASS_BASE="${HMVIP_GRID_CLASS_BASE:-hmvip-grid}"
+HMVIP_GRID_CLASS="${HMVIP_GRID_CLASS:-${HMVIP_GRID_CLASS_BASE}}"
 
 # Lista monitores conectados via `xrandr --listmonitors`.
 # Saida (uma linha por monitor): "<nome> <primario:0|1> <x> <y> <w> <h>"
@@ -142,16 +143,20 @@ function _hmvip_grid_plan() {
 # WIDs (X window ids) das janelas da grade abertas. --onlyvisible filtra so
 # janelas top-level mapeadas (o kitty cria janelas transitorias durante o
 # startup, que quebravam o pareamento wid->quadrante).
+# Aceita classe opcional como $1 (padrao: HMVIP_GRID_CLASS).
 function _hmvip_grid_wids() {
-    xdotool search --onlyvisible --class "${HMVIP_GRID_CLASS}" 2>/dev/null | sort -n
+    local cls="${1:-${HMVIP_GRID_CLASS}}"
+    xdotool search --onlyvisible --class "${cls}" 2>/dev/null | sort -n
 }
 
 # Fecha todas as janelas da grade (graceful; fallback para kill).
+# Fecha tanto janelas da classe base (hmvip-grid) quanto classes especificas
+# de slot (hmvip-grid-slot-*), sem tocar em janelas nativas do kitty.
 function _hmvip_grid_close() {
     local wids wid count=0
-    wids="$(_hmvip_grid_wids)"
+    wids="$(_hmvip_grid_wids "${HMVIP_GRID_CLASS_BASE}")"
     if [ -z "${wids}" ]; then
-        echo "Nenhuma janela da grade (${HMVIP_GRID_CLASS}) aberta."
+        echo "Nenhuma janela da grade (${HMVIP_GRID_CLASS_BASE}*) aberta."
         return 0
     fi
     while IFS= read -r wid; do
@@ -166,24 +171,25 @@ function _hmvip_grid_close() {
 }
 
 # Abre uma janela kitty e espera mapear. Define _HMVIP_GRID_LAST_WID.
-# Args: <title> <cmd...>
+# Args: <class> <title> <cmd...>
 function _hmvip_grid_open_one() {
-    local title="$1"
-    shift
+    local cls="$1"
+    local title="$2"
+    shift 2
     local before after wid tries
     # before/after em UMA linha separada por espacos: o teste de pertencimento
     # via case " $before " exige wid cercado de espacos (newlines quebrariam
     # a comparacao e o diff pegaria sempre a primeira janela da grade).
-    before=" $(_hmvip_grid_wids | tr '\n' ' ') "
+    before=" $(_hmvip_grid_wids "${cls}" | tr '\n' ' ') "
     # resize_in_steps=no: o kitty arredonda tamanhos para celulas de caracteres
     # por padrao, o que quebraria o encaixe pixel-exato do quadrante.
     # remember_window_size=no: nao restaurar tamanho de sessoes anteriores.
     if [ "$#" -gt 0 ]; then
-        setsid kitty --class "${HMVIP_GRID_CLASS}" --title "${title}" \
+        setsid kitty --class "${cls}" --title "${title}" \
             -o resize_in_steps=no -o remember_window_size=no \
             --directory "${HOME}" "$@" >/dev/null 2>&1 </dev/null &
     else
-        setsid kitty --class "${HMVIP_GRID_CLASS}" --title "${title}" \
+        setsid kitty --class "${cls}" --title "${title}" \
             -o resize_in_steps=no -o remember_window_size=no \
             --directory "${HOME}" >/dev/null 2>&1 </dev/null &
     fi
@@ -193,7 +199,7 @@ function _hmvip_grid_open_one() {
     wid=""
     tries=0
     while [ "${tries}" -lt 100 ]; do
-        after=" $(_hmvip_grid_wids | tr '\n' ' ') "
+        after=" $(_hmvip_grid_wids "${cls}" | tr '\n' ' ') "
         local candidate
         for candidate in ${after}; do
             case " ${before} " in
@@ -201,7 +207,7 @@ function _hmvip_grid_open_one() {
                 *)
                     sleep 0.3
                     if xdotool getwindowname "${candidate}" >/dev/null 2>&1 \
-                        && xdotool search --onlyvisible --class "${HMVIP_GRID_CLASS}" 2>/dev/null \
+                        && xdotool search --onlyvisible --class "${cls}" 2>/dev/null \
                             | grep -qx "${candidate}"; then
                         wid="${candidate}"
                     fi
@@ -374,11 +380,12 @@ function _hmvip_grid_cmd() {
         shift
     done
 
-    local plan slots_titles=() slots_cmds=() slots_worktrees=()
+    local plan slots_titles=() slots_cmds=() slots_worktrees=() slots_names=()
     if [ -n "${slots_json}" ]; then
         # Modo --slots: plano customizado, um quadrante por slot.
         plan="$(_hmvip_grid_plan_from_slots "${slots_json}")" || return 1
-        # Pre-carrega titulos, worktrees e comandos na mesma ordem do JSON.
+        # Pre-carrega titulos, worktrees, comandos e nomes de slot na mesma
+        # ordem do JSON.
         local s_idx=0 s_title s_worktree s_slot
         while IFS= read -r s_slot; do
             s_title="$(python3 - "${slots_json}" "${s_idx}" <<'PY' 2>/dev/null
@@ -402,6 +409,7 @@ except Exception:
 PY
 )"
             slots_titles+=("⚪ ${s_slot} | ${s_title}")
+            slots_names+=("${s_slot}")
             slots_worktrees+=("${s_worktree}")
             # Armazena como string unica para ser expandida via eval no loop de
             # abertura. Isso evita que um array de 3 elementos (sh, -c, string)
@@ -434,12 +442,15 @@ PY
 
     if [ "${replace}" = "1" ]; then
         _hmvip_grid_close
-    elif [ -n "$(_hmvip_grid_wids)" ]; then
+    elif [ -z "${slots_json}" ] && [ -n "$(_hmvip_grid_wids "${HMVIP_GRID_CLASS_BASE}")" ]; then
+        # Apenas no modo grade generica (sem --slots) bloqueamos duplicatas.
+        # No modo --slots, cada slot tem sua propria classe e o loop abaixo
+        # pula slots ja abertos.
         echo "Ja existe uma grade aberta. Use 'hmvip grid close' ou 'hmvip grid --replace'." >&2
         return 1
     fi
 
-    local total=0 ok=0 line mon q cx cy w h
+    local total=0 ok=0 skipped=0 line mon q cx cy w h
     local entries=()
     local slot_idx=0
     total="$(printf '%s\n' "${plan}" | grep -c . || true)"
@@ -450,27 +461,42 @@ PY
         _HMVIP_GRID_LAST_WID=""
         local title="hmvip ${mon} q${q}"
         local launch_cmd=()
+        local win_cls="${HMVIP_GRID_CLASS}"
+        local slot_name=""
         if [ "${#slots_titles[@]}" -gt 0 ] && [ "${slot_idx}" -lt "${#slots_titles[@]}" ]; then
             title="${slots_titles[${slot_idx}]}"
+            slot_name="${slots_names[${slot_idx}]}"
+            win_cls="${HMVIP_GRID_CLASS_BASE}-slot-${slot_name}"
             # Expande a string unica do comando (ex: sh -c "cd '...' && (...)")
             # em um array de argumentos. Os valores (worktree/slot) sao gerados
             # pelo proprio script, entao o eval e controlado.
             eval "launch_cmd=(${slots_cmds[${slot_idx}]})"
         fi
+        # No modo --slots, evita duplicar janela para um slot que ja esta aberto.
+        if [ -n "${slot_name}" ] && [ -n "$(_hmvip_grid_wids "${win_cls}" | head -1)" ]; then
+            echo "  ${title}: janela ja aberta; pulando."
+            skipped=$((skipped + 1))
+            slot_idx=$((slot_idx + 1))
+            continue
+        fi
         if [ "${#launch_cmd[@]}" -gt 0 ]; then
-            if _hmvip_grid_open_one "${title}" "${launch_cmd[@]}"; then
+            if _hmvip_grid_open_one "${win_cls}" "${title}" "${launch_cmd[@]}"; then
                 ok=$((ok + 1))
-                entries+=("${_HMVIP_GRID_LAST_WID}|${mon}|${q}|${cx}|${cy}|${w}|${h}")
+                entries+=("${_HMVIP_GRID_LAST_WID}|${mon}|${q}|${cx}|${cy}|${w}|${h}|${win_cls}")
             fi
         else
-            if _hmvip_grid_open_one "${title}" "${cmd_args[@]}"; then
+            if _hmvip_grid_open_one "${win_cls}" "${title}" "${cmd_args[@]}"; then
                 ok=$((ok + 1))
-                entries+=("${_HMVIP_GRID_LAST_WID}|${mon}|${q}|${cx}|${cy}|${w}|${h}")
+                entries+=("${_HMVIP_GRID_LAST_WID}|${mon}|${q}|${cx}|${cy}|${w}|${h}|${win_cls}")
             fi
         fi
         slot_idx=$((slot_idx + 1))
     done <<<"${plan}"
     if [ "${ok}" -eq 0 ]; then
+        if [ "${skipped}" -gt 0 ]; then
+            echo "Todas as janelas ja estavam abertas (${skipped} pulada(s))."
+            return 0
+        fi
         echo "Nenhuma janela abriu." >&2
         return 1
     fi
@@ -478,22 +504,22 @@ PY
     # Posicionamento: coloca cada janela no quadrante exato sem focar, sem
     # clicar e sem mover o cursor do usuario. Nao depende do Tiling Assistant.
     sleep 0.5
-    local entry wid
+    local entry wid win_cls
     for entry in "${entries[@]}"; do
-        IFS='|' read -r wid mon q cx cy w h <<<"${entry}"
+        IFS='|' read -r wid mon q cx cy w h win_cls <<<"${entry}"
         _hmvip_grid_position_exact "${wid}" "${q}" "${cx}" "${cy}" "${w}" "${h}"
         sleep 0.2
     done
     # Relatorio final.
     local placed=0
     for entry in "${entries[@]}"; do
-        IFS='|' read -r wid mon q cx cy w h <<<"${entry}"
+        IFS='|' read -r wid mon q cx cy w h win_cls <<<"${entry}"
         local ax ay aw ah
         read -r ax ay aw ah <<<"$(_hmvip_grid_geom "${wid}")"
         placed=$((placed + 1))
         echo "  ✔ ${mon} q${q} @ ${ax},${ay} ${aw}x${ah}"
     done
-    echo "Pronto: ${placed}/${total} janela(s) posicionadas. Feche com: hmvip grid close"
-    [ "${placed}" = "${total}" ] && return 0 || return 1
+    echo "Pronto: ${placed}/${total} janela(s) posicionadas (${skipped} pulada(s)). Feche com: hmvip grid close"
+    return 0
 }
 
