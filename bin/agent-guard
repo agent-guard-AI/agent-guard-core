@@ -223,9 +223,29 @@ function _agent_guard_main() {
                     ;;
             esac
             ;;
+        tab|aba)
+            if [[ "${1:-}" == "install" ]]; then
+                source "${SCRIPT_DIR}/src/tab.sh"
+                _hmvip_tab_install "$@"
+                return $?
+            fi
+            source "${SCRIPT_DIR}/src/tab.sh"
+            _hmvip_tab_cmd "$@"
+            return $?
+            ;;
+        tabs|abas|cockpit)
+            source "${SCRIPT_DIR}/src/tab.sh"
+            _hmvip_tab_list "$@"
+            return $?
+            ;;
+        grid|kitty|kitty-grid)
+            source "${SCRIPT_DIR}/src/grid.sh"
+            _hmvip_grid_cmd "$@"
+            return $?
+            ;;
         *)
             echo "❌ Unknown command or identity: ${COMMAND}" >&2
-            echo "   Commands: init, status, release, attach, triage, journal, resume, checkpoint, session, prune, cleanup-stale, orphan-sweep" >&2
+            echo "   Commands: init, status, release, attach, triage, journal, resume, checkpoint, session, prune, cleanup-stale, orphan-sweep, tab, tabs, grid" >&2
             echo "   Legacy:   <kimi|claude|gemini|grok> <role>" >&2
             return 1
             ;;
