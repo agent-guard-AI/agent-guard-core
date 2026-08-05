@@ -59,6 +59,15 @@ function _ag_session_end_main() {
 
     # Only auto-release when safe; failures are silent to avoid blocking Kimi shutdown.
     _auto_release_if_safe "${identity}" "${worktree_path}" "session-end" >/dev/null 2>&1 || true
+
+    # Clear tab state from the lease even if the slot could not be released
+    # (dirty worktree / open PRs). The cockpit reads tab_* from the lease.
+    _save_session_field "${identity}" "tab_state" "" >/dev/null 2>&1 || true
+    _save_session_field "${identity}" "tab_title" "" >/dev/null 2>&1 || true
+    _save_session_field "${identity}" "tab_bg" "" >/dev/null 2>&1 || true
+    _save_session_field "${identity}" "tab_tty" "" >/dev/null 2>&1 || true
+    _save_session_field "${identity}" "tab_updated" "" >/dev/null 2>&1 || true
+
     return 0
 }
 

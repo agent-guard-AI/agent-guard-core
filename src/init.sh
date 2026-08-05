@@ -354,11 +354,27 @@ _is_pid_healthy() {
     _is_pid_alive "$1"
 }
 
+# Convert tab state (working|attention|error|idle|...) to compact status dots.
+_tab_dot_for_state() {
+    local tab_state="$1"
+    local bg_count="${2:-0}"
+    local dots=""
+    [[ "${bg_count}" =~ ^[0-9]+$ ]] && [[ "${bg_count}" -gt 0 ]] && dots="🔵"
+    case "${tab_state}" in
+        working)   dots="${dots}🟢" ;;
+        attention) dots="${dots}🟡" ;;
+        error)     dots="${dots}🔴" ;;
+        *)         dots="${dots}⚪" ;;
+    esac
+    printf '%s' "${dots}"
+}
+
 # Reconcile session file with the actual state of the worktree and process.
 # Sets the following variables in the caller's scope:
 #   _rec_status, _rec_role, _rec_pid, _rec_branch, _rec_worktree,
-#   _rec_health, _rec_drift
-# _rec_health is one of: live, dead, stale, orphan, drift, -
+#   _rec_health, _rec_drift, _rec_tab_state, _rec_tab_title, _rec_tab_bg,
+#   _rec_tab_updated
+# _rec_health is one of: live, dead, stale, orphan, drift, pinned, -
 # _rec_drift is a short human-readable description of any inconsistency.
 _status_reconcile_session() {
     local identity="$1"
@@ -371,6 +387,10 @@ _status_reconcile_session() {
     _rec_branch="$(_load_session_field "${identity}" "branch")"
     _rec_worktree="$(_load_session_field "${identity}" "worktree_path")"
     _rec_last_activity="$(_load_last_activity "${identity}")"
+    _rec_tab_state="$(_load_session_field "${identity}" "tab_state")"
+    _rec_tab_title="$(_load_session_field "${identity}" "tab_title")"
+    _rec_tab_bg="$(_load_session_field "${identity}" "tab_bg")"
+    _rec_tab_updated="$(_load_session_field "${identity}" "tab_updated")"
     _rec_health="-"
     _rec_drift=""
 
@@ -656,13 +676,18 @@ _save_session_field() {
     session_file="$(_get_session_file "${identity}")"
     [[ -f "${session_file}" ]] || return 1
 
-    ${AG_PYTHON} -c "
-import json
-with open('${session_file}') as f:
+    # Pass value through the environment to avoid shell quoting/escaping issues
+    # with emoji, apostrophes and JSON-like payloads.
+    AG_SAVE_FIELD="${field}" AG_SAVE_VALUE="${value}" AG_SAVE_FILE="${session_file}" ${AG_PYTHON} -c "
+import json, time, os
+field = os.environ['AG_SAVE_FIELD']
+value = os.environ['AG_SAVE_VALUE']
+path = os.environ['AG_SAVE_FILE']
+with open(path) as f:
     d = json.load(f)
-d['${field}'] = '${value}'
-d['timestamp'] = __import__('time').time()
-with open('${session_file}', 'w') as f:
+d[field] = value
+d['timestamp'] = time.time()
+with open(path, 'w') as f:
     json.dump(d, f, indent=2)
 " >/dev/null 2>&1
 }
@@ -2458,8 +2483,8 @@ if [[ "${MODE}" == "status" ]]; then
     echo "=========================================================="
     echo "🛡️  Agent Guard — Session Status"
     echo "=========================================================="
-    printf "%-12s | %-8s | %-6s | %-10s | %-6s | %-8s | %-40s\n" "Agent" "Status" "Role" "PID" "WT" "Health" "Branch"
-    echo "----------------------------------------------------------"
+    printf "%-12s | %-8s | %-6s | %-10s | %-6s | %-8s | %-18s | %-40s\n" "Agent" "Status" "Role" "PID" "WT" "Health" "Tab" "Branch"
+    echo "------------------------------------------------------------------"
 
     _rec_status="" _rec_role="" _rec_pid="" _rec_branch="" _rec_worktree="" _rec_health="" _rec_drift=""
     any_drift=""
@@ -2487,9 +2512,16 @@ if [[ "${MODE}" == "status" ]]; then
                 pid_col="${_rec_pid} (stale)"
             fi
 
-            printf "%-12s | %-8s | %-6s | %-10s | %-6s | %-8s | %-40s\n" \
+            _tab_text="$(_tab_dot_for_state "${_rec_tab_state}" "${_rec_tab_bg}")"
+            if [[ -n "${_rec_tab_title}" ]]; then
+                _tab_text="${_tab_text} ${_rec_tab_title}"
+            fi
+            # Keep the tab column narrow; emoji are wide, so truncate conservatively.
+            _tab_text="$(${AG_PYTHON} -c "import sys; s=sys.argv[1]; print(s[:17]+'…' if len(s)>18 else s)" "${_tab_text}" 2>/dev/null || printf '%s' "${_tab_text}")"
+
+            printf "%-12s | %-8s | %-6s | %-10s | %-6s | %-8s | %-18s | %-40s\n" \
                 "${identity}" "${_rec_status:-free}" "${_rec_role:-}" \
-                "${pid_col:-}" "${wt_ok}" "${_rec_health:-}" "${_rec_branch:-}"
+                "${pid_col:-}" "${wt_ok}" "${_rec_health:-}" "${_tab_text}" "${_rec_branch:-}"
 
             if [[ "${_rec_health}" != "-" && "${_rec_health}" != "live" ]]; then
                 any_drift="${any_drift}\n  ${_rec_drift:-drift}: ${identity} -> ${_rec_branch:-<no branch>}"
