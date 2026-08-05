@@ -76,6 +76,13 @@ final class WorktreeOriginAudit
             if ($note === null) {
                 echo "   ❌ Missing worktree metadata (git note {$this->config->getGitNotesRef()}).\n";
                 echo "      The commit must be created inside the AI worktree.\n";
+                echo "\n";
+                echo "      Fix locally (run from the AI worktree that owns the commit):\n";
+                echo "        git notes --ref={$this->config->getGitNotesRef()} add -m 'worktree:/path/to/worktree\n";
+                echo "identity:{$identity}\n";
+                echo "branch:<branch-name>' {$hash}\n";
+                echo "        git push origin {$this->config->getGitNotesRef()}\n";
+                echo "\n";
                 $violations++;
                 continue;
             }
