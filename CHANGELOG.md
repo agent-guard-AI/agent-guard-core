@@ -16,6 +16,36 @@
   - 4 casos: recovery invocado mesmo sem lease, skipped fora de repo
     gerenciado, hook sai 0 com recovery.sh ausente e com recovery.sh falhando.
 
+## 0.9.11 — Shell-Pinned Lease Recovery
+
+Caso real (2026-08-05): agente morre, mas a aba de terminal que fez `source`
+do init sobrevive parada no worktree. O lease fica preso a um PID vivo que não
+é processo de agente e o `adopt` recusava com "SLOT STILL IN USE" para sempre.
+
+- `src/init.sh`:
+  - Novo helper `_pid_tree_has_agent_process()` — detecta processo de agente
+    (mesmo predicado comm/args de `_worktree_has_other_live_agent`) no PID e em
+    todos os descendentes transitivos. O próprio `$$` do caller falha fechado
+    por design (o pipeline de scan carrega os nomes de agente no argv).
+  - Novo helper `_shell_pin_grace_seconds()` — config
+    `session.shell_pin_grace_minutes` (padrão 15, mínimo 1).
+  - Novo helper `_lease_is_shell_pinned()` — lease ativo cujo PID vivo não é
+    árvore de agente + nenhum agente vivo no worktree + heartbeat mais velho
+    que a grace period. Falha fechado em qualquer dúvida (heartbeat ausente,
+    agente na árvore, agente no worktree).
+  - `adopt`: lease shell-pinned é limpo automaticamente em vez de recusar com
+    "SLOT STILL IN USE".
+  - `_slot_is_free()` (init normal): slot shell-pinned é tratado como livre.
+  - `_cleanup_stale_sessions()`: slots shell-pinned entram na varredura de
+    auto-release seguro (worktree limpo + sem PRs abertos).
+  - `--status`: novo health `pinned` com drift "lease held by stray non-agent
+    PID" (antes aparecia como `live`, enganoso).
+- `tests/agent-guard/agent-guard-shell-pinned-lease-test.sh`:
+  - 9 cenários: detecção por args, descendente de agente, heartbeat fresco
+    (fail closed), agente na árvore (fail closed), shared-PID (fail closed) e
+    auto-release via cleanup-stale.
+
+
 ## 0.9.9 — Orphan Rescue Protocol (ADR-0037)
 
 - `src/init.sh`:
