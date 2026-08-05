@@ -59,6 +59,33 @@ is_protected_branch() {
     return 1
 }
 
+# Resolve an author email to a configured agent identity (e.g. kimi7).
+# Prints the identity or an empty string for human/non-agent emails.
+_resolve_identity_from_email() {
+    local email="$1"
+    local domain=""
+    domain="$(_get_domain)"
+    if [[ -z "${domain}" ]]; then
+        return 0
+    fi
+    for name in $(bash "${AGENT_GUARD_BIN}" keys identities); do
+        local template=""
+        template="$(_get_config "identities.${name}.author_email" '')"
+        if [[ -z "${template}" ]]; then
+            continue
+        fi
+        if [[ ! "${template}" =~ ^agent-(.+)\{n\}@${domain}$ ]]; then
+            continue
+        fi
+        local base="${BASH_REMATCH[1]}"
+        local regex="^agent-${base}([0-9]+)@${domain}$"
+        if [[ "${email}" =~ ${regex} ]]; then
+            echo "${name}${BASH_REMATCH[1]}"
+            return 0
+        fi
+    done
+}
+
 # -------------------------------------------------------------------------
 # Case 1: AI agent with slot identity (agent-<base><n>@<domain>)
 # -------------------------------------------------------------------------
@@ -161,6 +188,74 @@ if [[ -z "${IDENTITY}" ]]; then
 fi
 
 # -------------------------------------------------------------------------
+# Worktree origin notes validation + auto-repair
+# -------------------------------------------------------------------------
+_ensure_worktree_notes() {
+    if ! git rev-parse --verify --quiet "origin/${BASE_BRANCH}" >/dev/null 2>&1; then
+        return 0
+    fi
+
+    local range="origin/${BASE_BRANCH}..HEAD"
+    local missing=0
+    local hash subject email commit_identity
+
+    while IFS= read -r hash; do
+        [[ -z "${hash}" ]] && continue
+
+        subject="$(git log -1 --pretty=%s "${hash}" 2>/dev/null || echo "")"
+        email="$(git log -1 --pretty=%ae "${hash}" 2>/dev/null || echo "")"
+        commit_identity="$(_resolve_identity_from_email "${email}")"
+        [[ -z "${commit_identity}" ]] && continue
+
+        if git notes --ref="${NOTES_REF}" show "${hash}" >/dev/null 2>&1; then
+            continue
+        fi
+
+        # Auto-repair is safe only when the commit author matches the current
+        # worktree identity. Commits from other agents must be fixed manually.
+        if [[ -n "${IDENTITY}" && "${email}" == "${AUTHOR_EMAIL}" ]]; then
+            local note_content
+            note_content="worktree:${REPO_ROOT}
+identity:${IDENTITY}
+branch:${BRANCH}"
+            if git notes --ref="${NOTES_REF}" add -f -m "${note_content}" "${hash}" >/dev/null 2>&1; then
+                echo "   🔧 Auto-repaired worktree note for ${hash:0:8} (${subject})" >&2
+                continue
+            fi
+        fi
+
+        echo "   ❌ Commit ${hash:0:8} (${subject}) is missing a worktree origin note." >&2
+        echo "      Author: ${email}" >&2
+        if [[ -n "${IDENTITY}" ]]; then
+            echo "      Fix (run from this worktree):" >&2
+            echo "        git notes --ref=${NOTES_REF} add -m 'worktree:${REPO_ROOT}" >&2
+            echo "identity:${IDENTITY}" >&2
+            echo "branch:${BRANCH}' ${hash}" >&2
+        else
+            echo "      Fix: add a worktree note on the correct AI worktree." >&2
+        fi
+        missing=$((missing + 1))
+    done < <(git log "${range}" --no-merges --pretty=%H 2>/dev/null)
+
+    if [[ "${missing}" -gt 0 ]]; then
+        echo "" >&2
+        echo "❌❌❌ PUSH BLOCKED: MISSING WORKTREE NOTES ❌❌❌" >&2
+        echo "" >&2
+        echo "${missing} AI commit(s) lack the required worktree origin note." >&2
+        echo "This usually happens when a commit is created without the post-commit" >&2
+        echo "hook (e.g. recovery, bypass, or a corrupted hook)." >&2
+        echo "" >&2
+        echo "Run the suggested 'git notes' command for each commit above, then push again." >&2
+        echo "" >&2
+        exit 1
+    fi
+}
+
+if [[ -n "${IDENTITY}" ]]; then
+    _ensure_worktree_notes
+fi
+
+# -------------------------------------------------------------------------
 # PAS — Protocolo de Ação Sensível (SPEC-ECOSYSTEM-GUARDIAN H5, task 3.3):
 # marca `sensitive: <categorias>` nas git notes dos commits do range ANTES
 # do push das notes abaixo, aumentando a visibilidade para a revisão humana.
@@ -177,6 +272,24 @@ fi
 # -------------------------------------------------------------------------
 # Send worktree origin notes
 # -------------------------------------------------------------------------
-git push origin "${NOTES_REF}" --no-verify >/dev/null 2>&1 || true
+# For AI agents, notes are mandatory; fail the push if they cannot be sent.
+# Humans keep the original best-effort behavior so a transient network issue
+# does not block their workflow.
+if [[ -n "${IDENTITY}" ]]; then
+    if git rev-parse --verify --quiet "${NOTES_REF}" >/dev/null 2>&1; then
+        if ! git push origin "${NOTES_REF}" --no-verify >/dev/null 2>&1; then
+            echo "" >&2
+            echo "❌❌❌ PUSH BLOCKED: WORKTREE NOTES NOT SENT ❌❌❌" >&2
+            echo "" >&2
+            echo "Failed to push worktree origin notes (${NOTES_REF})." >&2
+            echo "Run manually:" >&2
+            echo "  git push origin ${NOTES_REF}" >&2
+            echo "" >&2
+            exit 1
+        fi
+    fi
+else
+    git push origin "${NOTES_REF}" --no-verify >/dev/null 2>&1 || true
+fi
 
 exit 0

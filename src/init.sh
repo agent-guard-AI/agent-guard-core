@@ -1334,6 +1334,63 @@ _configure_hooks_path() {
     fi
 }
 
+# Ensure the worktree has up-to-date Git hook stubs that delegate to the
+# versioned hooks in packages/agent-guard-core/hooks/. Missing or stale stubs
+# are reinstalled from the main repository's .githooks template.
+_ensure_hooks_installed() {
+    local worktree_path="$1"
+    local worktree_hooks_path="${worktree_path}/.githooks"
+    local main_hooks_path="${_AG_REPO_ROOT}/.githooks"
+
+    local required_hooks=(
+        "pre-commit"
+        "post-commit"
+        "pre-push"
+        "pre-checkout"
+        "post-checkout"
+        "commit-msg"
+    )
+
+    local needs_install=0
+    if [[ ! -d "${worktree_hooks_path}" ]]; then
+        needs_install=1
+    else
+        for hook_name in "${required_hooks[@]}"; do
+            local stub="${worktree_hooks_path}/${hook_name}"
+            if [[ ! -f "${stub}" ]]; then
+                needs_install=1
+                break
+            fi
+            # Detect legacy/non-delegating stubs (e.g. empty files or old templates).
+            if ! grep -q "packages/agent-guard-core/hooks" "${stub}" 2>/dev/null; then
+                needs_install=1
+                break
+            fi
+        done
+    fi
+
+    if [[ "${needs_install}" -eq 0 ]]; then
+        return 0
+    fi
+
+    if [[ ! -d "${main_hooks_path}" ]]; then
+        echo "⚠️  Agent Guard: cannot reinstall hooks — main repo template missing at ${main_hooks_path}" >&2
+        return 0
+    fi
+
+    echo "🔧 Agent Guard: installing/updating hooks in ${worktree_hooks_path}" >&2
+    mkdir -p "${worktree_hooks_path}"
+
+    for hook_name in "${required_hooks[@]}"; do
+        local main_stub="${main_hooks_path}/${hook_name}"
+        local target_stub="${worktree_hooks_path}/${hook_name}"
+        if [[ -f "${main_stub}" ]]; then
+            cp -p "${main_stub}" "${target_stub}" 2>/dev/null || true
+            chmod +x "${target_stub}" 2>/dev/null || true
+        fi
+    done
+}
+
 _anti_stale_check() {
     local worktree_path="$1"
     local current_branch
@@ -1475,6 +1532,7 @@ _create_or_reuse_worktree() {
     fi
 
     _configure_hooks_path "${worktree_path}"
+    _ensure_hooks_installed "${worktree_path}"
     _anti_stale_check "${worktree_path}"
     _session_audit "${worktree_path}"
 
@@ -2412,6 +2470,7 @@ if [[ "${MODE}" == "attach" ]]; then
     _export_session_env "${WORKTREE_PATH}" "${ATTACH_BRANCH}" "${IMPACT_PLUGINS}"
 
     _configure_hooks_path "${WORKTREE_PATH}"
+    _ensure_hooks_installed "${WORKTREE_PATH}"
     _anti_stale_check "${WORKTREE_PATH}"
     _session_audit "${WORKTREE_PATH}"
 
@@ -2560,6 +2619,7 @@ if [[ "${MODE}" == "adopt" ]]; then
     _export_session_env "${WORKTREE_PATH}" "${ADOPT_BRANCH}" "${IMPACT_PLUGINS}"
 
     _configure_hooks_path "${WORKTREE_PATH}"
+    _ensure_hooks_installed "${WORKTREE_PATH}"
     _anti_stale_check "${WORKTREE_PATH}"
 
     impact_json="$(echo "${IMPACT_PLUGINS}" | ${AG_PYTHON} -c "import sys,json; print(json.dumps([p.strip() for p in sys.stdin.read().split(',') if p.strip()]))" 2>/dev/null || echo "[]")"
@@ -2685,6 +2745,7 @@ elif [[ -n "${CURRENT_IDENTITY}" && -n "${CURRENT_BRANCH}" && "${CURRENT_BRANCH}
     _export_session_env "${CURRENT_WORKTREE}" "${CURRENT_BRANCH}" "${IMPACT_PLUGINS}"
 
     _configure_hooks_path "${CURRENT_WORKTREE}"
+    _ensure_hooks_installed "${CURRENT_WORKTREE}"
     _anti_stale_check "${CURRENT_WORKTREE}"
     _session_audit "${CURRENT_WORKTREE}"
 

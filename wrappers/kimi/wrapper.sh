@@ -365,6 +365,26 @@ _ag_worktree_is_dirty() {
     [[ -n "${output}" ]]
 }
 
+# Return 0 if the PID refers to a healthy, runnable process.
+# Mirrors _is_pid_alive in init.sh: checks signal ability and rejects
+# traced/stopped/zombie/dead states. This prevents a zombie PID from being
+# treated as a live session holder (incident 2026-08-04).
+_ag_pid_is_alive() {
+    local pid="$1"
+    [[ -z "${pid}" ]] && return 1
+    if ! kill -0 "${pid}" 2>/dev/null; then
+        return 1
+    fi
+    local proc_stat
+    proc_stat="$(sed -n 's/.*) \([A-Za-z]\).*/\1/p' "/proc/${pid}/stat" 2>/dev/null || echo "")"
+    case "${proc_stat}" in
+        T|Z|X|x)
+            return 1
+            ;;
+    esac
+    return 0
+}
+
 # Caches for the single process scan performed per wrapper invocation.
 # With hundreds of thousands of threads on the host, scanning /proc multiple
 # times in shell is the dominant cost of opening a slot. We use `ps` (C
@@ -789,14 +809,16 @@ if ! _ag_have_lease; then
             _ag_sess_status="$(${AG_PYTHON} -c "import json,sys; d=json.load(open(sys.argv[1])); print(d.get('status','free'))" "${_ag_session_file}" 2>/dev/null || echo free)"
             _ag_sess_pid="$(${AG_PYTHON} -c "import json,sys; d=json.load(open(sys.argv[1])); print(d.get('pid',''))" "${_ag_session_file}" 2>/dev/null || echo '')"
             if [[ "${_ag_sess_status}" == "active" && -n "${_ag_sess_pid}" ]]; then
-                if [[ -d "/proc/${_ag_sess_pid}" ]]; then
+                if _ag_pid_is_alive "${_ag_sess_pid}"; then
                     echo "❌ AG WRAPPER: slot '${_AG_SLOT}' is held by live PID ${_ag_sess_pid}." >&2
                     echo "   Close that session first, or pick another slot." >&2
                     exit 1
                 fi
-                # Stale lease: adopt only when the worktree carries uncommitted
-                # work from the dead session; a clean stale worktree is handled
-                # by the normal acquire path (init clears the stale lease).
+                # Stale lease: the session file points to a dead/zombie PID.
+                # Adopt only when the worktree carries uncommitted work from the
+                # dead session; a clean stale worktree is handled by the normal
+                # acquire path (init clears the stale lease).
+                echo "🧹 AG WRAPPER: slot '${_AG_SLOT}' has a stale lease (PID ${_ag_sess_pid} is dead); clearing..." >&2
                 if _ag_worktree_is_dirty "${_ag_slot_worktree}"; then
                     _ag_slot_mode="adopt"
                 fi
