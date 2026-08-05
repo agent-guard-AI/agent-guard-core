@@ -437,10 +437,15 @@ _status_reconcile_session() {
 
     # Determine final health label. A live PID with no recent activity is
     # reported as stale so operators can recover slots left behind by idle
-    # IDE tabs/conversations.
-    local stale_marker=""
+    # IDE tabs/conversations. A live PID that is not an agent process tree
+    # (agent died, stray shell survived) is reported as pinned so operators
+    # know adopt/init will auto-clear it.
+    local stale_marker="" pinned_marker=""
     if [[ "${pid_health}" == "live" ]] && _is_session_stale "${identity}"; then
         stale_marker="stale"
+    fi
+    if [[ "${pid_health}" == "live" && -z "${stale_marker}" ]] && _lease_is_shell_pinned "${identity}"; then
+        pinned_marker="pinned"
     fi
 
     if [[ "${pid_health}" == "dead" ]]; then
@@ -452,6 +457,9 @@ _status_reconcile_session() {
     elif [[ -n "${stale_marker}" ]]; then
         _rec_health="stale"
         _rec_drift="inactive since $(date -d "@${_rec_last_activity}" '+%Y-%m-%d %H:%M' 2>/dev/null || echo "unknown")"
+    elif [[ -n "${pinned_marker}" ]]; then
+        _rec_health="pinned"
+        _rec_drift="lease held by stray non-agent PID ${_rec_pid} (auto-clear on adopt/init)"
     elif [[ "${pid_health}" == "live" ]]; then
         _rec_health="live"
     fi
@@ -730,6 +738,108 @@ _is_session_stale() {
     return 1
 }
 
+# Grace period (in seconds) without heartbeat before a live but non-agent
+# lease PID may be treated as shell-pinned. Config: session.shell_pin_grace_minutes
+# (default 15). A real agent session keeps the heartbeat fresh via the
+# UserPromptSubmit hook, so anything past the grace period is suspicious.
+_shell_pin_grace_seconds() {
+    local minutes
+    minutes="$(_guard_get_str "session.shell_pin_grace_minutes" "15" 2>/dev/null || echo "15")"
+    if [[ -z "${minutes}" || "${minutes}" == "None" || ! "${minutes}" =~ ^[0-9]+$ ]]; then
+        minutes=15
+    fi
+    local seconds=$((minutes * 60))
+    if [[ "${seconds}" -lt 60 ]]; then
+        seconds=60
+    fi
+    echo "${seconds}"
+}
+
+# Return true if the given PID exists and its process tree (itself plus all
+# transitive descendants) contains a known agent process. Uses the same agent
+# name/args predicate as _worktree_has_other_live_agent. A lease recorded
+# against a plain interactive shell (e.g. a terminal tab left open after the
+# agent died) fails this test, because no agent process survives in its tree.
+_pid_tree_has_agent_process() {
+    local root_pid="$1"
+    [[ -n "${root_pid}" ]] || return 1
+    [[ -d "/proc/${root_pid}" ]] || return 1
+
+    # Own PID fails closed: our scan pipeline (ps/awk) carries the agent names
+    # in its argv as part of the detection regex, so walking our own tree would
+    # always self-match. Treating $$ as "has agent" keeps shared-PID cases
+    # conservative (never auto-clear the caller's own lease).
+    if [[ "${root_pid}" == "$$" ]]; then
+        return 0
+    fi
+
+    ps -eo pid,ppid,comm,args 2>/dev/null | awk -v root="${root_pid}" '
+    {
+        pid=$1; ppid=$2; comm=$3;
+        args=""; for (i=4; i<=NF; i++) args = args $i " ";
+        children[ppid] = children[ppid] " " pid;
+        is_agent[pid] = (comm == "kimi-code" || comm == "claude" || comm == "gemini" || comm == "grok" || comm == "cursor" || comm == "antigravity" || comm == "kiro" || comm == "kimi" || args ~ /(^|[^[:alnum:]_])(kimi-code|claude|gemini|grok|cursor|antigravity|kiro|kimi)([^[:alnum:]_]|$)/) ? 1 : 0;
+    }
+    END {
+        q[0] = root; qi = 0; qn = 1;
+        while (qi < qn) {
+            cur = q[qi++];
+            if (is_agent[cur]) { found = 1; break; }
+            if (children[cur] != "") {
+                n = split(children[cur], cands, " ");
+                for (j=1; j<=n; j++) {
+                    cand = cands[j];
+                    if (cand != "" && !seen[cand]) {
+                        seen[cand] = 1;
+                        q[qn++] = cand;
+                    }
+                }
+            }
+        }
+        exit(found ? 0 : 1);
+    }'
+}
+
+# Return true when an active session's recorded PID is alive but is NOT an
+# agent process tree AND no live agent process occupies the worktree AND the
+# heartbeat is past the shell-pin grace period. Such leases are "shell-pinned":
+# the agent died but the interactive shell that sourced init survived (e.g. an
+# idle terminal tab sitting in the worktree), so the slot looks busy forever.
+# Fails closed on any doubt (missing heartbeat, agent in tree, agent in
+# worktree) — takeover of a real live session must stay impossible.
+_lease_is_shell_pinned() {
+    local identity="$1"
+    local session_file sess_status sess_pid worktree last_activity grace now
+    session_file="$(_get_session_file "${identity}")"
+    [[ -f "${session_file}" ]] || return 1
+
+    sess_status="$(_load_session_field "${identity}" "status")"
+    [[ "${sess_status}" == "active" ]] || return 1
+    sess_pid="$(_load_session_field "${identity}" "pid")"
+    [[ -n "${sess_pid}" ]] || return 1
+    _is_pid_alive "${sess_pid}" || return 1
+
+    # The recorded PID itself (or any descendant) being an agent means a real
+    # session is alive — never auto-clear.
+    if _pid_tree_has_agent_process "${sess_pid}"; then
+        return 1
+    fi
+
+    # Secondary guard: another live agent inside the worktree means real work.
+    worktree="$(_get_worktree_path "${identity}")"
+    if [[ -d "${worktree}" ]] && _worktree_has_other_live_agent "${worktree}"; then
+        return 1
+    fi
+
+    # Heartbeat must exist and be past the grace period. Missing heartbeat
+    # information fails closed.
+    last_activity="$(_load_last_activity "${identity}")"
+    [[ -n "${last_activity}" ]] || return 1
+    grace="$(_shell_pin_grace_seconds)"
+    now="$(date +%s)"
+    [[ $((now - ${last_activity%.*})) -gt ${grace} ]]
+}
+
 # Build a map of active PIDs to identities. Print lines "pid identity".
 _active_pid_identity_map() {
     local session_dir
@@ -979,7 +1089,12 @@ _acquire_slot() {
                 if _is_pid_alive "${sess_pid}"; then
                     # A live but stale session is treated as free so idle IDE
                     # tabs/conversations do not permanently exhaust slots.
+                    # The same applies to leases pinned to a stray non-agent
+                    # shell (agent died, terminal tab survived).
                     if _is_session_stale "${identity}"; then
+                        _clear_session "${identity}"
+                    elif _lease_is_shell_pinned "${identity}"; then
+                        echo "🧹 Slot ${identity} pinned to stray non-agent process (PID ${sess_pid}); auto-clearing." >&2
                         _clear_session "${identity}"
                     else
                         return 1
@@ -1957,7 +2072,11 @@ _cleanup_stale_sessions() {
 
             [[ "${sess_status}" == "active" ]] || continue
             _is_pid_alive "${sess_pid}" || continue
-            _is_session_stale "${identity}" || continue
+            # Stale (24h+) sessions and shell-pinned leases (agent died, stray
+            # non-agent shell survived, heartbeat past grace) are eligible.
+            if ! _is_session_stale "${identity}" && ! _lease_is_shell_pinned "${identity}"; then
+                continue
+            fi
 
             if _auto_release_if_safe "${identity}" "${worktree_path}" "stale"; then
                 released=$((released + 1))
@@ -2532,16 +2651,28 @@ if [[ "${MODE}" == "adopt" ]]; then
     adopt_sess_pid="$(_load_session_field "${ADOPT_IDENTITY}" "pid")"
     if [[ "${adopt_sess_status}" == "active" && -n "${adopt_sess_pid}" ]]; then
         if _is_pid_alive "${adopt_sess_pid}"; then
-            echo "" >&2
-            echo "❌❌❌ ERROR: SLOT STILL IN USE ❌❌❌" >&2
-            echo "" >&2
-            echo "   Identity '${ADOPT_IDENTITY}' is held by live PID ${adopt_sess_pid}." >&2
-            echo "   Adopt only works on slots whose previous session is dead." >&2
-            echo "" >&2
-            return 1 2>/dev/null || exit 1
+            # A live PID is not always a live session: when the agent dies but
+            # the interactive shell that sourced init survives (idle terminal
+            # tab sitting in the worktree), the lease stays pinned to that
+            # shell and adopt would be blocked forever. Auto-clear only when
+            # the PID tree has no agent process, no agent lives in the
+            # worktree and the heartbeat is past the shell-pin grace period.
+            if _lease_is_shell_pinned "${ADOPT_IDENTITY}"; then
+                echo "🧹 Lease for ${ADOPT_IDENTITY} pinned to stray non-agent process (PID ${adopt_sess_pid}); auto-clearing." >&2
+                _clear_session "${ADOPT_IDENTITY}"
+            else
+                echo "" >&2
+                echo "❌❌❌ ERROR: SLOT STILL IN USE ❌❌❌" >&2
+                echo "" >&2
+                echo "   Identity '${ADOPT_IDENTITY}' is held by live PID ${adopt_sess_pid}." >&2
+                echo "   Adopt only works on slots whose previous session is dead." >&2
+                echo "" >&2
+                return 1 2>/dev/null || exit 1
+            fi
+        else
+            echo "🧹 Clearing stale session for ${ADOPT_IDENTITY} (PID ${adopt_sess_pid} is dead)." >&2
+            _clear_session "${ADOPT_IDENTITY}"
         fi
-        echo "🧹 Clearing stale session for ${ADOPT_IDENTITY} (PID ${adopt_sess_pid} is dead)." >&2
-        _clear_session "${ADOPT_IDENTITY}"
     fi
 
     # Secondary guard: even if the session file is free/stale, refuse to adopt
