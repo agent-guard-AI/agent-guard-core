@@ -49,9 +49,11 @@ last_title() { tail -n1 "${HMVIP_TAB_OUT}" 2>/dev/null; }
 
 echo "== transicoes de estado =="
 
+EXPECTED_AUTO_TITLE="$(python3 "${HMVIP_TAB_SUMMARIZER}" 'corrigir paywall de albuns duplicados no perfil' 2>/dev/null | jq -r '.title')"
+
 fire working ',"prompt":"corrigir paywall de albuns duplicados no perfil"' UserPromptSubmit
 TITLE="$(last_title)"
-[[ "${TITLE}" == "🟢 kimi9 | fix paywall albuns duplicados…"* ]] \
+[[ "${TITLE}" == "🟢 kimi9 | ${EXPECTED_AUTO_TITLE}" ]] \
     && ok "working => verde + titulo do prompt" \
     || bad "working => verde + titulo do prompt" "${TITLE}"
 
@@ -66,7 +68,7 @@ fire error "" StopFailure
 
 fire working ',"prompt":"outra coisa"' UserPromptSubmit
 T2="$(last_title)"
-[[ "${T2}" == "🟢 kimi9 | fix paywall albuns duplicados…"* ]] \
+[[ "${T2}" == "🟢 kimi9 | ${EXPECTED_AUTO_TITLE}" ]] \
     && ok "novo prompt limpa erro e MANTEM titulo original (estavel)" \
     || bad "titulo estavel" "${T2}"
 
@@ -92,7 +94,7 @@ fire render
 
 rm -f "${HMVIP_TAB_DIR}/${SID}.title"
 fire render
-[[ "$(last_title)" == "🟢 kimi9 | fix paywall albuns duplicados…"* ]] \
+[[ "$(last_title)" == "🟢 kimi9 | ${EXPECTED_AUTO_TITLE}" ]] \
     && ok "remover override volta ao automatico" \
     || bad "volta automatico" "$(last_title)"
 
