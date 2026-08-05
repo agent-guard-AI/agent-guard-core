@@ -243,6 +243,11 @@ function _agent_guard_main() {
             _hmvip_grid_cmd "$@"
             return $?
             ;;
+        continuar-tudo|ct|continue-all)
+            source "${SCRIPT_DIR}/src/continue-all.sh"
+            _hmvip_continue_all_cmd "$@"
+            return $?
+            ;;
         *)
             echo "❌ Unknown command or identity: ${COMMAND}" >&2
             echo "   Commands: init, status, release, attach, triage, journal, resume, checkpoint, session, prune, cleanup-stale, orphan-sweep, tab, tabs, grid" >&2
