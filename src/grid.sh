@@ -49,6 +49,55 @@ function _hmvip_grid_monitors() {
         }'
 }
 
+# Imprime o plano da grade a partir de uma lista de slots JSON.
+# Cada slot ocupa um quadrante sequencial nos monitores extras (q1..q4, M1, M2...).
+# Saida: "<monitor> <q> <cx> <cy> <w> <h>" por linha.
+function _hmvip_grid_plan_from_slots() {
+    local slots_json="$1"
+    local count
+    count="$(python3 - "${slots_json}" <<'PY' 2>/dev/null
+import json, sys
+try:
+    print(len(json.loads(sys.argv[1])))
+except Exception:
+    print(0)
+PY
+)"
+    [[ "${count}" -gt 0 ]] || return 1
+
+    local mons
+    mons="$(_hmvip_grid_monitors)" || return 1
+    [[ -n "${mons}" ]] || { echo "Nenhum monitor detectado via xrandr." >&2; return 1; }
+
+    # Filtra monitores extras (nao primarios), ordenados da esquerda para direita.
+    local extra
+    extra="$(printf '%s\n' "${mons}" | awk '$2 == 0 {print}' | sort -k3,3n)"
+    [[ -n "${extra}" ]] || { echo "Nenhum monitor extra detectado (use --primary para incluir o principal)." >&2; return 1; }
+
+    local idx=0
+    local line name primary x y w h
+    while IFS= read -r line; do
+        [[ -n "${line}" ]] || continue
+        read -r name primary x y w h <<<"${line}"
+        local hw hh q cx cy
+        hw=$((w / 2))
+        hh=$((h / 2))
+        for q in 1 2 3 4; do
+            if [[ "${idx}" -ge "${count}" ]]; then
+                break 2
+            fi
+            case "${q}" in
+                1) cx=$((x + hw / 2));      cy=$((y + hh / 2)) ;;
+                2) cx=$((x + hw + hw / 2)); cy=$((y + hh / 2)) ;;
+                3) cx=$((x + hw / 2));      cy=$((y + hh + hh / 2)) ;;
+                4) cx=$((x + hw + hw / 2)); cy=$((y + hh + hh / 2)) ;;
+            esac
+            printf '%s %d %d %d %d %d\n' "M$(($(echo "${extra}" | grep -n "^${name}" | cut -d: -f1)))(${name})" "${q}" "${cx}" "${cy}" "${hw}" "${hh}"
+            idx=$((idx + 1))
+        done
+    done <<<"${extra}"
+}
+
 # Imprime o plano da grade: "<monitor> <q> <cx> <cy> <w> <h>" por linha, onde
 # cx,cy e o CENTRO do quadrante (alvo do move grosseiro) e w,h o quadrante.
 # Args: <include_primary:0|1> <only_csv>
@@ -289,6 +338,7 @@ function _hmvip_grid_cmd() {
 
     local include_primary=0 only_csv="" replace=0 dry_run=0
     local cmd_args=()
+    local slots_json=""
     while [ "$#" -gt 0 ]; do
         case "$1" in
             --primary|--all|--include-primary) include_primary=1 ;;
@@ -297,14 +347,53 @@ function _hmvip_grid_cmd() {
             --cmd)         cmd_args=(sh -c "${2:-}"); shift ;;
             --cmd=*)       cmd_args=(sh -c "${1#*=}") ;;
             --replace)     replace=1 ;;
+            --slots)       slots_json="${2:-}"; shift ;;
             layout|plan|dry-run|--dry-run) dry_run=1 ;;
             *) echo "Opcao desconhecida: $1" >&2; _hmvip_grid_usage; return 1 ;;
         esac
         shift
     done
 
-    local plan
-    plan="$(_hmvip_grid_plan "${include_primary}" "${only_csv}")" || return 1
+    local plan slots_titles=() slots_cmds=() slots_worktrees=()
+    if [ -n "${slots_json}" ]; then
+        # Modo --slots: plano customizado, um quadrante por slot.
+        plan="$(_hmvip_grid_plan_from_slots "${slots_json}")" || return 1
+        # Pre-carrega titulos, worktrees e comandos na mesma ordem do JSON.
+        local s_idx=0 s_title s_worktree s_slot
+        while IFS= read -r s_slot; do
+            s_title="$(python3 - "${slots_json}" "${s_idx}" <<'PY' 2>/dev/null
+import json, sys
+try:
+    arr = json.loads(sys.argv[1])
+    idx = int(sys.argv[2])
+    print(arr[idx].get('title', 'trabalho pendente'))
+except Exception:
+    print('trabalho pendente')
+PY
+)"
+            s_worktree="$(python3 - "${slots_json}" "${s_idx}" <<'PY' 2>/dev/null
+import json, sys
+try:
+    arr = json.loads(sys.argv[1])
+    idx = int(sys.argv[2])
+    print(arr[idx].get('worktree', ''))
+except Exception:
+    print('')
+PY
+)"
+            slots_titles+=("⚪ ${s_slot} | ${s_title}")
+            slots_worktrees+=("${s_worktree}")
+            slots_cmds+=(sh -c "cd ${s_worktree@Q} && (kimi --slot ${s_slot@Q}; exec bash)")
+            s_idx=$((s_idx + 1))
+        done <<<"$(python3 - "${slots_json}" <<'PY' 2>/dev/null
+import json, sys
+for item in json.loads(sys.argv[1]):
+    print(item.get('slot', ''))
+PY
+)"
+    else
+        plan="$(_hmvip_grid_plan "${include_primary}" "${only_csv}")" || return 1
+    fi
     if [ -z "${plan}" ]; then
         echo "Nenhum monitor selecionado (o principal fica livre por padrao; use --primary para inclui-lo)." >&2
         return 1
@@ -329,16 +418,31 @@ function _hmvip_grid_cmd() {
 
     local total=0 ok=0 line mon q cx cy w h
     local entries=()
+    local slot_idx=0
     total="$(printf '%s\n' "${plan}" | grep -c . || true)"
     echo "Abrindo ${total} janela(s) kitty em grade 2x2..."
     while IFS= read -r line; do
         [ -n "${line}" ] || continue
         read -r mon q cx cy w h <<<"${line}"
         _HMVIP_GRID_LAST_WID=""
-        if _hmvip_grid_open_one "hmvip ${mon} q${q}" "${cmd_args[@]}"; then
-            ok=$((ok + 1))
-            entries+=("${_HMVIP_GRID_LAST_WID}|${mon}|${q}|${cx}|${cy}|${w}|${h}")
+        local title="hmvip ${mon} q${q}"
+        local launch_cmd=()
+        if [ "${#slots_titles[@]}" -gt 0 ] && [ "${slot_idx}" -lt "${#slots_titles[@]}" ]; then
+            title="${slots_titles[${slot_idx}]}"
+            launch_cmd=("${slots_cmds[${slot_idx}]}")
         fi
+        if [ "${#launch_cmd[@]}" -gt 0 ]; then
+            if _hmvip_grid_open_one "${title}" "${launch_cmd[@]}"; then
+                ok=$((ok + 1))
+                entries+=("${_HMVIP_GRID_LAST_WID}|${mon}|${q}|${cx}|${cy}|${w}|${h}")
+            fi
+        else
+            if _hmvip_grid_open_one "${title}" "${cmd_args[@]}"; then
+                ok=$((ok + 1))
+                entries+=("${_HMVIP_GRID_LAST_WID}|${mon}|${q}|${cx}|${cy}|${w}|${h}")
+            fi
+        fi
+        slot_idx=$((slot_idx + 1))
     done <<<"${plan}"
     if [ "${ok}" -eq 0 ]; then
         echo "Nenhuma janela abriu." >&2

@@ -1,5 +1,28 @@
 # Changelog — agent-guard-core
 
+## 0.9.12 — `hmvip continuar-tudo` (ranking A+B + grade kitty)
+
+- `src/continue-all.sh`:
+  - Ranking dupla camada de slots com trabalho em andamento.
+  - Camada A: lease active + PID morto, PRs abertos de `ia-<slot>/*`, ou branch
+    `ia-<slot>/*` não released.
+  - Camada B: título da aba vem de `Próximo passo:` em
+    `.agent-guard/tasks/<slot>.md`; fallback para `tab_title`; último fallback
+    "trabalho pendente".
+  - Ordenação: notas primeiro, depois PRs abertos, depois atividade recente.
+  - Modo `--dry-run` imprime a fila sem abrir janelas.
+  - Slots com sessão viva são pulados (nunca adopt forçado).
+- `src/grid.sh`:
+  - Novo modo `--slots <json>`: abre uma janela kitty por slot, mapeando cada
+    um para um quadrante sequencial nos monitores extras.
+  - Título inicial: `⚪ <slot> | <título>`; comando: `kimi --slot <slot>`.
+- `bin/agent-guard`: subcomandos `continuar-tudo` e alias `ct`.
+- `.kiro/shell/hmvip.sh`: atalhos `hmvip continuar-tudo` / `hmvip ct`.
+- `tests/agent-guard/continue-all-test.sh`: fixture com 4 slots + notas,
+  valida inclusão/exclusão, títulos da nota, ordenação, dry-run e skip de slot
+  vivo.
+- `tests/agent-guard/shell-isolation-test.sh`: caso para `continuar-tudo --dry-run`.
+
 ## 0.9.10 — SessionEnd hook restaura o wrapper Kimi (janela do cron zerada)
 
 - `wrappers/kimi/hooks/agent-guard-session-end.sh`:
