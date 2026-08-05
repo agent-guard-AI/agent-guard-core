@@ -265,7 +265,7 @@ function _hmvip_grid_tile_quarter() {
     [ -n "${keysym}" ] || return 1
     _hmvip_grid_focus_click "${wid}" "${cx}" "${cy}"
     xdotool key --clearmodifiers "super+${keysym}" 2>/dev/null || true
-    sleep 0.7
+    sleep 1.0
     # Encaixe: centro da janela dentro do quadrante-alvo e tamanho >=
     # quadrante - 150px (gaps + paineis reduzem um pouco as dimensoes).
     local ax ay aw ah acx acy ex ey
@@ -289,6 +289,26 @@ function _hmvip_grid_geom() {
     w="$(printf '%s\n' "${g}" | sed -n 's/^WIDTH=//p')"
     h="$(printf '%s\n' "${g}" | sed -n 's/^HEIGHT=//p')"
     printf '%s %s %s %s' "${x:-0}" "${y:-0}" "${w:-0}" "${h:-0}"
+}
+
+# Posiciona uma janela em um quadrante EXATO sem focar, sem clicar e sem mover
+# o cursor do usuario. Remove estados maximizados primeiro, depois move e
+# redimensiona. Nao depende do Tiling Assistant, entao funciona em qualquer
+# ambiente X11 com xdotool.
+function _hmvip_grid_position_exact() {
+    local wid="$1" q="$2" cx="$3" cy="$4" qw="$5" qh="$6"
+    local x y
+    x=$((cx - qw / 2))
+    y=$((cy - qh / 2))
+    # Remove maximizado (vertical/horizontal/fullscreen) para que o redimensionamento
+    # e posicionamento manual funcione.
+    xdotool windowstate --remove MAXIMIZED_VERT "${wid}" 2>/dev/null || true
+    xdotool windowstate --remove MAXIMIZED_HORZ "${wid}" 2>/dev/null || true
+    xdotool windowstate --remove FULLSCREEN "${wid}" 2>/dev/null || true
+    # Pequena pausa para o window manager processar o unmaximize.
+    sleep 0.1
+    xdotool windowmove "${wid}" "${x}" "${y}" 2>/dev/null || true
+    xdotool windowsize "${wid}" "${qw}" "${qh}" 2>/dev/null || true
 }
 
 function _hmvip_grid_usage() {
@@ -383,7 +403,10 @@ PY
 )"
             slots_titles+=("⚪ ${s_slot} | ${s_title}")
             slots_worktrees+=("${s_worktree}")
-            slots_cmds+=(sh -c "cd ${s_worktree@Q} && (kimi --slot ${s_slot@Q}; exec bash)")
+            # Armazena como string unica para ser expandida via eval no loop de
+            # abertura. Isso evita que um array de 3 elementos (sh, -c, string)
+            # seja indexado incorretamente como se fosse um slot por elemento.
+            slots_cmds+=("sh -c \"cd ${s_worktree@Q} && (kimi --slot ${s_slot@Q}; exec bash)\"")
             s_idx=$((s_idx + 1))
         done <<<"$(python3 - "${slots_json}" <<'PY' 2>/dev/null
 import json, sys
@@ -429,7 +452,10 @@ PY
         local launch_cmd=()
         if [ "${#slots_titles[@]}" -gt 0 ] && [ "${slot_idx}" -lt "${#slots_titles[@]}" ]; then
             title="${slots_titles[${slot_idx}]}"
-            launch_cmd=("${slots_cmds[${slot_idx}]}")
+            # Expande a string unica do comando (ex: sh -c "cd '...' && (...)")
+            # em um array de argumentos. Os valores (worktree/slot) sao gerados
+            # pelo proprio script, entao o eval e controlado.
+            eval "launch_cmd=(${slots_cmds[${slot_idx}]})"
         fi
         if [ "${#launch_cmd[@]}" -gt 0 ]; then
             if _hmvip_grid_open_one "${title}" "${launch_cmd[@]}"; then
@@ -449,54 +475,25 @@ PY
         return 1
     fi
 
-    # Posicionamento: move grosseiro para o centro do quadrante (garante o
-    # monitor certo) + quarter-tiling nativo do Tiling Assistant.
-    sleep 1
+    # Posicionamento: coloca cada janela no quadrante exato sem focar, sem
+    # clicar e sem mover o cursor do usuario. Nao depende do Tiling Assistant.
+    sleep 0.5
     local entry wid
-    local ex ey
     for entry in "${entries[@]}"; do
         IFS='|' read -r wid mon q cx cy w h <<<"${entry}"
-        # Move grosseiro: canto superior-esquerdo = centro - metade do quadrante.
-        ex=$((cx - w / 2))
-        ey=$((cy - h / 2))
-        xdotool windowmove "${wid}" "${ex}" "${ey}" 2>/dev/null || true
-        xdotool windowsize "${wid}" "${w}" "${h}" 2>/dev/null || true
-        sleep 0.3
-        _hmvip_grid_focus_click "${wid}" "${cx}" "${cy}"
-        xdotool key --clearmodifiers "super+$(_hmvip_grid_tile_keysym "${q}")" 2>/dev/null || true
-        sleep 0.5
-    done
-    # Varredura de consistencia: janela com altura == quadrante cru nao foi
-    # tileada (o tile nativo aplica gaps e encolhe um pouco) — re-dispara.
-    local pass tiled ax ay aw ah
-    for pass in 1 2 3; do
-        local pending=0
-        for entry in "${entries[@]}"; do
-            IFS='|' read -r wid mon q cx cy w h <<<"${entry}"
-            read -r ax ay aw ah <<<"$(_hmvip_grid_geom "${wid}")"
-            if [ "${ah}" -ge "${h}" ]; then
-                pending=$((pending + 1))
-                _hmvip_grid_focus_click "${wid}" "${cx}" "${cy}"
-                xdotool key --clearmodifiers "super+$(_hmvip_grid_tile_keysym "${q}")" 2>/dev/null || true
-                sleep 0.5
-            fi
-        done
-        [ "${pending}" -eq 0 ] && break
+        _hmvip_grid_position_exact "${wid}" "${q}" "${cx}" "${cy}" "${w}" "${h}"
+        sleep 0.2
     done
     # Relatorio final.
-    local placed=0 tiled=0
+    local placed=0
     for entry in "${entries[@]}"; do
         IFS='|' read -r wid mon q cx cy w h <<<"${entry}"
+        local ax ay aw ah
         read -r ax ay aw ah <<<"$(_hmvip_grid_geom "${wid}")"
         placed=$((placed + 1))
-        if [ "${ah}" -lt "${h}" ]; then
-            tiled=$((tiled + 1))
-            echo "  ✔ ${mon} q${q} @ ${ax},${ay} ${aw}x${ah} (tile nativo)"
-        else
-            echo "  ⚠ ${mon} q${q} @ ${ax},${ay} ${aw}x${ah} (manual — tile nao pegou)"
-        fi
+        echo "  ✔ ${mon} q${q} @ ${ax},${ay} ${aw}x${ah}"
     done
-    echo "Pronto: ${placed}/${total} janela(s) posicionadas (${tiled} via tile nativo). Feche com: hmvip grid close"
+    echo "Pronto: ${placed}/${total} janela(s) posicionadas. Feche com: hmvip grid close"
     [ "${placed}" = "${total}" ] && return 0 || return 1
 }
 
