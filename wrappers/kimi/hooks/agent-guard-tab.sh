@@ -296,7 +296,74 @@ case "$(basename "${CWD}" 2>/dev/null)" in
         ;;
 esac
 
-if [ "${ACTION}" != "session-end" ]; then
+# ---------------------------------------------------------------------------
+# Replicar estado da tab nos campos tab_* do lease do agent-guard.
+# O cockpit unificado (hmvip status / hmvip tabs) le do lease, nao do arquivo
+# de sessao da tab, para nao depender de ~/.kimi-code/tab-sessions/ estar
+# acessivel no worktree correto.
+# ---------------------------------------------------------------------------
+_persist_tab_to_lease() {
+    local _identity="$1"
+    case "${_identity}" in
+        kimi[1-9]|kimi[1-9][0-9]|claude[1-9]|claude[1-9][0-9]|gemini[1-9]|gemini[1-9][0-9]|grok[1-9]|grok[1-9][0-9]) ;;
+        *) return 0 ;;
+    esac
+
+    local _repo_root
+    _repo_root="$(git -C "${CWD}" rev-parse --show-toplevel 2>/dev/null || true)"
+    [ -n "${_repo_root}" ] || return 0
+    local _init_stub="${_repo_root}/packages/agent-guard-core/src/init.sh"
+    [ -f "${_init_stub}" ] || return 0
+
+    AGENT_GUARD_FUNCTIONS_ONLY=1
+    # shellcheck source=/dev/null
+    source "${_init_stub}" >/dev/null 2>&1 || return 0
+
+    local _session_file
+    _session_file="$(_get_session_file "${_identity}" 2>/dev/null || true)"
+    [ -f "${_session_file}" ] || return 0
+    local _session_status
+    _session_status="$(_load_session_field "${_identity}" "status" 2>/dev/null || true)"
+    [ "${_session_status}" = "active" ] || return 0
+
+    _save_session_field "${_identity}" "tab_state" "${STATE}" >/dev/null 2>&1 || true
+    _save_session_field "${_identity}" "tab_title" "${TITLE_WORK}" >/dev/null 2>&1 || true
+    _save_session_field "${_identity}" "tab_bg" "${BG}" >/dev/null 2>&1 || true
+    _save_session_field "${_identity}" "tab_tty" "${TTY_NAME}" >/dev/null 2>&1 || true
+    _save_session_field "${_identity}" "tab_updated" "${NOW}" >/dev/null 2>&1 || true
+}
+
+_clear_tab_lease_fields() {
+    local _identity="$1"
+    case "${_identity}" in
+        kimi[1-9]|kimi[1-9][0-9]|claude[1-9]|claude[1-9][0-9]|gemini[1-9]|gemini[1-9][0-9]|grok[1-9]|grok[1-9][0-9]) ;;
+        *) return 0 ;;
+    esac
+
+    local _repo_root
+    _repo_root="$(git -C "${CWD}" rev-parse --show-toplevel 2>/dev/null || true)"
+    [ -n "${_repo_root}" ] || return 0
+    local _init_stub="${_repo_root}/packages/agent-guard-core/src/init.sh"
+    [ -f "${_init_stub}" ] || return 0
+
+    AGENT_GUARD_FUNCTIONS_ONLY=1
+    # shellcheck source=/dev/null
+    source "${_init_stub}" >/dev/null 2>&1 || return 0
+
+    local _session_file
+    _session_file="$(_get_session_file "${_identity}" 2>/dev/null || true)"
+    [ -f "${_session_file}" ] || return 0
+
+    _save_session_field "${_identity}" "tab_state" "" >/dev/null 2>&1 || true
+    _save_session_field "${_identity}" "tab_title" "" >/dev/null 2>&1 || true
+    _save_session_field "${_identity}" "tab_bg" "" >/dev/null 2>&1 || true
+    _save_session_field "${_identity}" "tab_tty" "" >/dev/null 2>&1 || true
+    _save_session_field "${_identity}" "tab_updated" "" >/dev/null 2>&1 || true
+}
+
+if [ "${ACTION}" = "session-end" ]; then
+    _clear_tab_lease_fields "${SLOT}"
+elif [ "${ACTION}" != "session-end" ]; then
     TMP="${STATE_FILE}.tmp.$$"
     if command -v jq >/dev/null 2>&1; then
         jq -n \
@@ -338,6 +405,11 @@ if [ -f "${TITLE_FILE}" ]; then
 fi
 [ -z "${TITLE_WORK}" ] && TITLE_WORK="$(_sanitize_title "$(git -C "${CWD}" branch --show-current 2>/dev/null | awk -F/ '{print $NF}')")"
 [ -z "${TITLE_WORK}" ] && TITLE_WORK="livre"
+
+# Replicar titulo final no lease para o cockpit unificado.
+if [ "${ACTION}" != "session-end" ]; then
+    _persist_tab_to_lease "${SLOT}"
+fi
 
 if [ "${ACTION}" = "session-end" ]; then
     FINAL_TITLE="${SLOT}${SEPARATOR}livre"
