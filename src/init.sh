@@ -136,6 +136,16 @@ if [[ -f "${JOURNAL_SCRIPT}" ]]; then
 fi
 
 # ---------------------------------------------------------------------------
+# 1.6.1 Load release helpers (global scope)
+# ---------------------------------------------------------------------------
+# These functions must be available even when AGENT_GUARD_FUNCTIONS_ONLY=1,
+# because wrappers/kimi/hooks/agent-guard-session-end.sh invokes them.
+RELEASE_HELPERS_SCRIPT="${SCRIPT_DIR}/release-helpers.sh"
+if [[ -f "${RELEASE_HELPERS_SCRIPT}" ]]; then
+    source "${RELEASE_HELPERS_SCRIPT}"
+fi
+
+# ---------------------------------------------------------------------------
 # 1.5. Ensure Kimi CLI wrapper is in place
 # ---------------------------------------------------------------------------
 # The wrapper is the entrypoint that redirects sessions to isolated worktrees.
@@ -1841,43 +1851,11 @@ while [[ $# -gt 0 ]]; do
 done
 
 # ---------------------------------------------------------------------------
-# Helper: check whether the current branch belongs to the agent identity that
-# owns this worktree. This allows release directly from a task branch without
-# forcing a checkout to develop, which is impossible when develop is already
-# checked out in another worktree (e.g. the main repository).
-_branch_is_current_agent_task() {
-    local worktree_path="$1"
-    local current_branch
-    current_branch="$(git -C "${worktree_path}" branch --show-current 2>/dev/null || echo "")"
-    local wt_name identity expected_prefix
-    wt_name="$(basename "${worktree_path}")"
-    identity="$(_detect_identity_from_worktree_name "${wt_name}" | awk '{print $1 $2}')"
-    [[ -n "${identity}" ]] || return 1
-    expected_prefix="ia-${identity}/"
-    [[ "${current_branch}" == "${expected_prefix}"* ]]
-}
-
-# ---------------------------------------------------------------------------
-# Helper: check whether the worktree is parked on its neutral post-release
-# branch (_released/<identity>). Release switches the worktree to this branch
-# at the end, so a second --release must be accepted as an idempotent no-op
-# instead of failing validation.
-# ---------------------------------------------------------------------------
-_branch_is_neutral_released() {
-    local worktree_path="$1"
-    local current_branch
-    current_branch="$(git -C "${worktree_path}" branch --show-current 2>/dev/null || echo "")"
-    local wt_name identity
-    wt_name="$(basename "${worktree_path}")"
-    identity="$(_detect_identity_from_worktree_name "${wt_name}" | awk '{print $1 $2}')"
-    [[ -n "${identity}" ]] || return 1
-    [[ "${current_branch}" == "_released/${identity}" ]]
-}
-
-# ---------------------------------------------------------------------------
 # Helper: check whether the current branch belongs to the identity that owns
 # the worktree, or is a safe base branch (develop, main, etc.). Returns 1 when
 # the worktree is on another agent's task/neutral branch.
+# (_branch_is_current_agent_task and _branch_is_neutral_released live in
+# release-helpers.sh so they are available with AGENT_GUARD_FUNCTIONS_ONLY=1.)
 # ---------------------------------------------------------------------------
 _branch_belongs_to_identity_or_base() {
     local worktree_path="$1"
@@ -1910,253 +1888,6 @@ _branch_belongs_to_identity_or_base() {
     return 1
 }
 
-# ---------------------------------------------------------------------------
-# Helper: validate worktree is in a neutral state before release
-# ---------------------------------------------------------------------------
-_validate_worktree_release_ready() {
-    local worktree_path="$1"
-
-    if [[ -z "${worktree_path}" ]]; then
-        echo "❌ Cannot determine worktree path." >&2
-        return 1
-    fi
-
-    if [[ ! -e "${worktree_path}/.git" ]]; then
-        echo "❌ Worktree '${worktree_path}' does not appear to be a git worktree." >&2
-        return 1
-    fi
-
-    local current_branch
-    current_branch="$(git -C "${worktree_path}" branch --show-current 2>/dev/null || echo "")"
-    if [[ "${current_branch}" != "develop" ]] && ! _branch_is_current_agent_task "${worktree_path}" && ! _branch_is_neutral_released "${worktree_path}"; then
-        echo "" >&2
-        echo "❌❌❌ ERROR: WORKTREE NOT RELEASABLE ❌❌❌" >&2
-        echo "" >&2
-        echo "   Current branch: ${current_branch:-<detached>}" >&2
-        echo "   Release is only allowed when the worktree is on 'develop'," >&2
-        echo "   on its own agent task branch (ia-<identity>/...), or on its" >&2
-        echo "   neutral '_released/<identity>' branch (release is idempotent)." >&2
-        echo "" >&2
-        echo "   Required actions before release:" >&2
-        echo "     1. Commit or stash any unfinished work on your task branch." >&2
-        echo "     2. Push your branch and ensure PR is open/merged." >&2
-        echo "     3. If the branch was already merged via squash, release directly" >&2
-        echo "        from the task branch — do not force a checkout to develop." >&2
-        echo "" >&2
-        return 1
-    fi
-
-    local dirty_files
-    dirty_files="$(git -C "${worktree_path}" status --porcelain 2>/dev/null || true)"
-    if [[ -n "${dirty_files}" ]]; then
-        echo "" >&2
-        echo "❌❌❌ ERROR: WORKING TREE DIRTY ❌❌❌" >&2
-        echo "" >&2
-        echo "${dirty_files}" | sed 's/^/   /' >&2
-        echo "" >&2
-        echo "   Commit, stash, or remove these changes before releasing." >&2
-        echo "" >&2
-        return 1
-    fi
-
-    local stash_count
-    # Stashes sao globais ao repo: so bloqueiam o release os que pertencem
-    # a ESTA identidade (criados em branch ia-<identity>/... ou na branch
-    # atual). Stash de outro agente vivo nao pode travar este slot
-    # (incidente 2026-07-12: stash do kimi2 bloqueou release de todos).
-    local wt_name identity
-    wt_name="$(basename "${worktree_path}")"
-    identity="$(_detect_identity_from_worktree_name "${wt_name}" | awk '{print $1 $2}')"
-    if [[ -n "${identity}" ]]; then
-        stash_count="$(git -C "${worktree_path}" stash list 2>/dev/null | grep -cE "^stash@\{[0-9]+\}: On (ia-${identity}/|${current_branch}:)" || true)"
-    else
-        stash_count="$(git -C "${worktree_path}" stash list 2>/dev/null | grep -c "On ${current_branch}:" || true)"
-    fi
-    if [[ "${stash_count}" -gt 0 ]]; then
-        echo "" >&2
-        echo "❌❌❌ ERROR: WORKTREE HAS STASHES ❌❌❌" >&2
-        echo "" >&2
-        if [[ -n "${identity}" ]]; then
-            git -C "${worktree_path}" stash list 2>/dev/null | grep -E "^stash@\{[0-9]+\}: On (ia-${identity}/|${current_branch}:)" | sed 's/^/   /' >&2
-        else
-            git -C "${worktree_path}" stash list 2>/dev/null | grep "On ${current_branch}:" | sed 's/^/   /' >&2
-        fi
-        echo "" >&2
-        echo "   Apply, drop, or move these stashes before releasing." >&2
-        echo "   Stash is not a trash can — inspect with: git stash show -p stash@{<n>}" >&2
-        echo "" >&2
-        return 1
-    fi
-
-    # Aviso nao-bloqueante: stashes de OUTRAS identidades presentes no repo
-    local foreign_count
-    foreign_count="$(git -C "${worktree_path}" stash list 2>/dev/null | grep -c '^stash@{' || true)"
-    if [[ "${foreign_count}" -gt 0 ]]; then
-        echo "ℹ️  ${foreign_count} stash(es) de outra(s) identidade(s) no repo — nao bloqueiam este release." >&2
-    fi
-
-    return 0
-}
-
-# ---------------------------------------------------------------------------
-# Helper: pending-work guard (protocolo 2026-07-17)
-#
-# Finalizar uma tarefa/spec/correção NÃO libera o slot: na maioria das
-# sessões ainda há PRs em andamento (CI, merge queue, correções), e a IA
-# estava liberando antecipadamente. O release agora verifica PRs abertos da
-# identidade (branches ia-<identity>/*) e:
-#   - sem PRs abertos: segue normalmente;
-#   - com PRs abertos + TTY (humano): pergunta explicitamente [y/N];
-#   - com PRs abertos + não-TTY (IA): BLOQUEIA e exige --force, que só deve
-#     ser usado após autorização explícita do usuário;
-#   - gh indisponível/erro de rede: fail-open com aviso (guard é proteção
-#     contra esquecimento, não trava de disponibilidade).
-# ---------------------------------------------------------------------------
-_release_pending_work_guard() {
-    local identity="$1"
-    local worktree_path="$2"
-    local force="${3:-false}"
-
-    if ! command -v gh >/dev/null 2>&1; then
-        echo "⚠️  gh CLI indisponível — verificação de PRs abertos pulada (release segue)." >&2
-        return 0
-    fi
-
-    local pr_lines
-    if ! pr_lines="$(cd "${worktree_path}" 2>/dev/null && gh pr list --state open --limit 100 \
-        --json number,title,headRefName \
-        --jq ".[] | select(.headRefName | startswith(\"ia-${identity}/\")) | \"#\\(.number) \\(.headRefName) — \\(.title)\"" 2>/dev/null)"; then
-        echo "⚠️  Falha ao consultar PRs abertos via gh — verificação pulada (release segue)." >&2
-        return 0
-    fi
-
-    local pr_count=0
-    if [[ -n "${pr_lines}" ]]; then
-        pr_count="$(printf '%s\n' "${pr_lines}" | grep -c . || true)"
-    fi
-
-    if [[ "${pr_count}" -eq 0 ]]; then
-        return 0
-    fi
-
-    if [[ "${force}" == "true" ]]; then
-        echo "⚠️  Liberando com ${pr_count} PR(s) aberto(s) de ia-${identity}/* (--force; exige autorização prévia do usuário):" >&2
-        printf '%s\n' "${pr_lines}" | sed 's/^/   /' >&2
-        return 0
-    fi
-
-    # Humano em TTY: pergunta explícita em vez de bloqueio seco.
-    if [[ -t 0 ]]; then
-        echo "" >&2
-        echo "⚠️  ${pr_count} PR(s) aberto(s) de ia-${identity}/*:" >&2
-        printf '%s\n' "${pr_lines}" | sed 's/^/   /' >&2
-        local answer=""
-        read -r -p "   Liberar o slot mesmo assim? [y/N] " answer || answer=""
-        if [[ "${answer}" =~ ^[yY]([eE][sS])?$ ]]; then
-            return 0
-        fi
-        echo "🔒 Release cancelado pelo usuário." >&2
-        return 1
-    fi
-
-    echo "" >&2
-    echo "❌❌❌ RELEASE BLOQUEADO: ${pr_count} PR(s) aberto(s) de ia-${identity}/* ❌❌❌" >&2
-    echo "" >&2
-    printf '%s\n' "${pr_lines}" | sed 's/^/   /' >&2
-    echo "" >&2
-    echo "   Protocolo (2026-07-17): finalizar tarefa/spec/correção NÃO libera o" >&2
-    echo "   slot — a maioria das sessões ainda tem PRs em andamento (CI, merge" >&2
-    echo "   queue, correções). Antes de liberar:" >&2
-    echo "     1. Apresente os PRs acima ao usuário." >&2
-    echo "     2. Só prossiga com autorização explícita dele, usando:" >&2
-    echo "        source ${AGENT_GUARD_INIT_NAME:-.hmvip-agent-init} --release --force" >&2
-    echo "" >&2
-    return 1
-}
-
-# ---------------------------------------------------------------------------
-# Helper: attempt to release a stale session only when it is safe.
-# Safe means: worktree is release-ready and there are no open PRs.
-# Returns 0 if released, 1 otherwise (without emitting blocking errors).
-# ---------------------------------------------------------------------------
-_auto_release_if_safe() {
-    local identity="$1"
-    local worktree_path="$2"
-    local reason="${3:-stale}"
-
-    if ! _validate_worktree_release_ready "${worktree_path}" >/dev/null 2>&1; then
-        return 1
-    fi
-
-    if ! _release_pending_work_guard "${identity}" "${worktree_path}" "false" >/dev/null 2>&1; then
-        return 1
-    fi
-
-    _clear_session "${identity}"
-
-    if command -v _journal_release >/dev/null 2>&1; then
-        _journal_release
-    fi
-
-    local neutral_branch="_released/${identity}"
-    local base_ref=""
-    if git -C "${worktree_path}" rev-parse --verify --quiet "origin/develop" >/dev/null 2>&1; then
-        base_ref="origin/develop"
-    elif git -C "${worktree_path}" rev-parse --verify --quiet "develop" >/dev/null 2>&1; then
-        base_ref="develop"
-    fi
-
-    if [[ -n "${base_ref}" ]]; then
-        git -C "${worktree_path}" checkout -B "${neutral_branch}" "${base_ref}" >/dev/null 2>&1 || \
-            git -C "${worktree_path}" checkout --detach "${base_ref}" >/dev/null 2>&1 || true
-    fi
-
-    echo "🔓 Auto-released ${identity} (${reason})"
-    return 0
-}
-
-# ---------------------------------------------------------------------------
-# Helper: scan all slots and auto-release stale ones that are safe to release.
-# ---------------------------------------------------------------------------
-_cleanup_stale_sessions() {
-    local identity_list prefix i identity worktree_path
-    local released=0 skipped=0
-
-    identity_list="$(bash "${AGENT_GUARD_CONFIG_BIN}" keys identities 2>/dev/null || true)"
-    for prefix in ${identity_list}; do
-        [[ -z "${prefix}" ]] && continue
-        local base_slots max_slots
-        base_slots="$(_guard_get "identities.${prefix}.slots" 2>/dev/null || echo "0")"
-        max_slots="$(_guard_get "identities.${prefix}.max_slots" "${base_slots}" 2>/dev/null || echo "${base_slots}")"
-        for i in $(seq 1 "${max_slots}"); do
-            identity="${prefix}${i}"
-            worktree_path="$(_get_worktree_path "${identity}")"
-
-            local sess_status sess_pid
-            sess_status="$(_load_session_field "${identity}" "status")"
-            sess_pid="$(_load_session_field "${identity}" "pid")"
-
-            [[ "${sess_status}" == "active" ]] || continue
-            _is_pid_alive "${sess_pid}" || continue
-            # Stale (24h+) sessions and shell-pinned leases (agent died, stray
-            # non-agent shell survived, heartbeat past grace) are eligible.
-            if ! _is_session_stale "${identity}" && ! _lease_is_shell_pinned "${identity}"; then
-                continue
-            fi
-
-            if _auto_release_if_safe "${identity}" "${worktree_path}" "stale"; then
-                released=$((released + 1))
-            else
-                echo "🔒 ${identity} is stale but cannot be auto-released (dirty worktree or open PRs)." >&2
-                skipped=$((skipped + 1))
-            fi
-        done
-    done
-
-    echo ""
-    echo "🧹 Cleanup complete: ${released} released, ${skipped} skipped."
-    return 0 2>/dev/null || exit 0
-}
 
 # ---------------------------------------------------------------------------
 # Orphan Rescue Protocol helpers
@@ -2487,29 +2218,39 @@ if [[ "${MODE}" == "release" ]]; then
         return 1 2>/dev/null || exit 1
     fi
 
+    # ATOMIC RELEASE: move the worktree to the neutral branch BEFORE clearing
+    # the session. If the checkout fails, keep the session active and report the
+    # failure so the slot cannot be silently left free with active work.
+    NEUTRAL_BRANCH="_released/${CURRENT_IDENTITY}"
+    if ! _move_worktree_to_neutral_branch "${CURRENT_WORKTREE}" "${CURRENT_IDENTITY}"; then
+        echo ""
+        echo "❌❌❌ RELEASE FAILED: worktree could not be moved to ${NEUTRAL_BRANCH} ❌❌❌" >&2
+        echo "" >&2
+        echo "   The session was NOT released. Investigate the git state of:" >&2
+        echo "     ${CURRENT_WORKTREE}" >&2
+        echo "" >&2
+        echo "   Common causes:" >&2
+        echo "     - Conflicting branch checkout (another worktree holds the branch)." >&2
+        echo "     - Missing 'origin/develop' or 'develop' ref." >&2
+        echo "     - Files locked or permissions issues in the worktree." >&2
+        echo "" >&2
+        if _blocked_event_notifications_enabled "journal" && command -v _journal_write_event >/dev/null 2>&1; then
+            local payload current_branch_for_log
+            current_branch_for_log="$(git -C "${CURRENT_WORKTREE}" branch --show-current 2>/dev/null || echo "")"
+            payload="$(${AG_PYTHON} -c "
+import json
+print(json.dumps({'reason': 'release', 'blockers': ['neutral_branch_failed'], 'worktree': '${CURRENT_WORKTREE}', 'branch': '${current_branch_for_log}'}))
+" 2>/dev/null || echo \"{\"reason\": \"release\", \"blockers\": [\"neutral_branch_failed\"]}\")"
+            _journal_write_event "release_failed" "${payload}" "${MAIN_REPO:-${_AG_REPO_ROOT:-}}"
+        fi
+        return 1 2>/dev/null || exit 1
+    fi
+
     _clear_session "${CURRENT_IDENTITY}"
 
     # Record release in session journal for crash recovery.
     if command -v _journal_release >/dev/null 2>&1; then
         _journal_release
-    fi
-
-    # After releasing the lease, move the worktree to a neutral branch so
-    # that 'develop' is not held by an idle worktree. Git does not allow the
-    # same branch to be checked out in multiple worktrees; leaving 'develop'
-    # behind blocks other agents from releasing their sessions.
-    NEUTRAL_BRANCH="_released/${CURRENT_IDENTITY}"
-    BASE_REF=""
-    if git -C "${CURRENT_WORKTREE}" rev-parse --verify --quiet "origin/develop" >/dev/null 2>&1; then
-        BASE_REF="origin/develop"
-    elif git -C "${CURRENT_WORKTREE}" rev-parse --verify --quiet "develop" >/dev/null 2>&1; then
-        BASE_REF="develop"
-    fi
-
-    if [[ -n "${BASE_REF}" ]]; then
-        if ! git -C "${CURRENT_WORKTREE}" checkout -B "${NEUTRAL_BRANCH}" "${BASE_REF}" >/dev/null 2>&1; then
-            git -C "${CURRENT_WORKTREE}" checkout --detach "${BASE_REF}" >/dev/null 2>&1 || true
-        fi
     fi
 
     echo "🔓 Released session for ${CURRENT_IDENTITY}"
@@ -2566,6 +2307,22 @@ if [[ "${MODE}" == "status" ]]; then
 
             if [[ "${_rec_health}" != "-" && "${_rec_health}" != "live" ]]; then
                 any_drift="${any_drift}\n  ${_rec_drift:-drift}: ${identity} -> ${_rec_branch:-<no branch>}"
+
+                # Audit structural drifts to the journal so admins can detect
+                # slots that were released while still holding task branches.
+                if _blocked_event_notifications_enabled "journal" && command -v _journal_write_event >/dev/null 2>&1; then
+                    local drift_payload
+                    drift_payload="$(${AG_PYTHON} -c "
+import json
+print(json.dumps({
+    'health': '${_rec_health}',
+    'drift': '${_rec_drift}',
+    'branch': '${_rec_branch}',
+    'worktree': '${worktree_path}',
+    'status': '${_rec_status}'
+}))" 2>/dev/null || echo \"{\"health\": \"${_rec_health}\", \"drift\": \"${_rec_drift}\"}\")"
+                    _journal_write_event "slot_drift_detected" "${drift_payload}" "${_AG_REPO_ROOT:-${MAIN_REPO}}"
+                fi
             fi
         done
     done
@@ -2579,6 +2336,19 @@ if [[ "${MODE}" == "status" ]]; then
         echo "⚠️  Shared PID detected (one IDE process holding multiple slots):"
         echo "   ${shared_pids}"
         echo ""
+        if _blocked_event_notifications_enabled "journal" && command -v _journal_write_event >/dev/null 2>&1; then
+            local payload
+            payload="$(${AG_PYTHON} -c "
+import json, sys
+pairs = [p.strip() for p in sys.argv[1].split(',') if p.strip()]
+ids = []
+for p in pairs:
+    parts = p.split('&')
+    ids.extend([x.strip() for x in parts if x.strip()])
+print(json.dumps({'identities': ids, 'pairs': pairs}))
+" "${shared_pids}" 2>/dev/null || echo \"{\"identities\": [], \"pairs\": []}\")"
+            _journal_write_event "shared_pid_detected" "${payload}" "${_AG_REPO_ROOT:-${MAIN_REPO}}"
+        fi
     fi
 
     if [[ -n "${any_drift}" ]]; then

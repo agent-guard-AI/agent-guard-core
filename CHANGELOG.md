@@ -1,5 +1,82 @@
 # Changelog — agent-guard-core
 
+## 0.10.2 — Release Atomicity & Structural Drift Reporting
+
+Fecha o gap onde slots podiam ser marcados como `free` enquanto o worktree
+permanecia em uma task branch (liberação não-atômica), e adiciona visibilidade
+externa para drifts estruturais detectados pelo `--status`.
+
+- `src/release-helpers.sh`:
+  - `_move_worktree_to_neutral_branch()` — novo helper que move o worktree para
+    `_released/<identity>` e retorna sucesso/falha, sem limpar a sessão.
+  - `_auto_release_if_safe()` agora move o worktree ANTES de `_clear_session()`;
+    se o checkout falhar, a sessão permanece ativa e um evento
+    `auto_release_blocked` com blocker `neutral_branch_failed` é registrado.
+- `src/init.sh`:
+  - `--release` move o worktree para `_released/<identity>` ANTES de limpar a
+    sessão. Se o checkout falhar, o release aborta, a sessão continua ativa e um
+    evento `release_failed` é gravado no journal.
+  - `--status` registra eventos `slot_drift_detected` no journal quando encontra
+    slots liberados com trabalho ativo, branch mismatch ou outro health não-live.
+- `.github/workflows/agent-guard-drift-reporter.yml` (novo):
+  - Reporter 2×/dia que varre o journal por `slot_drift_detected` e
+    `release_failed`, abrindo/comentando issue `guardian` com os slots em drift.
+- `.github/workflows/agent-guard-stale-blocked-reporter.yml`:
+  - Agora também reage a eventos `release_failed`.
+- `wrappers/amp/wrapper.sh`:
+  - Watcher em background agora tenta auto-release seguro ao final da sessão Amp,
+    registrando `session_end_blocked` quando o worktree está sujo ou há PRs abertos.
+    Fecha o gap de `/exit`/`/quit` no Amp Code CLI.
+- Testes:
+  - `tests/agent-guard/agent-guard-release-atomicity-test.sh` (novo): valida
+    que o worktree é movido antes da limpeza da sessão e que uma falha de
+    checkout preserva a sessão.
+
+## 0.10.1 — Blocked Release Visibility (auditoria de slots que não liberam)
+
+Fecha gaps onde `/exit`/`/quit`, `--cleanup-stale` ou falta do `gh` deixavam
+slots presos sem notificar o admin.
+
+- `src/release-helpers.sh` (novo):
+  - Helpers globais usados por release, stale cleanup, orphan rescue e pelo hook
+    `SessionEnd` do Kimi, disponíveis mesmo com `AGENT_GUARD_FUNCTIONS_ONLY=1`.
+  - `_note_slot_event()` — append estruturado em `.agent-guard/tasks/<slot>.md`.
+  - `_blocked_event_notifications_enabled()` — lê a config
+    `session.blocked_event_notifications`.
+  - `_worktree_release_blockers()` — retorna a lista de bloqueios de liberação
+    de forma silenciosa (reusa a lógica das guards existentes).
+  - `_branch_is_current_agent_task()` e `_branch_is_neutral_released()` migrados
+    para cá para ficarem acessíveis no `SessionEnd` hook.
+  - `_auto_release_if_safe()` registra eventos `session_end_blocked` /
+    `stale_cleanup_blocked` no journal e na nota do slot quando não consegue
+    liberar, mantendo o comportamento silencioso no terminal para não bloquear
+    o shutdown do Kimi.
+  - `_release_pending_work_guard()` registra `pr_guard_skipped` no journal
+    quando `gh` está indisponível ou a consulta falha, preservando o
+    fail-open por disponibilidade.
+- `src/init.sh`:
+  - Sourcia `src/release-helpers.sh` no escopo global.
+  - `--status` registra `shared_pid_detected` no journal quando um mesmo PID
+    de IDE detém múltiplos slots.
+- `agent-guard.yaml` + `agent-guard.yaml.example`:
+  - Nova seção `session.blocked_event_notifications` com `enabled`, `journal`
+    e `slot_note` (todos default `true`).
+- `wrappers/kimi/hooks/agent-guard-session-end.sh`:
+  - Passa evento `session_end_blocked` para `_auto_release_if_safe`.
+- `.github/workflows/agent-guard-stale-blocked-reporter.yml` (novo):
+  - Reporter diário que varre o journal e abre/comenta issue `guardian` com
+    slots bloqueados nas últimas 24h.
+- `.github/workflows/agent-guard-orphan-sweep.yml`:
+  - Adicionado job manual `rescue` que executa `orphan-sweep --auto` via
+    `workflow_dispatch` input `run_rescue`.
+- Testes:
+  - `tests/agent-guard/agent-guard-stale-cleanup-test.sh`: valida journal e
+    nota do slot para `stale_cleanup_blocked`.
+  - `tests/agent-guard/agent-guard-session-end-blocked-test.sh` (novo):
+    valida `session_end_blocked` ao sair com worktree suja.
+  - `tests/agent-guard/agent-guard-pr-guard-failopen-test.sh` (novo):
+    valida `pr_guard_skipped` quando `gh` está ausente.
+
 ## 0.10.0 — Amp CLI Wrapper (Sourcegraph)
 
 - **Novo wrapper**: `wrappers/amp/wrapper.sh` — isolamento automático para o
