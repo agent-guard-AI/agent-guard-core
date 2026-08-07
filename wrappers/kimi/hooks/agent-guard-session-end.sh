@@ -57,8 +57,10 @@ function _ag_session_end_main() {
     worktree_path="$(_get_worktree_path "${identity}" 2>/dev/null || true)"
     [[ -n "${worktree_path}" ]] || return 0
 
-    # Only auto-release when safe; failures are silent to avoid blocking Kimi shutdown.
-    _auto_release_if_safe "${identity}" "${worktree_path}" "session-end" >/dev/null 2>&1 || true
+    # Only auto-release when safe; failures are silent to avoid blocking Kimi shutdown,
+    # but _auto_release_if_safe now records audit events in the session journal and in
+    # the slot task note so blocked slots are visible to admins.
+    _auto_release_if_safe "${identity}" "${worktree_path}" "session-end" "session_end_blocked" >/dev/null 2>&1 || true
 
     # Clear tab state from the lease even if the slot could not be released
     # (dirty worktree / open PRs). The cockpit reads tab_* from the lease.

@@ -1002,6 +1002,30 @@ if [[ -f "${_ag_session_trace_script}" && -n "${_AG_WORKTREE:-}" && -n "${_AG_ID
                 fi
             done
             _trace_checkpoint "final checkpoint after amp session ended" >/dev/null 2>&1 || true
+
+            # Best-effort auto-release when the Amp session ends. Mirrors the
+            # Kimi SessionEnd hook: only releases when safe, and records audit
+            # events when blocked so slots do not stay pinned silently.
+            local ag_init_stub="${_AG_INIT_SCRIPT:-}"
+            if [[ -z "${ag_init_stub}" && -n "${_AG_REPO_ROOT:-}" && -n "${_AG_INIT_SCRIPT_NAME:-}" ]]; then
+                ag_init_stub="${_AG_REPO_ROOT}/${_AG_INIT_SCRIPT_NAME}"
+            fi
+            if [[ -n "${ag_init_stub}" && -f "${ag_init_stub}" && -n "${_AG_WORKTREE:-}" ]]; then
+                AGENT_GUARD_FUNCTIONS_ONLY=1
+                if source "${ag_init_stub}" >/dev/null 2>&1; then
+                    local amp_worktree_name amp_identity
+                    amp_worktree_name="$(basename "${_AG_WORKTREE}" 2>/dev/null || true)"
+                    amp_identity="$(_detect_identity_from_worktree_name "${amp_worktree_name}" 2>/dev/null | awk '{print $1 $2}' || true)"
+                    if [[ -n "${amp_identity}" ]]; then
+                        local amp_session_status amp_worktree_path
+                        amp_session_status="$(_load_session_field "${amp_identity}" "status" 2>/dev/null || true)"
+                        if [[ "${amp_session_status}" == "active" ]]; then
+                            amp_worktree_path="$(_get_worktree_path "${amp_identity}" 2>/dev/null || true)"
+                            _auto_release_if_safe "${amp_identity}" "${amp_worktree_path}" "session-end" "session_end_blocked" >/dev/null 2>&1 || true
+                        fi
+                    fi
+                fi
+            fi
         ) </dev/null >/dev/null 2>&1 &
         disown 2>/dev/null || true
     fi

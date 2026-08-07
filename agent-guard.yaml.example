@@ -72,6 +72,18 @@ journal:
   path: .agent-guard/journal/agent-guard.jsonl
   retention_days: 90
 
+session:
+  stale_threshold_hours: 24
+  auto_release_stale: true
+  orphan_rescue:
+    enabled: true
+    ttl_days: 7
+    workflow_auto: false
+  blocked_event_notifications:
+    enabled: true
+    journal: true
+    slot_note: true
+
 wrappers:
   kimi:
     bin_dir: /home/user/.kimi-code/bin
