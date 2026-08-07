@@ -43,6 +43,13 @@ identities:
     worktree_prefix: myproject-ia-grok
     author_email: agent-grok{n}@example.dev
     author_name: MyProject Grok{n} Agent
+  amp:
+    slots: 3
+    max_slots: 10
+    auto_expand: true
+    worktree_prefix: myproject-ia-amp
+    author_email: agent-amp{n}@example.dev
+    author_name: MyProject Amp{n} Agent
 
 git:
   protected_branches:
@@ -70,3 +77,8 @@ wrappers:
     bin_dir: /home/user/.kimi-code/bin
     real_bin: kimi.real
     default_role: ia-a
+  amp:
+    bin_dir: /home/user/.local/hmvip/bin
+    real_bin_path: /home/user/.amp/bin/amp
+    default_role: ia-a
+    identity_prefix: amp

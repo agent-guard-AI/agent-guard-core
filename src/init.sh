@@ -175,6 +175,44 @@ _ensure_kimi_wrapper() {
 }
 
 # ---------------------------------------------------------------------------
+# 1.5b. Ensure Amp CLI wrapper is in place
+# ---------------------------------------------------------------------------
+# Same pattern as _ensure_kimi_wrapper but for the Amp CLI.
+# Amp's wrapper lives at ~/.local/hmvip/bin/amp (a stable directory that
+# Amp's self-updater does not touch), so recovery is simpler — we only need
+# to ensure the wrapper file exists and is current.
+_ensure_amp_wrapper() {
+    local package_root
+    package_root="$(_guard_get_str "paths.package_root" "packages/agent-guard-core")"
+
+    local amp_bin_dir
+    amp_bin_dir="$(_guard_get_str "wrappers.amp.bin_dir" "${HOME}/.local/hmvip/bin")"
+    local amp_bin="${amp_bin_dir}/amp"
+    local recovery=""
+
+    # Recovery script shipped with the agent-guard-core package.
+    local package_recovery="${_AG_REPO_ROOT}/${package_root}/wrappers/amp/recovery.sh"
+    if [[ -f "${package_recovery}" ]]; then
+        recovery="${package_recovery}"
+    fi
+
+    [[ -z "${recovery}" ]] && return 0
+
+    # If amp is already the wrapper, nothing to do.
+    if [[ -f "${amp_bin}" ]] && head -n 5 "${amp_bin}" 2>/dev/null | grep -q "Agent Guard — Amp CLI Wrapper"; then
+        return 0
+    fi
+
+    echo "🛡️  Agent Guard: Amp wrapper missing; attempting recovery..." >&2
+    if bash "${recovery}" --repo-root "${_AG_REPO_ROOT}" >/tmp/ag-amp-wrapper-recovery.log 2>&1; then
+        echo "✅ Amp wrapper recovered successfully." >&2
+    else
+        echo "⚠️  Amp wrapper recovery failed. Log: /tmp/ag-amp-wrapper-recovery.log" >&2
+        echo "   Amp isolation may be compromised; restore the wrapper manually." >&2
+    fi
+}
+
+# ---------------------------------------------------------------------------
 # 2. Helper: read values from agent-guard.yaml (SSOT)
 # ---------------------------------------------------------------------------
 # Cache the parsed config in memory to avoid spawning agent-guard-config
@@ -280,6 +318,9 @@ _detect_identity_from_worktree_name() {
 
 _ensure_kimi_wrapper
 unset -f _ensure_kimi_wrapper
+
+_ensure_amp_wrapper
+unset -f _ensure_amp_wrapper
 
 MAIN_REPO=$(_guard_get_str "paths.main_repo" "")
 if [[ -z "${MAIN_REPO}" ]]; then

@@ -16,7 +16,9 @@
 #   --skip-hooks          Do not install Git hooks
 #   --install-wrapper     Install the invasive Kimi CLI wrapper for Kimi by Moonshot AI
 #                         (replaces ~/.kimi-code/bin/kimi)
-#   --skip-wrapper        Do not install the Kimi CLI wrapper (default: non-invasive launcher only)
+#   --install-amp-wrapper Install the Amp CLI wrapper at ~/.local/hmvip/bin/amp
+#                         (does not replace the real binary; uses a stable directory)
+#   --skip-wrapper        Do not install any CLI wrapper (default: non-invasive launcher only)
 #   --yes                 Skip confirmation prompts
 
 set -euo pipefail
@@ -32,6 +34,7 @@ PACKAGE_ROOT="packages/agent-guard-core"
 INIT_NAME=".agent-guard-init"
 INSTALL_HOOKS="true"
 INSTALL_WRAPPER="false"
+INSTALL_AMP_WRAPPER="false"
 SKIP_CONFIRM="false"
 
 while [[ $# -gt 0 ]]; do
@@ -68,8 +71,13 @@ while [[ $# -gt 0 ]]; do
             INSTALL_WRAPPER="true"
             shift
             ;;
+        --install-amp-wrapper)
+            INSTALL_AMP_WRAPPER="true"
+            shift
+            ;;
         --skip-wrapper)
             INSTALL_WRAPPER="false"
+            INSTALL_AMP_WRAPPER="false"
             shift
             ;;
         --yes)
@@ -184,6 +192,42 @@ else
     echo "   To enforce isolation automatically, install the invasive wrapper with:"
     echo "     bash ${DEST_DIR}/install.sh --install-wrapper"
     echo "   Or run the launcher manually from the init stub."
+fi
+
+# Install Amp CLI wrapper if requested.
+# Unlike the Kimi wrapper, the Amp wrapper does NOT replace the real binary.
+# It installs to a stable directory (~/.local/hmvip/bin/amp) that must be
+# in PATH before ~/.local/bin and ~/.amp/bin.
+if [[ "${INSTALL_AMP_WRAPPER}" == "true" ]]; then
+    AMP_BIN_DIR="${HOME}/.local/hmvip/bin"
+    AMP_REAL_PATH="${HOME}/.amp/bin/amp"
+    if [[ -f "${TARGET_DIR}/agent-guard.yaml" ]]; then
+        AMP_BIN_DIR="$(${AG_PYTHON} -c "import yaml,sys; d=yaml.safe_load(open(sys.argv[1])); print(d.get('wrappers',{}).get('amp',{}).get('bin_dir','${AMP_BIN_DIR}'))" "${TARGET_DIR}/agent-guard.yaml" 2>/dev/null || echo "${AMP_BIN_DIR}")"
+        AMP_REAL_PATH="$(${AG_PYTHON} -c "import yaml,sys; d=yaml.safe_load(open(sys.argv[1])); print(d.get('wrappers',{}).get('amp',{}).get('real_bin_path','${AMP_REAL_PATH}'))" "${TARGET_DIR}/agent-guard.yaml" 2>/dev/null || echo "${AMP_REAL_PATH}")"
+    fi
+    AMP_WRAPPER_BIN="${AMP_BIN_DIR}/amp"
+
+    mkdir -p "${AMP_BIN_DIR}"
+    echo "🛡️  Installing Amp CLI wrapper at ${AMP_WRAPPER_BIN}..."
+    cp "${DEST_DIR}/wrappers/amp/wrapper.sh" "${AMP_WRAPPER_BIN}"
+    chmod +x "${AMP_WRAPPER_BIN}"
+
+    if [[ ! -f "${AMP_REAL_PATH}" ]]; then
+        echo "⚠️  Amp real binary not found at ${AMP_REAL_PATH}" >&2
+        echo "   Install Amp CLI first: https://ampcode.com" >&2
+    fi
+
+    # Warn if the wrapper directory is not in PATH.
+    if ! echo "${PATH}" | tr ':' '\n' | grep -qx "${AMP_BIN_DIR}"; then
+        echo "⚠️  ${AMP_BIN_DIR} is not in PATH." >&2
+        echo "   Add this to your ~/.bashrc (before other PATH entries):" >&2
+        echo "     export PATH=\"${AMP_BIN_DIR}:\$PATH\"" >&2
+    fi
+    echo "✅ Amp CLI wrapper installed. Use 'which amp' in a new terminal to verify."
+else
+    echo "🛡️  Amp CLI wrapper installation skipped."
+    echo "   To enforce Amp isolation, install the wrapper with:"
+    echo "     bash ${DEST_DIR}/install.sh --install-amp-wrapper"
 fi
 
 # Ensure runtime artifacts are ignored by Git.

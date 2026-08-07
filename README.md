@@ -4,7 +4,7 @@ Protocolo open source de governança multi-IA para repositórios Git.
 
 Permite que múltiplos agentes de IA CLI colaborem no mesmo repositório sem colidir em branches, worktrees ou commits.
 
-> ⚠️ **Compatibilidade de wrappers:** o protocolo e os hooks são genéricos e podem ser estendidos para várias identidades, mas o **wrapper CLI oficial e testado é o do Kimi (Moonshot AI)**. Hoje, apenas `wrappers/kimi/` está implementado. Outros agentes (Claude, Gemini, Grok etc.) podem usar o protocolo via init stub manual, mas não há wrapper automático para eles.
+> ⚠️ **Compatibilidade de wrappers:** o protocolo e os hooks são genéricos e podem ser estendidos para várias identidades. Wrappers CLI oficiais e testados: **Kimi (Moonshot AI)** e **Amp (Sourcegraph)**. Outros agentes (Claude, Gemini, Grok etc.) podem usar o protocolo via init stub manual, mas não há wrapper automático para eles.
 
 ## Por que usar
 
@@ -48,8 +48,11 @@ agent-guard-core/
 │   ├── add-worktree-note.sh     # Cria git note de origem
 │   └── branch-triage.sh         # Limpeza de branches por identidade
 ├── wrappers/
-│   └── kimi/
-│       ├── wrapper.sh           # Wrapper do Kimi CLI
+│   ├── kimi/
+│   │   ├── wrapper.sh           # Wrapper do Kimi CLI
+│   │   └── recovery.sh          # Restaura wrapper após updates
+│   └── amp/
+│       ├── wrapper.sh           # Wrapper do Amp CLI (Sourcegraph)
 │       └── recovery.sh          # Restaura wrapper após updates
 ├── tests/
 │   └── run-all.sh               # Testes funcionais básicos
@@ -259,7 +262,7 @@ O script rejeita commits de IA que não carreguem metadados de worktree ou cujo 
 
 Adapters são thin wrappers que interceptam a chamada da ferramenta de IA e redirecionam para um worktree livre antes de delegar ao binário real.
 
-> **Atenção:** nesta versão, o único adapter implementado e testado é o **wrapper do Kimi (Moonshot AI)** em `wrappers/kimi/`. Outras ferramentas de IA CLI não possuem wrapper automático e devem usar o init stub manualmente.
+> **Atenção:** nesta versão, os adapters implementados e testados são os **wrappers do Kimi (Moonshot AI)** em `wrappers/kimi/` e do **Amp (Sourcegraph)** em `wrappers/amp/`. Outras ferramentas de IA CLI não possuem wrapper automático e devem usar o init stub manualmente.
 
 ### Wrapper Kimi (`wrappers/kimi/`)
 
@@ -314,6 +317,78 @@ Notas de implementação:
   ```bash
   bash packages/agent-guard-core/wrappers/kimi/recovery.sh --remove-wrapper
   ```
+
+### Wrapper Amp (`wrappers/amp/`)
+
+O wrapper `wrappers/amp/wrapper.sh` impõe isolamento automático para o Amp CLI (Sourcegraph). Diferente do wrapper Kimi (que substitui o binário in-place), o wrapper Amp vive em um diretório estável (`~/.local/hmvip/bin/amp`) que o auto-updater do Amp não toca, evitando quebras em updates.
+
+**Arquitetura:**
+
+```
+~/.local/hmvip/bin/amp    ← wrapper (estável, gerenciado pelo Agent Guard)
+~/.amp/bin/amp            ← binário real (atualizado normalmente pelo Amp)
+~/.local/bin/amp          ← symlink original do Amp (não usado quando o wrapper está no PATH)
+```
+
+O wrapper resolve o binário real em ordem:
+1. `AG_AMP_REAL` (variável de ambiente)
+2. `wrappers.amp.real_bin_path` (config em `agent-guard.yaml`)
+3. `~/.amp/bin/amp` (padrão)
+4. `command -v amp` (fallback, com detecção anti-recursão)
+
+**Instalação:**
+
+```bash
+# 1. Criar diretório estável
+mkdir -p ~/.local/hmvip/bin
+
+# 2. Instalar wrapper
+cp packages/agent-guard-core/wrappers/amp/wrapper.sh ~/.local/hmvip/bin/amp
+chmod +x ~/.local/hmvip/bin/amp
+
+# 3. Garantir que ~/.local/hmvip/bin vem antes no PATH
+# Adicione ao ~/.bashrc (antes de outras entradas de PATH):
+export PATH="$HOME/.local/hmvip/bin:$PATH"
+```
+
+**Instalação via recovery script (idempotente):**
+
+```bash
+bash packages/agent-guard-core/wrappers/amp/recovery.sh --repo-root /path/to/repo
+```
+
+**Mitigação contra updates do Amp:**
+
+O Amp CLI usa `~/.local/bin/amp` (symlink) e `~/.amp/bin/amp` (binário real). Quando o Amp executa `amp update`, ele atualiza apenas `~/.amp/bin/amp`. O wrapper em `~/.local/hmvip/bin/amp` não é tocado, desde que `~/.local/hmvip/bin` esteja antes no PATH.
+
+O `init.sh` chama `_ensure_amp_wrapper()` automaticamente em toda inicialização, detectando e restaurando o wrapper se ele tiver sido removido.
+
+**Seleção explícita de slot:**
+
+```bash
+amp --slot amp2            # ir direto ao slot amp2
+AGENT_GUARD_SLOT=amp2 amp  # equivalente via env var
+```
+
+**Comandos de gerenciamento (bypass de lease):**
+
+`amp --version`, `amp --help`, `amp update`, `amp upgrade`, `amp login` não requerem lease e passam direto ao binário real.
+
+**Bypass de emergência:**
+
+```bash
+AG_WRAPPER_BYPASS=1 amp ...
+```
+
+**Diferenças em relação ao wrapper Kimi:**
+
+| Aspecto | Kimi | Amp |
+|---------|------|-----|
+| Localização do wrapper | `~/.kimi-code/bin/kimi` (substitui binário) | `~/.local/hmvip/bin/amp` (diretório separado) |
+| Binário real | `~/.kimi-code/bin/kimi.real` (backup) | `~/.amp/bin/amp` (intacto) |
+| Risco de update quebrar | Alto (update sobrescreve) | Baixo (update não toca o wrapper) |
+| Recovery | Backup + restore in-place | Copy wrapper para dir estável |
+|PATH | `~/.kimi-code/bin` já existe | Requer `~/.local/hmvip/bin` antes no PATH |
 
 ## Testes
 

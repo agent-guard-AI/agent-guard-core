@@ -1,5 +1,33 @@
 # Changelog — agent-guard-core
 
+## 0.10.0 — Amp CLI Wrapper (Sourcegraph)
+
+- **Novo wrapper**: `wrappers/amp/wrapper.sh` — isolamento automático para o
+  Amp CLI (Sourcegraph). Diferente do wrapper Kimi, usa um diretório estável
+  (`~/.local/hmvip/bin/amp`) que o auto-updater do Amp não sobrescreve.
+- **Novo recovery**: `wrappers/amp/recovery.sh` — instala/restaura o wrapper
+  idempotentemente, verifica PATH e existência do binário real.
+- **Nova identidade**: `amp` em `agent-guard.yaml` com `worktree_prefix:
+  hmvip-ia-amp`, slots iniciais 3, max 10, auto-expand.
+- **Nova config**: `wrappers.amp.*` com `bin_dir`, `real_bin_path`,
+  `default_role`, `identity_prefix`.
+- `bin/agent-guard`: `amp` adicionado a `KNOWN_IDENTITIES`.
+- `src/init.sh`: `_ensure_amp_wrapper()` executa recovery automático em toda
+  inicialização, igual ao `_ensure_kimi_wrapper`.
+- `install.sh`: `--install-amp-wrapper` instala o wrapper no diretório estável.
+- `README.md`: seção completa do wrapper Amp com arquitetura, instalação,
+  mitigação de updates, comparação com wrapper Kimi.
+- `docs/amp-wrapper.md`: documentação detalhada (432 linhas) cobrindo
+  arquitetura, instalação, uso, troubleshooting e cenários proativos.
+- `agent-guard.yaml.example`: exemplo de configuração Amp incluído.
+
+### Mitigação contra updates do Amp
+
+O Amp CLI atualiza `~/.amp/bin/amp` (binário real) durante `amp update`.
+O wrapper em `~/.local/hmvip/bin/amp` não é tocado, desde que
+`~/.local/hmvip/bin` esteja antes no PATH. O `init.sh` detecta e restaura
+o wrapper automaticamente se ele for removido.
+
 ## 0.9.12 — `hmvip continuar-tudo` (ranking A+B + grade kitty)
 
 - `src/continue-all.sh`:
