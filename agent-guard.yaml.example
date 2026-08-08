@@ -83,6 +83,11 @@ session:
     enabled: true
     journal: true
     slot_note: true
+  # Open PR cache: avoids a GitHub API round-trip on every release/stale check.
+  # TTL in seconds (min 5). Cache is invalidated by git push via post-push hook.
+  pr_cache_ttl_seconds: 60
+  # Hard timeout for `gh pr list` so a slow API cannot stall release/shutdown.
+  pr_api_timeout_seconds: 5
 
 wrappers:
   kimi:

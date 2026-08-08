@@ -153,6 +153,13 @@ fi
 # silently disabling isolation. We restore it automatically if a versioned
 # recovery script is available.
 _ensure_kimi_wrapper() {
+    # Hooks that only need lightweight helpers (heartbeat, SessionEnd) should
+    # skip wrapper recovery to keep prompt/shutdown latency low. Recovery is
+    # still run explicitly by SessionEnd before sourcing this script.
+    if [[ "${AGENT_GUARD_SKIP_WRAPPER_RECOVERY:-}" == "1" ]]; then
+        return 0
+    fi
+
     local package_root
     package_root="$(_guard_get_str "paths.package_root" "packages/agent-guard-core")"
 
@@ -192,6 +199,11 @@ _ensure_kimi_wrapper() {
 # Amp's self-updater does not touch), so recovery is simpler — we only need
 # to ensure the wrapper file exists and is current.
 _ensure_amp_wrapper() {
+    # See _ensure_kimi_wrapper: hooks skip recovery to stay lightweight.
+    if [[ "${AGENT_GUARD_SKIP_WRAPPER_RECOVERY:-}" == "1" ]]; then
+        return 0
+    fi
+
     local package_root
     package_root="$(_guard_get_str "paths.package_root" "packages/agent-guard-core")"
 

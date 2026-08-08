@@ -256,6 +256,17 @@ if [[ -n "${IDENTITY}" ]]; then
 fi
 
 # -------------------------------------------------------------------------
+# Invalidate the open-PR cache for this identity after a push, so the next
+# release/stale check sees fresh data without waiting for the TTL to expire.
+# -------------------------------------------------------------------------
+if [[ -n "${IDENTITY}" ]]; then
+    PR_CACHE_FILE="${REPO_ROOT}/.agent-guard/pr-cache/${IDENTITY}.json"
+    if [[ -f "${PR_CACHE_FILE}" ]]; then
+        rm -f "${PR_CACHE_FILE}"
+    fi
+fi
+
+# -------------------------------------------------------------------------
 # PAS — Protocolo de Ação Sensível (SPEC-ECOSYSTEM-GUARDIAN H5, task 3.3):
 # marca `sensitive: <categorias>` nas git notes dos commits do range ANTES
 # do push das notes abaixo, aumentando a visibilidade para a revisão humana.
