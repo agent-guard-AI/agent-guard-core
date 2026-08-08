@@ -92,6 +92,148 @@ _blocked_event_notifications_enabled() {
 }
 
 # ---------------------------------------------------------------------------
+# PR cache helpers
+#
+# Open PR lookups are the dominant network cost during release/stale cleanup.
+# We keep a small per-identity cache in .agent-guard/pr-cache/ so repeated
+# checks within the same minute hit disk instead of the GitHub API.
+# ---------------------------------------------------------------------------
+_pr_cache_dir() {
+    local repo_root="${MAIN_REPO:-${_AG_REPO_ROOT:-}}"
+    [[ -n "${repo_root}" ]] || return 0
+    echo "${repo_root}/.agent-guard/pr-cache"
+}
+
+_pr_cache_file() {
+    local identity="$1"
+    local cache_dir
+    cache_dir="$(_pr_cache_dir)"
+    [[ -n "${cache_dir}" ]] || return 0
+    echo "${cache_dir}/${identity}.json"
+}
+
+_pr_cache_ttl_seconds() {
+    local ttl
+    ttl="$(_guard_get_str "session.pr_cache_ttl_seconds" "60" 2>/dev/null || echo "60")"
+    [[ -z "${ttl}" || "${ttl}" == "None" || ! "${ttl}" =~ ^[0-9]+$ ]] && ttl=60
+    # Floor of 1s keeps tests fast and avoids zero-TTL loops in production.
+    if [[ "${ttl}" -lt 1 ]]; then
+        ttl=1
+    fi
+    echo "${ttl}"
+}
+
+_pr_api_timeout_seconds() {
+    local timeout
+    timeout="$(_guard_get_str "session.pr_api_timeout_seconds" "5" 2>/dev/null || echo "5")"
+    [[ -z "${timeout}" || "${timeout}" == "None" || ! "${timeout}" =~ ^[0-9]+$ ]] && timeout=5
+    if [[ "${timeout}" -lt 1 ]]; then
+        timeout=1
+    fi
+    echo "${timeout}"
+}
+
+_pr_cache_is_fresh() {
+    local identity="$1"
+    local cache_file
+    cache_file="$(_pr_cache_file "${identity}")"
+    [[ -f "${cache_file}" ]] || return 1
+
+    local ttl now mtime
+    ttl="$(_pr_cache_ttl_seconds)"
+    now="$(date +%s)"
+    mtime="$(stat -c %Y "${cache_file}" 2>/dev/null || stat -f %m "${cache_file}" 2>/dev/null || echo "0")"
+    [[ "${mtime}" -gt 0 ]] || return 1
+    [[ $((now - mtime)) -le ${ttl} ]]
+}
+
+_pr_cache_read() {
+    local identity="$1"
+    local cache_file
+    cache_file="$(_pr_cache_file "${identity}")"
+    [[ -f "${cache_file}" ]] || return 1
+    cat "${cache_file}" 2>/dev/null
+}
+
+_pr_cache_write() {
+    local identity="$1"
+    local content="$2"
+    local cache_dir cache_file
+    cache_dir="$(_pr_cache_dir)"
+    [[ -n "${cache_dir}" ]] || return 1
+    mkdir -p "${cache_dir}" || return 1
+    cache_file="${cache_dir}/${identity}.json"
+    printf '%s' "${content}" > "${cache_file}"
+}
+
+_pr_cache_invalidate() {
+    local identity="$1"
+    local cache_file
+    cache_file="$(_pr_cache_file "${identity}")"
+    [[ -f "${cache_file}" ]] && rm -f "${cache_file}"
+}
+
+# ---------------------------------------------------------------------------
+# Helper: list open PRs for an identity, using a short-lived local cache and
+# a bounded API timeout. Prints one PR line per line; empty means none.
+#
+# Exit codes:
+#   0 = data obtained (cache hit or successful API call), even if the list is empty
+#   1 = could not obtain data (gh missing, timeout, query failed)
+# ---------------------------------------------------------------------------
+_pr_list_open_for_identity() {
+    local identity="$1"
+    local worktree_path="${2:-$(pwd)}"
+
+    [[ -n "${identity}" ]] || return 1
+
+    # 1. Cache hit: return immediately without touching the network.
+    if _pr_cache_is_fresh "${identity}"; then
+        _pr_cache_read "${identity}"
+        return 0
+    fi
+
+    # 2. gh not available: nothing to list, cache stays absent.
+    if ! command -v gh >/dev/null 2>&1; then
+        return 1
+    fi
+
+    local timeout_seconds
+    timeout_seconds="$(_pr_api_timeout_seconds)"
+
+    local pr_lines=""
+    local query_rc=0
+    # Use a bounded timeout so a slow GitHub API cannot stall the release.
+    # 'timeout' is part of coreutils on Linux and available on macOS via gtimeout.
+    local timeout_cmd=""
+    if command -v timeout >/dev/null 2>&1; then
+        timeout_cmd="timeout"
+    elif command -v gtimeout >/dev/null 2>&1; then
+        timeout_cmd="gtimeout"
+    fi
+
+    if [[ -n "${timeout_cmd}" ]]; then
+        pr_lines="$(cd "${worktree_path}" 2>/dev/null && ${timeout_cmd} "${timeout_seconds}" gh pr list --state open --limit 100 \
+            --json number,title,headRefName \
+            --jq ".[] | select(.headRefName | startswith(\"ia-${identity}/\")) | \"#\\(.number) \\(.headRefName) — \\(.title)\"" 2>/dev/null)" || query_rc=$?
+    else
+        pr_lines="$(cd "${worktree_path}" 2>/dev/null && gh pr list --state open --limit 100 \
+            --json number,title,headRefName \
+            --jq ".[] | select(.headRefName | startswith(\"ia-${identity}/\")) | \"#\\(.number) \\(.headRefName) — \\(.title)\"" 2>/dev/null)" || query_rc=$?
+    fi
+
+    # 3. Persist to cache only on a real successful fetch, so a slow/failed API
+    #    is not retried on every blocker check within the TTL window.
+    if [[ "${query_rc}" -eq 0 ]]; then
+        _pr_cache_write "${identity}" "${pr_lines}"
+        printf '%s' "${pr_lines}"
+        return 0
+    fi
+
+    return 1
+}
+
+# ---------------------------------------------------------------------------
 # Helper: return a list of release blockers for a worktree.
 # Prints one blocker per line (empty output means releasable).
 # Reuses the same logic as _validate_worktree_release_ready and the PR guard.
@@ -135,12 +277,14 @@ _worktree_release_blockers() {
         echo "own_stashes"
     fi
 
-    # PR guard: if gh is available, list open PRs from this identity.
-    if [[ -n "${identity}" ]] && command -v gh >/dev/null 2>&1; then
-        local pr_count
-        pr_count="$(cd "${worktree_path}" 2>/dev/null && gh pr list --state open --limit 100 \
-            --json number,headRefName \
-            --jq ".[] | select(.headRefName | startswith(\"ia-${identity}/\")) | .number" 2>/dev/null | wc -l || true)"
+    # PR guard: list open PRs from this identity (cached + bounded timeout).
+    if [[ -n "${identity}" ]]; then
+        local pr_lines pr_count
+        pr_lines="$(_pr_list_open_for_identity "${identity}" "${worktree_path}")"
+        pr_count=0
+        if [[ -n "${pr_lines}" ]]; then
+            pr_count="$(printf '%s\n' "${pr_lines}" | grep -c . || true)"
+        fi
         if [[ "${pr_count}" -gt 0 ]]; then
             echo "open_prs:${pr_count}"
         fi
@@ -251,10 +395,13 @@ _release_pending_work_guard() {
         return 0
     fi
 
-    local pr_lines
-    if ! pr_lines="$(cd "${worktree_path}" 2>/dev/null && gh pr list --state open --limit 100 \
-        --json number,title,headRefName \
-        --jq ".[] | select(.headRefName | startswith(\"ia-${identity}/\")) | \"#\\(.number) \\(.headRefName) — \\(.title)\"" 2>/dev/null)"; then
+    local pr_lines=""
+    local pr_query_ok=0
+    if ! pr_lines="$(_pr_list_open_for_identity "${identity}" "${worktree_path}" 2>/dev/null)"; then
+        pr_query_ok=1
+    fi
+
+    if [[ "${pr_query_ok}" -ne 0 ]]; then
         echo "⚠️  Falha ao consultar PRs abertos via gh — verificação pulada (release segue)." >&2
         if _blocked_event_notifications_enabled "journal" && command -v _journal_write_event >/dev/null 2>&1; then
             _journal_write_event "pr_guard_skipped" "{\"reason\": \"gh_query_failed\", \"identity\": \"${identity}\", \"worktree\": \"${worktree_path}\"}" "${MAIN_REPO:-${_AG_REPO_ROOT:-}}"

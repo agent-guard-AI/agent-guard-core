@@ -27,8 +27,11 @@ function _ag_heartbeat_main() {
     fi
 
     # Load Agent Guard helpers only (no session acquisition side effects).
+    # Skip wrapper recovery in the heartbeat path: it runs on every prompt and
+    # must stay lightweight; recovery is handled by SessionEnd and by cron.
     local _ag_functions_loaded=""
     AGENT_GUARD_FUNCTIONS_ONLY=1
+    AGENT_GUARD_SKIP_WRAPPER_RECOVERY=1
     # shellcheck source=/dev/null
     if ! source "${init_stub}" >/dev/null 2>&1; then
         return 0
