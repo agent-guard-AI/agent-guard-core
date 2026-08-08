@@ -112,6 +112,7 @@ unset _AG_WORKTREE _AG_IDENTITY _AG_BRANCH
 unset _HMVIP_WORKTREE _HMVIP_IDENTITY _HMVIP_BRANCH
 unset AG_WORKTREE_PATH AG_BRANCH
 unset AGENT_GUARD_WORKTREE_PATH AGENT_GUARD_IDENTITY AGENT_GUARD_BRANCH
+unset AGENT_GUARD_REPO_ROOT
 
 # Resolve a usable Python interpreter cross-platform.
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
@@ -687,6 +688,35 @@ sys.exit(1)
 PY
 }
 
+# Sort slot numbers by most-recent activity.  Primary key is the session file's
+# last_activity timestamp; fallback to the worktree directory mtime.  Returns
+# slot numbers (1..max_slots) one per line, most recent first.
+_ag_sort_slots_by_recent_activity() {
+    local prefix="$1"
+    local max_slots="$2"
+    local wt_prefix="$3"
+    local session_dir="$4"
+    local n identity worktree session_file ts
+    for n in $(seq 1 "${max_slots}"); do
+        identity="${prefix}${n}"
+        worktree="${_AG_BASE_DIR}/${wt_prefix}${n}"
+        session_file="${session_dir}/${identity}.json"
+        ts=""
+        if [[ -f "${session_file}" ]]; then
+            ts="$(${AG_PYTHON} -c "import json,sys; d=json.load(open('${session_file}')); print(d.get('last_activity',''))" 2>/dev/null || true)"
+        fi
+        if [[ -z "${ts}" || "${ts}" == "None" ]]; then
+            if [[ -d "${worktree}" ]]; then
+                ts="$(stat -c %Y "${worktree}" 2>/dev/null || true)"
+            fi
+        fi
+        if [[ -z "${ts}" || "${ts}" == "None" ]]; then
+            ts=0
+        fi
+        printf '%s %s\n' "${ts}" "${n}"
+    done | sort -t' ' -k1,1rn | awk '{print $2}'
+}
+
 _ag_find_free_kimi_worktree() {
     local session_dir
     session_dir="${_AG_MAIN_REPO}/$(bash "${_AG_CONFIG_BIN}" get paths.session_storage ".agent-guard/sessions")"
@@ -702,7 +732,9 @@ _ag_find_free_kimi_worktree() {
         max_slots="$(bash "${_AG_CONFIG_BIN}" get "identities.${prefix}.max_slots" "${initial_slots}" 2>/dev/null || echo "${initial_slots}")"
         [[ "${max_slots}" -lt "${initial_slots}" ]] && max_slots="${initial_slots}"
 
-        for n in $(seq 1 "${max_slots}"); do
+        local sorted_slots
+        sorted_slots="$(_ag_sort_slots_by_recent_activity "${prefix}" "${max_slots}" "${wt_prefix}" "${session_dir}")"
+        for n in ${sorted_slots}; do
             local identity="${prefix}${n}"
             local worktree="${_AG_BASE_DIR}/${wt_prefix}${n}"
             local session_file="${session_dir}/${identity}.json"
