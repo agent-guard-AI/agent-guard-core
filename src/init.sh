@@ -581,7 +581,7 @@ _AG_OTHER_AGENT_CACHE_RESULT=""
 # agent because args-based detection can flag the current shell/wrapper itself
 # as an agent (e.g. its argv contains a .kimi-code path); the meaningful
 # session owner is the IDE/agent root at the top of the chain.
-_ag_init_find_agent_ancestor() {
+_ag_find_agent_ancestor() {
     local start_pid="$1"
     local agent_pids="$2"
     local ppid_map="$3"
@@ -689,7 +689,7 @@ _worktree_has_other_live_agent() {
     # belonging to the same agent session are ignored; any other agent session in
     # the worktree counts as a live occupant.
     local own_agent_ancestor
-    own_agent_ancestor="$(_ag_init_find_agent_ancestor "$$" "${agent_pids}" "${ppid_map}")"
+    own_agent_ancestor="$(_ag_find_agent_ancestor "$$" "${agent_pids}" "${ppid_map}")"
 
     # Check cwd for every agent and descendant candidate. Ignore candidates that
     # belong to our own agent session.
@@ -700,7 +700,7 @@ _worktree_has_other_live_agent() {
         [[ "${cwd_link}" != "${worktree_path}" ]] && continue
 
         local cand_agent_ancestor
-        cand_agent_ancestor="$(_ag_init_find_agent_ancestor "${candidate}" "${agent_pids}" "${ppid_map}")"
+        cand_agent_ancestor="$(_ag_find_agent_ancestor "${candidate}" "${agent_pids}" "${ppid_map}")"
         if [[ -n "${own_agent_ancestor}" && "${cand_agent_ancestor}" == "${own_agent_ancestor}" ]]; then
             continue
         fi
@@ -1067,35 +1067,6 @@ _ag_session_pid() {
 # ---------------------------------------------------------------------------
 # 4. Helper: atomic slot allocation
 # ---------------------------------------------------------------------------
-
-# Sort candidate identities by most-recent activity.  The primary key is the
-# session file's last_activity timestamp; when that is absent (e.g. released
-# slot or no session file yet), fall back to the worktree directory mtime.
-# Slots with no worktree get timestamp 0 and end up last.
-_ag_sort_identities_by_recent_activity() {
-    local prefix="$1"
-    local max_slots="$2"
-    local i identity worktree session_file ts
-    for i in $(seq 1 "${max_slots}"); do
-        identity="${prefix}${i}"
-        worktree="$(_get_worktree_path "${identity}")"
-        session_file="$(_get_session_file "${identity}")"
-        ts=""
-        if [[ -f "${session_file}" ]]; then
-            ts="$(_load_session_field "${identity}" "last_activity" 2>/dev/null || true)"
-        fi
-        if [[ -z "${ts}" || "${ts}" == "None" ]]; then
-            if [[ -d "${worktree}" ]]; then
-                ts="$(stat -c %Y "${worktree}" 2>/dev/null || true)"
-            fi
-        fi
-        if [[ -z "${ts}" || "${ts}" == "None" ]]; then
-            ts=0
-        fi
-        printf '%s %s\n' "${ts}" "${identity}"
-    done | sort -t' ' -k1,1rn | awk '{print $2}'
-}
-
 _acquire_slot() {
     local prefix="$1"
     local role="$2"
@@ -1283,24 +1254,22 @@ _acquire_slot() {
             return 1
         fi
     else
-        local sorted_identities
-        sorted_identities="$(_ag_sort_identities_by_recent_activity "${prefix}" "${max_slots}")"
-        while IFS= read -r identity; do
-            [[ -z "${identity}" ]] && continue
+        for i in $(seq 1 "${max_slots}"); do
+            identity="${prefix}${i}"
             if _slot_is_free "${identity}"; then
                 selected_identity="${identity}"
                 break
             fi
-        done <<< "${sorted_identities}"
+        done
 
         if [[ -z "${selected_identity}" ]]; then
-            while IFS= read -r identity; do
-                [[ -z "${identity}" ]] && continue
+            for i in $(seq 1 "${max_slots}"); do
+                identity="${prefix}${i}"
                 if _slot_is_free "${identity}" "true"; then
                     selected_identity="${identity}"
                     break
                 fi
-            done <<< "${sorted_identities}"
+            done
         fi
 
         if [[ -z "${selected_identity}" ]]; then
