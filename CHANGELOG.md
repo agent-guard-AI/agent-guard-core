@@ -1,26 +1,5 @@
 # Changelog — agent-guard-core
 
-## 0.10.3 — Recent-first slot allocation
-
-- `src/init.sh`:
-  - Novo helper `_ag_sort_identities_by_recent_activity()` — ordena slots por
-    atividade recente (primary key `last_activity` do lease, fallback para mtime
-    do worktree).
-  - `_acquire_slot_locked()` aloca automaticamente o slot livre mais recente em
-    vez de sempre começar por `kimi1`/`claude1`/etc.
-  - Renomeia `_ag_find_agent_ancestor()` para `_ag_init_find_agent_ancestor()`
-    para evitar conflito de nomes com o wrapper Kimi quando o init é sourceado.
-- `wrappers/kimi/wrapper.sh`:
-  - Novo helper `_ag_sort_slots_by_recent_activity()` com a mesma semântica.
-  - `_ag_find_free_kimi_worktree()` respeita a ordenação recente-first.
-  - Desseta `AGENT_GUARD_REPO_ROOT` herdado para garantir que o repo seja
-    resolvido a partir do CWD.
-- `tests/agent-guard/slot-allocation-recent-first-test.sh` (novo): valida init e
-  wrapper em 4 cenários (slot mais recente, próximo mais recente quando ocupado,
-  bypass via `--slot`).
-- Comportamento de `--slot <id>` inalterado: explicit slot selection sempre tem
-  precedência.
-
 ## 0.10.2 — Release Atomicity & Structural Drift Reporting
 
 Fecha o gap onde slots podiam ser marcados como `free` enquanto o worktree
