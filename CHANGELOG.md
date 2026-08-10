@@ -1,5 +1,23 @@
 # Changelog — agent-guard-core
 
+## 0.10.3 — Dead-PID Stale Cleanup
+
+Corrige a falha de engenharia onde sessões cujo PID havia morrido permaneciam
+marcadas como `active` indefinidamente, bloqueando adoção automática via
+`hmvip go`/`hmvip ad` e acumulando slots fantasmas no `--status`.
+
+- `src/release-helpers.sh`:
+  - `_cleanup_stale_sessions()` agora trata PID morto como sessão stale por
+    definição. Antes, a condição `_is_pid_alive || continue` fazia o cleanup
+    ignorar deliberadamente sessões com PID morto, deixando o lease file
+    preso para sempre.
+  - Sessões active com PID inexistente/zombie são candidatas a auto-release
+    seguro (worktree limpo + sem PRs abertos), exatamente como sessões stale
+    por tempo ou shell-pinned.
+- Testes:
+  - `tests/agent-guard/agent-guard-stale-cleanup-test.sh`: adicionado Test 6
+    que valida liberação automática de slot com PID morto e heartbeat recente.
+
 ## 0.10.2 — Release Atomicity & Structural Drift Reporting
 
 Fecha o gap onde slots podiam ser marcados como `free` enquanto o worktree
