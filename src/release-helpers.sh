@@ -601,9 +601,18 @@ _cleanup_stale_sessions() {
             sess_pid="$(_load_session_field "${identity}" "pid")"
 
             [[ "${sess_status}" == "active" ]] || continue
-            _is_pid_alive "${sess_pid}" || continue
-            # Stale (24h+) sessions and shell-pinned leases are eligible.
-            if ! _is_session_stale "${identity}" && ! _lease_is_shell_pinned "${identity}"; then
+
+            local pid_alive="true"
+            if [[ -z "${sess_pid}" ]] || ! _is_pid_alive "${sess_pid}"; then
+                pid_alive="false"
+            fi
+
+            # Dead PID: the session is stale by definition and must not remain
+            # "active" forever in the lease file. Live PID: only stale (24h+)
+            # or shell-pinned leases are eligible for auto-release.
+            if [[ "${pid_alive}" == "false" ]]; then
+                echo "🧹 ${identity}: session PID ${sess_pid} is dead; checking for safe auto-release..." >&2
+            elif ! _is_session_stale "${identity}" && ! _lease_is_shell_pinned "${identity}"; then
                 continue
             fi
 
