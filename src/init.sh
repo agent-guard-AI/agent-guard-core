@@ -1707,6 +1707,74 @@ _anti_stale_check() {
     fi
 }
 
+# Auto-rebase a clean task branch when the agent starts working on it.
+# This replaces the previous continuous auto-rebase cron (see incident-log L389+
+# and .github/workflows/auto-rebase-own-branches.yml). We only rebase on demand:
+# when a slot is adopted/reused, the worktree is clean and the branch is behind
+# origin/develop. Dirty worktrees are skipped — the agent must resolve them first.
+_auto_rebase_if_clean() {
+    local worktree_path="$1"
+    local identity="$2"
+    local current_branch
+    current_branch="$(git -C "${worktree_path}" branch --show-current 2>/dev/null || echo "")"
+
+    # Only rebases own task branches.
+    if [[ -z "${current_branch}" || "${current_branch}" == "develop" || "${current_branch}" == "_released/${identity}" ]]; then
+        return 0
+    fi
+    if [[ ! "${current_branch}" =~ ^ia-${identity}/ ]]; then
+        return 0
+    fi
+
+    # Skip dirty worktrees — agent must resolve them first.
+    local dirty_files
+    dirty_files="$(git -C "${worktree_path}" status --porcelain 2>/dev/null || true)"
+    if [[ -n "${dirty_files}" ]]; then
+        return 0
+    fi
+
+    # Skip if there are stashes on the current branch.
+    local stash_count
+    stash_count="$(git -C "${worktree_path}" stash list 2>/dev/null | grep -c "On ${current_branch}:" || true)"
+    if [[ "${stash_count}" -gt 0 ]]; then
+        return 0
+    fi
+
+    git -C "${worktree_path}" fetch origin develop >/dev/null 2>&1 || true
+
+    local behind_count
+    behind_count="$(git -C "${worktree_path}" rev-list --count "HEAD..origin/develop" 2>/dev/null || echo "0")"
+    if [[ -z "${behind_count}" || "${behind_count}" -le 0 ]]; then
+        return 0
+    fi
+
+    echo "" >&2
+    echo "🔄 Branch '${current_branch}' is ${behind_count} commits behind origin/develop." >&2
+    echo "   Worktree is clean — auto-rebasing on session start..." >&2
+
+    local rebase_log="/tmp/ag-rebase-${identity}-$$.log"
+    local push_log="/tmp/ag-push-${identity}-$$.log"
+
+    if git -C "${worktree_path}" rebase origin/develop >"${rebase_log}" 2>&1; then
+        if git -C "${worktree_path}" push --force-with-lease origin "${current_branch}" >"${push_log}" 2>&1; then
+            echo "✅ Auto-rebase complete: ${current_branch} is now up to date with origin/develop." >&2
+        else
+            echo "⚠️  Auto-rebase succeeded but push failed:" >&2
+            sed 's/^/   /' <"${push_log}" | head -20 >&2
+        fi
+    else
+        echo "⚠️  Auto-rebase failed (conflict or other issue). Aborting rebase." >&2
+        git -C "${worktree_path}" rebase --abort >/dev/null 2>&1 || true
+        sed 's/^/   /' <"${rebase_log}" | head -20 >&2
+        echo "" >&2
+        echo "   Resolve manually:" >&2
+        echo "     git fetch origin" >&2
+        echo "     git rebase origin/develop" >&2
+        echo "     git push --force-with-lease" >&2
+    fi
+    rm -f "${rebase_log}" "${push_log}"
+}
+
 _session_audit() {
     local worktree_path="$1"
     local current_branch
@@ -2892,6 +2960,7 @@ if [[ "${MODE}" == "adopt" ]]; then
     _configure_hooks_path "${WORKTREE_PATH}"
     _ensure_hooks_installed "${WORKTREE_PATH}"
     _anti_stale_check "${WORKTREE_PATH}"
+    _auto_rebase_if_clean "${WORKTREE_PATH}" "${ADOPT_IDENTITY}"
 
     impact_json="$(echo "${IMPACT_PLUGINS}" | ${AG_PYTHON} -c "import sys,json; print(json.dumps([p.strip() for p in sys.stdin.read().split(',') if p.strip()]))" 2>/dev/null || echo "[]")"
     _save_session "${ADOPT_IDENTITY}" "active" "${ROLE}" "${ADOPT_BRANCH}" "$(_ag_session_pid "${WORKTREE_PATH}")" "${WORKTREE_PATH}" "${impact_json}"
@@ -3042,6 +3111,7 @@ elif [[ -n "${CURRENT_IDENTITY}" && -n "${CURRENT_BRANCH}" && "${CURRENT_BRANCH}
     _configure_hooks_path "${CURRENT_WORKTREE}"
     _ensure_hooks_installed "${CURRENT_WORKTREE}"
     _anti_stale_check "${CURRENT_WORKTREE}"
+    _auto_rebase_if_clean "${CURRENT_WORKTREE}" "${CURRENT_IDENTITY}"
     _session_audit "${CURRENT_WORKTREE}"
 
     impact_json="$(echo "${IMPACT_PLUGINS}" | ${AG_PYTHON} -c "import sys,json; print(json.dumps([p.strip() for p in sys.stdin.read().split(',') if p.strip()]))" 2>/dev/null || echo "[]")"
