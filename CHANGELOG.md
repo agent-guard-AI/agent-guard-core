@@ -1,10 +1,12 @@
 # Changelog — agent-guard-core
 
-## 0.10.3 — Dead-PID Stale Cleanup
+## 0.10.3 — Dead-PID Stale Cleanup + Descriptive Branch Names
 
 Corrige a falha de engenharia onde sessões cujo PID havia morrido permaneciam
 marcadas como `active` indefinidamente, bloqueando adoção automática via
-`hmvip go`/`hmvip ad` e acumulando slots fantasmas no `--status`.
+`hmvip go`/`hmvip ad` e acumulando slots fantasmas no `--status`. Adiciona
+suporte a nomes descritivos de branch para que seja possível identificar o
+conteúdo de cada slot sem abrir o worktree.
 
 - `src/release-helpers.sh`:
   - `_cleanup_stale_sessions()` agora trata PID morto como sessão stale por
@@ -14,9 +16,40 @@ marcadas como `active` indefinidamente, bloqueando adoção automática via
   - Sessões active com PID inexistente/zombie são candidatas a auto-release
     seguro (worktree limpo + sem PRs abertos), exatamente como sessões stale
     por tempo ou shell-pinned.
+- `src/init.sh`:
+  - Novo parâmetro `--topic "<descrição>"` para `init`, `--slot`, `--attach` e
+    `--adopt`. A descrição é convertida em slug e incorporada ao nome da
+    branch: `ia-<id>/<role>/<slug>-YYYYMMDD-HHMM`.
+  - Mantido o formato legado `ia-<id>/<role>/task-YYYYMMDD-HHMM` quando
+    `--topic` não é fornecido.
+  - Novo modo `--rename-topic "<descrição>"` para renomear a branch de
+    trabalho atual quando o escopo muda de fase/tópico.
+  - A nota do slot (`.agent-guard/tasks/<slot>.md`) é criada/atualizada
+    automaticamente com as linhas **Branch:** e **Tópico:** apontando para
+    o trabalho corrente.
+  - Reuse mode agora permite retomar um worktree quando o lease está no PID
+    pai/ancestral do processo atual. Corrige o cenário em que o usuário faz
+    `source .hmvip-agent-init --adopt` no shell e depois executa `kimi` no
+    mesmo shell — antes o wrapper recusava com "WORKTREE ALREADY IN USE".
+- `.kiro/shell/hmvip.sh`:
+  - `_hmvip_resolve_init_script()` agora usa **sempre** o stub
+    `.hmvip-agent-init` do repo principal (`/home/hmvip-dev/hmvip`), a menos que
+    `HMVIP_USE_WORKTREE_INIT=1` seja definido. Worktrees de IA ficam em branches
+    antigas com frequência; usar o stub daquele worktree para operar em *outros*
+    slots reproduzia bugs já corrigidos na develop (ex: `linha 564: $2: variável
+    não associada` ao adotar um slot a partir de um worktree desatualizado).
+- Wrappers Kimi/Amp (`wrappers/kimi/wrapper.sh`, `wrappers/amp/wrapper.sh`):
+  - Requisição explícita de slot (`hmvip go <slot>` / `amp go <slot>`) em um
+    worktree sujo agora entra no modo **adopt** automaticamente, em vez de
+    recusar. Isso permite retomar slots que foram liberados com trabalho ativo
+    (drift reportado por `--status`) sem precisar decorar
+    `AG_ALLOW_DIRTY_WORKTREE=1`. A guarda de agente/lease vivo continua
+    bloqueando takeovers indevidos.
 - Testes:
   - `tests/agent-guard/agent-guard-stale-cleanup-test.sh`: adicionado Test 6
     que valida liberação automática de slot com PID morto e heartbeat recente.
+  - `tests/agent-guard/agent-guard-topic-branch-test.sh` (novo): valida
+    `--topic`, `--rename-topic` e atualização da nota do slot.
 
 ## 0.10.2 — Release Atomicity & Structural Drift Reporting
 
