@@ -1282,10 +1282,20 @@ _acquire_slot() {
         fi
     fi
 
-    # Build branch name
+    # Build branch name. If a descriptive topic was provided, slugify it into
+    # the branch name so operators can tell what the slot is working on.
     local date_str
     date_str="$(date +%Y%m%d-%H%M)"
-    local branch_name="ia-${selected_identity}/${role}/task-${date_str}"
+    local topic_slug=""
+    if [[ -n "${TASK_TOPIC}" ]]; then
+        topic_slug="$(_ag_slugify_topic "${TASK_TOPIC}")"
+    fi
+    local branch_name
+    if [[ -n "${topic_slug}" ]]; then
+        branch_name="ia-${selected_identity}/${role}/${topic_slug}-${date_str}"
+    else
+        branch_name="ia-${selected_identity}/${role}/task-${date_str}"
+    fi
 
     # Output via global variables so the caller can read the allocation without
     # command substitution (which would close the lock descriptor and break
@@ -1403,6 +1413,84 @@ _ensure_task_note() {
 hmvip resume ${identity}
 \`\`\`
 EOF
+}
+
+# Convert a human-readable topic into a Git-branch-safe slug.
+_ag_slugify_topic() {
+    local topic="$1"
+    ${AG_PYTHON} -c "
+import re, sys
+t = sys.argv[1].lower().strip()
+t = re.sub(r'[^a-z0-9]+', '-', t)
+t = t.strip('-')
+t = re.sub(r'-+', '-', t)
+print(t[:50])
+" "${topic}" 2>/dev/null || echo ''
+}
+
+# Update the slot task note with the current branch and optional topic.
+# Creates the note if it does not exist.
+_update_task_note_branch_topic() {
+    local identity="$1"
+    local branch="$2"
+    local topic="${3:-}"
+    local tasks_dir="${_AG_REPO_ROOT}/.agent-guard/tasks"
+    mkdir -p "${tasks_dir}"
+    local note_file="${tasks_dir}/${identity}.md"
+    local today
+    today="$(date +%Y-%m-%d)"
+
+    if [[ ! -f "${note_file}" ]]; then
+        local topic_line=""
+        [[ -n "${topic}" ]] && topic_line=" — ${topic}"
+        cat > "${note_file}" <<EOF
+# Tarefa do slot \`${identity}\`${topic_line}
+
+> Arquivo lido por \`hmvip resume ${identity}\`. Atualizar via PR quando a tarefa do slot mudar.
+
+**Branch:** \`${branch}\`
+**Tópico:** \`${topic:-não definido}\`
+
+## Tarefa ATUAL — ${today}
+**Descreva aqui o trabalho em andamento.**
+
+### Commits/PRs recentes
+(nenhum)
+
+### Próximo passo
+(não definido)
+
+### Como retomar
+\`\`\`bash
+hmvip resume ${identity}
+\`\`\`
+EOF
+        return 0
+    fi
+
+    # Note exists: append/update branch/topic markers so retomada always points
+    # to the current work. Avoid rewriting the whole file to preserve user edits.
+    local tmp_file
+    tmp_file="$(mktemp)"
+
+    if grep -q "^\\*\\*Branch:\\*\\*" "${note_file}" 2>/dev/null; then
+        sed "s|^\\*\\*Branch:\\*\\* .*|**Branch:** \`${branch}\`|" "${note_file}" > "${tmp_file}"
+    else
+        cp "${note_file}" "${tmp_file}"
+        {
+            echo ""
+            echo "**Branch:** \`${branch}\`"
+        } >> "${tmp_file}"
+    fi
+
+    if grep -q "^\\*\\*Tópico:\\*\\*" "${tmp_file}" 2>/dev/null; then
+        sed -i "s|^\\*\\*Tópico:\\*\\* .*|**Tópico:** \`${topic:-não definido}\`|" "${tmp_file}"
+    else
+        # Insert topic line right after the branch line.
+        sed -i "/^\\*\\*Branch:\\*\\* .*/a\\**Tópico:** \`${topic:-não definido}\`" "${tmp_file}"
+    fi
+
+    mv "${tmp_file}" "${note_file}"
 }
 
 # ---------------------------------------------------------------------------
@@ -1763,6 +1851,7 @@ FORCED_IDENTITY=""
 FORCE_RELEASE="false"
 USE_WORKTREE="true"
 MODE="acquire"
+TASK_TOPIC=""
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -1845,6 +1934,34 @@ while [[ $# -gt 0 ]]; do
             ;;
         --no-worktree)
             USE_WORKTREE="false"
+            shift
+            ;;
+        --topic)
+            if [[ -n "${2:-}" ]]; then
+                TASK_TOPIC="$2"
+                shift 2
+            else
+                echo "❌ --topic requires a description (ex: 'fix agent-guard dead pid')." >&2
+                return 1 2>/dev/null || exit 1
+            fi
+            ;;
+        --topic=*)
+            TASK_TOPIC="${1#--topic=}"
+            shift
+            ;;
+        --rename-topic)
+            if [[ -n "${2:-}" ]]; then
+                TASK_TOPIC="$2"
+                MODE="rename-topic"
+                shift 2
+            else
+                echo "❌ --rename-topic requires a new description (ex: 'F2 integrate checkout')." >&2
+                return 1 2>/dev/null || exit 1
+            fi
+            ;;
+        --rename-topic=*)
+            TASK_TOPIC="${1#--rename-topic=}"
+            MODE="rename-topic"
             shift
             ;;
         -*)
@@ -2391,6 +2508,94 @@ if [[ "${MODE}" == "orphan-sweep" ]]; then
 fi
 
 # ---------------------------------------------------------------------------
+# 8.7 --rename-topic mode (rename current task branch to a descriptive slug)
+# ---------------------------------------------------------------------------
+if [[ "${MODE}" == "rename-topic" ]]; then
+    CURRENT_DIR="$(pwd)"
+    CURRENT_WORKTREE=""
+    CURRENT_IDENTITY=""
+    CURRENT_BRANCH=""
+
+    if git -C "${CURRENT_DIR}" rev-parse --show-toplevel >/dev/null 2>&1; then
+        CURRENT_WORKTREE="$(git -C "${CURRENT_DIR}" rev-parse --show-toplevel 2>/dev/null || echo "")"
+        CURRENT_BRANCH="$(git -C "${CURRENT_DIR}" branch --show-current 2>/dev/null || echo "")"
+        if [[ -n "${CURRENT_WORKTREE}" ]]; then
+            wt_name="$(basename "${CURRENT_WORKTREE}")"
+            CURRENT_IDENTITY="$(_detect_identity_from_worktree_name "${wt_name}" | awk '{print $1 $2}')"
+        fi
+    fi
+
+    if [[ -z "${CURRENT_IDENTITY}" ]]; then
+        echo "❌ --rename-topic must be run from an agent worktree." >&2
+        return 1 2>/dev/null || exit 1
+    fi
+
+    if [[ -z "${TASK_TOPIC}" ]]; then
+        echo "❌ --rename-topic requires a new description." >&2
+        return 1 2>/dev/null || exit 1
+    fi
+
+    RT_NEW_SLUG="$(_ag_slugify_topic "${TASK_TOPIC}")"
+    if [[ -z "${RT_NEW_SLUG}" ]]; then
+        echo "❌ Could not produce a valid branch slug from '${TASK_TOPIC}'." >&2
+        return 1 2>/dev/null || exit 1
+    fi
+
+    RT_EXPECTED_PREFIX="ia-${CURRENT_IDENTITY}/"
+    if [[ "${CURRENT_BRANCH}" != "${RT_EXPECTED_PREFIX}"* ]]; then
+        echo "❌ Current branch '${CURRENT_BRANCH}' does not belong to ${CURRENT_IDENTITY}." >&2
+        echo "   --rename-topic only works on this identity's own task branches." >&2
+        return 1 2>/dev/null || exit 1
+    fi
+
+    RT_ROLE="$(git -C "${CURRENT_WORKTREE}" config --worktree user.role 2>/dev/null || echo "")"
+    if [[ -z "${RT_ROLE}" ]]; then
+        RT_ROLE="${CURRENT_BRANCH#${RT_EXPECTED_PREFIX}}"
+        RT_ROLE="${RT_ROLE%%/*}"
+    fi
+    if [[ -z "${RT_ROLE}" ]]; then
+        RT_ROLE="ia-a"
+    fi
+
+    RT_DATE_STR="$(date +%Y%m%d-%H%M)"
+    RT_NEW_BRANCH="${RT_EXPECTED_PREFIX}${RT_ROLE}/${RT_NEW_SLUG}-${RT_DATE_STR}"
+
+    if git -C "${CURRENT_WORKTREE}" show-ref --verify --quiet "refs/heads/${RT_NEW_BRANCH}" 2>/dev/null; then
+        echo "❌ Branch '${RT_NEW_BRANCH}' already exists." >&2
+        return 1 2>/dev/null || exit 1
+    fi
+
+    if ! git -C "${CURRENT_WORKTREE}" checkout -b "${RT_NEW_BRANCH}" >/dev/null 2>&1; then
+        echo "❌ Failed to create branch '${RT_NEW_BRANCH}'." >&2
+        return 1 2>/dev/null || exit 1
+    fi
+
+    impact_json="$(echo "${IMPACT_PLUGINS}" | ${AG_PYTHON} -c "import sys,json; print(json.dumps([p.strip() for p in sys.stdin.read().split(',') if p.strip()]))" 2>/dev/null || echo "[]")"
+    _save_session "${CURRENT_IDENTITY}" "active" "${RT_ROLE}" "${RT_NEW_BRANCH}" "$(_ag_session_pid "${CURRENT_WORKTREE}")" "${CURRENT_WORKTREE}" "${impact_json}"
+    _update_task_note_branch_topic "${CURRENT_IDENTITY}" "${RT_NEW_BRANCH}" "${TASK_TOPIC}"
+
+    RT_PR_WARNING=""
+    if command -v gh >/dev/null 2>&1; then
+        RT_OPEN_PRS="$(gh pr list --head "${CURRENT_BRANCH}" --state open --json number --jq '.[].number' 2>/dev/null || true)"
+        if [[ -n "${RT_OPEN_PRS}" ]]; then
+            RT_PR_WARNING="Open PR(s) still point to the old branch: ${RT_OPEN_PRS}. Update or close them manually."
+        fi
+    fi
+
+    echo ""
+    echo "🛡️  Agent Guard: renamed worktree branch"
+    echo "   Identity: ${CURRENT_IDENTITY}"
+    echo "   Old:      ${CURRENT_BRANCH}"
+    echo "   New:      ${RT_NEW_BRANCH}"
+    if [[ -n "${RT_PR_WARNING}" ]]; then
+        echo ""
+        echo "⚠️  ${RT_PR_WARNING}"
+    fi
+    echo ""
+    return 0 2>/dev/null || exit 0
+fi
+
+# ---------------------------------------------------------------------------
 # 9. --triage mode
 # ---------------------------------------------------------------------------
 if [[ "${MODE}" == "triage" ]]; then
@@ -2450,6 +2655,9 @@ if [[ "${MODE}" == "attach" ]]; then
 
     impact_json="$(echo "${IMPACT_PLUGINS}" | ${AG_PYTHON} -c "import sys,json; print(json.dumps([p.strip() for p in sys.stdin.read().split(',') if p.strip()]))" 2>/dev/null || echo "[]")"
     _save_session "${IDENTITY_FROM_BRANCH}" "active" "${ROLE}" "${ATTACH_BRANCH}" "$(_ag_session_pid "${WORKTREE_PATH}")" "${WORKTREE_PATH}" "${impact_json}"
+
+    # Keep the slot task note aligned with the current branch/topic.
+    _update_task_note_branch_topic "${IDENTITY_FROM_BRANCH}" "${ATTACH_BRANCH}" "${TASK_TOPIC}"
 
     if command -v _journal_attach >/dev/null 2>&1; then
         _journal_attach "${ATTACH_BRANCH}"
@@ -2614,6 +2822,9 @@ if [[ "${MODE}" == "adopt" ]]; then
     # Expanded slots (beyond the base count) must have a retomada note.
     _ensure_task_note "${ADOPT_IDENTITY}"
 
+    # Keep the slot task note aligned with the current branch/topic.
+    _update_task_note_branch_topic "${ADOPT_IDENTITY}" "${ADOPT_BRANCH}" "${TASK_TOPIC}"
+
     if command -v _journal_adopt >/dev/null 2>&1; then
         _journal_adopt "${ADOPT_BRANCH}"
     fi
@@ -2677,22 +2888,40 @@ elif [[ -n "${CURRENT_IDENTITY}" && -n "${CURRENT_BRANCH}" && "${CURRENT_BRANCH}
     existing_status="$(_load_session_field "${CURRENT_IDENTITY}" "status")"
     if [[ "${existing_status}" == "active" && -n "${existing_pid}" && "${existing_pid}" != "$(_ag_session_pid "${CURRENT_WORKTREE}")" ]]; then
         if _is_pid_alive "${existing_pid}"; then
-            echo ""
-            echo "❌❌❌ ERROR: WORKTREE ALREADY IN USE ❌❌❌" >&2
-            echo "" >&2
-            echo "   Identity '${CURRENT_IDENTITY}' is already held by PID ${existing_pid}." >&2
-            echo "   Worktree: ${CURRENT_WORKTREE}" >&2
-            echo "" >&2
-            echo "   Possible causes:" >&2
-            echo "     - A previous session released the lease but its process is still running." >&2
-            echo "     - Another terminal/chat is using this worktree." >&2
-            echo "" >&2
-            echo "   Resolution:" >&2
-            echo "     1. Find the other session and close it, OR" >&2
-            echo "     2. Start from ${MAIN_REPO} to get a free worktree, OR" >&2
-            echo "     3. Use --attach to explicitly reattach to your own branch." >&2
-            echo "" >&2
-            return 1 2>/dev/null || exit 1
+            # Allow reuse when the recorded PID is the parent (or ancestor) of
+            # the current process. This happens when the user sources init or
+            # --adopt from a shell and then launches the agent wrapper from the
+            # same shell: the lease is temporarily bound to the shell's PID,
+            # and the wrapper is a child that should inherit it.
+            RT_CURRENT_PID="$$"
+            RT_IS_ANCESTOR="false"
+            RT_PROBE_PID="${RT_CURRENT_PID}"
+            while [[ -n "${RT_PROBE_PID}" && "${RT_PROBE_PID}" != "1" ]]; do
+                if [[ "${RT_PROBE_PID}" == "${existing_pid}" ]]; then
+                    RT_IS_ANCESTOR="true"
+                    break
+                fi
+                RT_PROBE_PID="$(awk '/^PPid:/{print $2}' /proc/${RT_PROBE_PID}/status 2>/dev/null || echo '')"
+            done
+
+            if [[ "${RT_IS_ANCESTOR}" != "true" ]]; then
+                echo ""
+                echo "❌❌❌ ERROR: WORKTREE ALREADY IN USE ❌❌❌" >&2
+                echo "" >&2
+                echo "   Identity '${CURRENT_IDENTITY}' is already held by PID ${existing_pid}." >&2
+                echo "   Worktree: ${CURRENT_WORKTREE}" >&2
+                echo "" >&2
+                echo "   Possible causes:" >&2
+                echo "     - A previous session released the lease but its process is still running." >&2
+                echo "     - Another terminal/chat is using this worktree." >&2
+                echo "" >&2
+                echo "   Resolution:" >&2
+                echo "     1. Find the other session and close it, OR" >&2
+                echo "     2. Start from ${MAIN_REPO} to get a free worktree, OR" >&2
+                echo "     3. Use --attach to explicitly reattach to your own branch." >&2
+                echo "" >&2
+                return 1 2>/dev/null || exit 1
+            fi
         fi
     fi
 
@@ -2737,6 +2966,9 @@ elif [[ -n "${CURRENT_IDENTITY}" && -n "${CURRENT_BRANCH}" && "${CURRENT_BRANCH}
 
     impact_json="$(echo "${IMPACT_PLUGINS}" | ${AG_PYTHON} -c "import sys,json; print(json.dumps([p.strip() for p in sys.stdin.read().split(',') if p.strip()]))" 2>/dev/null || echo "[]")"
     _save_session "${CURRENT_IDENTITY}" "active" "${ROLE}" "${CURRENT_BRANCH}" "$(_ag_session_pid "${CURRENT_WORKTREE}")" "${CURRENT_WORKTREE}" "${impact_json}"
+
+    # Keep the slot task note aligned with the current branch/topic.
+    _update_task_note_branch_topic "${CURRENT_IDENTITY}" "${CURRENT_BRANCH}" "${TASK_TOPIC}"
 
     if command -v _journal_init >/dev/null 2>&1; then
         _journal_init
@@ -2830,6 +3062,9 @@ _save_session "${IDENTITY}" "active" "${ROLE}" "${BRANCH_NAME}" "$(_ag_session_p
 
 # Expanded slots (beyond the base count) must have a retomada note.
 _ensure_task_note "${IDENTITY}"
+
+# Keep the slot task note aligned with the current branch/topic.
+_update_task_note_branch_topic "${IDENTITY}" "${BRANCH_NAME}" "${TASK_TOPIC}"
 
 if command -v _journal_init >/dev/null 2>&1; then
     _journal_init

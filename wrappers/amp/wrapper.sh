@@ -835,6 +835,15 @@ if ! _ag_have_lease; then
             fi
         fi
 
+        # Explicit slot request on a dirty worktree: prefer adopt so the user
+        # can inspect and continue the previous session's work. Without this,
+        # slots that were released with uncommitted changes (a drift condition
+        # reported by --status) become unreachable via `amp go <slot>`.
+        if [[ "${_ag_slot_mode}" == "acquire" && -d "${_ag_slot_worktree}" ]] && _ag_worktree_is_dirty "${_ag_slot_worktree}"; then
+            echo "🔄 AG WRAPPER: slot '${_AG_SLOT}' has uncommitted work; adopting for inspection..." >&2
+            _ag_slot_mode="adopt"
+        fi
+
         _ag_default_role="$(bash "${_AG_CONFIG_BIN}" get "wrappers.amp.default_role" "ia-a" 2>/dev/null || echo "ia-a")"
         ORIGINAL_ARGS=("$@")
         set --
