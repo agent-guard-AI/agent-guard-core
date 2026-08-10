@@ -2056,6 +2056,83 @@ _has_open_prs_for_identity() {
     [[ "${pr_count}" -gt 0 ]]
 }
 
+# Show a summary of open PRs belonging to the given identity.
+# Called during init/adopt/resume so the agent immediately sees work that may
+# need attention (checks failing, merge conflicts, stale PRs).
+# Fail-open: if gh is unavailable or the query fails, nothing is printed.
+_show_open_prs_for_identity() {
+    local identity="$1"
+
+    if ! command -v gh >/dev/null 2>&1; then
+        return 0
+    fi
+
+    local prs_json
+    prs_json="$(gh pr list --repo "hmvip-org/hmvip" \
+        --state open --limit 100 \
+        --json number,title,headRefName,mergeStateStatus,statusCheckRollup,updatedAt,url \
+        --jq ".[] | select(.headRefName | startswith(\"ia-${identity}/\"))" 2>/dev/null || true)"
+    if [[ -z "${prs_json}" ]]; then
+        return 0
+    fi
+
+    local count
+    count="$(echo "${prs_json}" | ${AG_PYTHON} -c "import sys,json; print(sum(1 for _ in sys.stdin if _.strip()))" 2>/dev/null || echo 0)"
+    if [[ "${count}" == "0" ]]; then
+        return 0
+    fi
+
+    echo ""
+    echo "📬 Open PRs for ${identity}:"
+    echo ""
+
+    # Print one summary line per PR.
+    echo "${prs_json}" | while IFS= read -r pr_line; do
+        [[ -z "${pr_line}" ]] && continue
+        local num title head merge_state url pending failed total status_emoji alert
+        num="$(echo "${pr_line}" | ${AG_PYTHON} -c "import sys,json; print(json.loads(sys.stdin.read()).get('number','?'))" 2>/dev/null || echo "?")"
+        title="$(echo "${pr_line}" | ${AG_PYTHON} -c "import sys,json; print(json.loads(sys.stdin.read()).get('title',''))" 2>/dev/null || echo "")"
+        head="$(echo "${pr_line}" | ${AG_PYTHON} -c "import sys,json; print(json.loads(sys.stdin.read()).get('headRefName',''))" 2>/dev/null || echo "")"
+        merge_state="$(echo "${pr_line}" | ${AG_PYTHON} -c "import sys,json; print(json.loads(sys.stdin.read()).get('mergeStateStatus',''))" 2>/dev/null || echo "")"
+        url="$(echo "${pr_line}" | ${AG_PYTHON} -c "import sys,json; print(json.loads(sys.stdin.read()).get('url',''))" 2>/dev/null || echo "")"
+
+        pending="$(echo "${pr_line}" | ${AG_PYTHON} -c "import sys,json; crs=json.loads(sys.stdin.read()).get('statusCheckRollup',[]); print(sum(1 for c in crs if c.get('status')!='COMPLETED'))" 2>/dev/null || echo 0)"
+        failed="$(echo "${pr_line}" | ${AG_PYTHON} -c "import sys,json; crs=json.loads(sys.stdin.read()).get('statusCheckRollup',[]); print(sum(1 for c in crs if c.get('status')=='COMPLETED' and c.get('conclusion') not in ('SUCCESS','SKIPPED','NEUTRAL'))))" 2>/dev/null || echo 0)"
+        total="$(echo "${pr_line}" | ${AG_PYTHON} -c "import sys,json; print(len(json.loads(sys.stdin.read()).get('statusCheckRollup',[])))" 2>/dev/null || echo 0)"
+
+        status_emoji="🟢"
+        alert=""
+        if [[ "${failed}" -gt 0 ]]; then
+            status_emoji="❌"
+            alert="checks falhos ${failed}/${total}"
+        elif [[ "${pending}" -gt 0 ]]; then
+            status_emoji="🔄"
+            alert="${pending}/${total} checks pendentes"
+        elif [[ "${total}" -gt 0 ]]; then
+            alert="${total}/${total} checks OK"
+        else
+            alert="sem checks"
+        fi
+
+        if [[ "${merge_state}" == "DIRTY" || "${merge_state}" == "BEHIND" ]]; then
+            alert="${alert}; conflito/rebase necessario"
+        elif [[ "${merge_state}" == "BLOCKED" ]]; then
+            alert="${alert}; bloqueado"
+        elif [[ "${merge_state}" == "CLEAN" || "${merge_state}" == "UNSTABLE" ]]; then
+            alert="${alert}; pronto para merge"
+        fi
+
+        # Trim title for display.
+        title_display="${title:0:50}"
+        [[ "${#title}" -gt 50 ]] && title_display="${title_display}..."
+
+        printf "   %s #%s %s\n" "${status_emoji}" "${num}" "${title_display}"
+        printf "      branch: %s | %s\n" "${head}" "${alert}"
+        printf "      %s\n" "${url}"
+    done
+    echo ""
+}
+
 # Check whether a slot qualifies for orphan rescue sweep.
 # Returns 0 when the slot is an orphan with a dirty worktree that we can safely
 # rescue and clean. Sets _OS_REASON with a human-readable classification.
@@ -2842,6 +2919,9 @@ if [[ "${MODE}" == "adopt" ]]; then
     else
         echo "✅ Session active on ${ADOPT_IDENTITY} — resumed from previous state."
     fi
+
+    _show_open_prs_for_identity "${ADOPT_IDENTITY}"
+
     echo ""
     return 0 2>/dev/null || exit 0
 fi
@@ -2978,6 +3058,9 @@ elif [[ -n "${CURRENT_IDENTITY}" && -n "${CURRENT_BRANCH}" && "${CURRENT_BRANCH}
     fi
 
     echo "✅ Git author set to ${GIT_AUTHOR_EMAIL}"
+
+    _show_open_prs_for_identity "${CURRENT_IDENTITY}"
+
     return 0 2>/dev/null || exit 0
 elif [[ -n "${CURRENT_IDENTITY}" && -n "${CURRENT_BRANCH}" && "${CURRENT_BRANCH}" == "_released/${CURRENT_IDENTITY}" ]]; then
     # The worktree was released to its neutral branch. Do not silently reuse
@@ -3107,6 +3190,8 @@ echo "=========================================================="
 echo ""
 echo "To release the session, run: source ${AGENT_GUARD_INIT_NAME:-.agent-guard-init} --release"
 echo ""
+
+    _show_open_prs_for_identity "${IDENTITY}"
 
     return 0 2>/dev/null || exit 0
 }

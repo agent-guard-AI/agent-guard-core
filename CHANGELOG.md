@@ -32,12 +32,19 @@ conteúdo de cada slot sem abrir o worktree.
     `source .hmvip-agent-init --adopt` no shell e depois executa `kimi` no
     mesmo shell — antes o wrapper recusava com "WORKTREE ALREADY IN USE".
 - `.kiro/shell/hmvip.sh`:
-  - `_hmvip_resolve_init_script()` agora usa **sempre** o stub
-    `.hmvip-agent-init` do repo principal (`/home/hmvip-dev/hmvip`), a menos que
-    `HMVIP_USE_WORKTREE_INIT=1` seja definido. Worktrees de IA ficam em branches
-    antigas com frequência; usar o stub daquele worktree para operar em *outros*
-    slots reproduzia bugs já corrigidos na develop (ex: `linha 564: $2: variável
-    não associada` ao adotar um slot a partir de um worktree desatualizado).
+  - `_hmvip_resolve_init_script()` escolhe o stub `.hmvip-agent-init` mais
+    atualizado disponível. Prioridade: repo principal quando está em
+    `develop`/`main`; depois um worktree em `develop`/`main`; depois o worktree
+    cujo `packages/agent-guard-core` tenha o commit mais recente. Isso evita que
+    `hmvip go/ad` use um init desatualizado quando o repo principal está
+    estacionado em uma task branch antiga (cenário comum no setup multi-IA).
+- `src/init.sh`:
+  - Nova função `_show_open_prs_for_identity()` que consulta PRs abertos do slot
+    e exibe resumo (número, título, estado dos checks, merge state, URL) ao
+    final de `init`, `--adopt` e reuse mode. A IA passa a ver imediatamente, ao
+    retomar um slot, quais PRs precisam de atenção — checks falhos, conflito,
+    bloqueado ou pronto para merge. A consulta é fail-open: se `gh` falhar ou
+    não houver PRs, a inicialização continua normalmente.
 - Wrappers Kimi/Amp (`wrappers/kimi/wrapper.sh`, `wrappers/amp/wrapper.sh`):
   - Requisição explícita de slot (`hmvip go <slot>` / `amp go <slot>`) em um
     worktree sujo agora entra no modo **adopt** automaticamente, em vez de
