@@ -281,6 +281,27 @@ if [[ -f "${PAS_SCAN}" ]]; then
 fi
 
 # -------------------------------------------------------------------------
+# Local pre-flight quality gates (HMVIP cost guard)
+# -------------------------------------------------------------------------
+# Roda o pre-flight check local para evitar erros "bobos" que geram re-runs
+# caros no GitHub Actions. A chamada eh condicional porque o script nao existe
+# no upstream agent-guard-core — so no HMVIP.
+# Ver: .agents/skills/hmvip-workflow-cost-governance/SKILL.md
+# -------------------------------------------------------------------------
+PRE_FLIGHT="${REPO_ROOT}/.agent/scripts/hmvip-pre-flight-check.sh"
+if [[ -f "${PRE_FLIGHT}" ]]; then
+    echo "🔍 [GUARD] Running local pre-flight quality gates..."
+    if ! bash "${PRE_FLIGHT}"; then
+        echo ""
+        echo "❌ [GUARD] Pre-flight local failed. Fix before pushing."
+        echo "   Run manually: bash ${PRE_FLIGHT}"
+        echo ""
+        exit 1
+    fi
+    echo "✅ [GUARD] Pre-flight local passed"
+fi
+
+# -------------------------------------------------------------------------
 # Send worktree origin notes
 # -------------------------------------------------------------------------
 # For AI agents, notes are mandatory; fail the push if they cannot be sent.
