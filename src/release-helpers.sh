@@ -620,7 +620,7 @@ _cleanup_shared_pid_sessions() {
         inspected=$((inspected + 1))
         # Sort by last_activity descending (most recent first); format is identity:timestamp.
         local sorted keeper
-        sorted="$(echo "${entries}" | tr ',' '\n' | sort -t':' -k2 -nr)"
+        sorted="$(echo "${entries}" | tr ',' '\n' | LC_ALL=C sort -t':' -k2 -nr)"
         keeper="$(echo "${sorted}" | head -n1 | cut -d':' -f1)"
 
         echo "🧩 Shared PID ${pid} held by ${count} slots; keeping ${keeper} (most recent activity)." >&2

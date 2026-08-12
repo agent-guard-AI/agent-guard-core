@@ -24,6 +24,24 @@ Adiciona limpeza automática de slots que compartilham o mesmo PID vivo. Esse
     preservação do mais recente, proteção de worktree sujo e dispatch via
     CLI `cleanup-stale`.
 
+### Correções na 0.10.4
+
+- `src/release-helpers.sh`:
+  - `_cleanup_shared_pid_sessions()` agora usa `LC_ALL=C` na ordenação por
+    `last_activity`. Sem isso, locales onde a vírgula é separador decimal
+    (ex.: `pt_BR`) faziam `sort -n` tratar `1786543661.967517` como menor que
+    `1786540475.0792904`, mantendo o slot *mais antigo* e tentando liberar o
+    mais recente.
+- `tests/agent-guard/agent-guard-shared-pid-cleanup-test.sh`:
+  - Novo caso de teste com timestamps fracionados para garantir que a
+    ordenação seja estável independentemente do locale do runner.
+- `.kiro/scripts/agent-guard-cleanup.sh`:
+  - Agora resolve o init stub mais atualizado disponível (repo principal em
+    `develop`/`main`, worktree em trunk, ou worktree com
+    `packages/agent-guard-core` modificado mais recentemente). Antes, o script
+    usava sempre o stub do repo principal, que frequentemente fica em branch
+    antiga neste setup multi-IA e não continha o shared-PID cleanup.
+
 ## 0.10.3 — Dead-PID Stale Cleanup + Descriptive Branch Names
 
 Corrige a falha de engenharia onde sessões cujo PID havia morrido permaneciam
