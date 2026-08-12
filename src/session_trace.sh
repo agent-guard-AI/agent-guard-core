@@ -316,7 +316,43 @@ _trace_checkpoint() {
         _journal_write_event "trace_checkpoint" "$(echo "{}" | ${AG_PYTHON} -c "import json,sys; print(json.dumps({'checkpoint_id':'${checkpoint_id}','sha':'${commit_sha}','ref':'${AGENT_GUARD_SESSION_REF}','message':'${message}'}))" 2>/dev/null || echo '{}')" >/dev/null 2>&1 || true
     fi
 
+    # Limpa cópias locais antigas (a ref Git permanece como fonte verdade).
+    _trace_prune_local_checkpoints "${session_dir}" >/dev/null 2>&1 || true
+
     echo "${checkpoint_id}"
+}
+
+# Remove checkpoints locais mais antigos que o limite configurado.
+# A fonte verdadeira permanece na ref Git refs/agent-guard/sessions/v1.
+_trace_prune_local_checkpoints() {
+    local session_dir="${1:-}"
+    if [[ -z "${session_dir}" ]]; then
+        session_dir="$(_trace_get_session_dir)"
+    fi
+
+    local checkpoints_dir="${session_dir}/checkpoints"
+    if [[ ! -d "${checkpoints_dir}" ]]; then
+        return 0
+    fi
+
+    local retention_days
+    retention_days="${AGENT_GUARD_LOCAL_CHECKPOINT_RETENTION_DAYS:-3}"
+    if ! [[ "${retention_days}" =~ ^[0-9]+$ ]] || [[ "${retention_days}" -le 0 ]]; then
+        retention_days=3
+    fi
+
+    local cutoff
+    cutoff="$(date -u +%s)"
+    cutoff=$((cutoff - retention_days * 86400))
+
+    local checkpoint_dir basename ts
+    while IFS= read -r checkpoint_dir; do
+        basename="$(basename "${checkpoint_dir}")"
+        ts="${basename%%-*}"
+        if [[ "${ts}" =~ ^[0-9]+$ ]] && [[ "${ts}" -lt "${cutoff}" ]]; then
+            rm -rf "${checkpoint_dir}"
+        fi
+    done < <(find "${checkpoints_dir}" -maxdepth 1 -mindepth 1 -type d 2>/dev/null)
 }
 
 # Constroi uma tree Git a partir de arquivos em um diretório.
