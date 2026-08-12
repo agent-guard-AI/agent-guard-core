@@ -11,6 +11,7 @@ paths:
   main_repo: /home/user/projects/my-project
   base_dir: /home/user/projects
   package_root: packages/agent-guard-core
+  triage_script: .agent-guard/branch-triage.sh
   session_storage: .agent-guard/sessions
   init_script: .agent-guard-init
 

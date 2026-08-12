@@ -2744,7 +2744,10 @@ fi
 # 9. --triage mode
 # ---------------------------------------------------------------------------
 if [[ "${MODE}" == "triage" ]]; then
-    local triage_script="${_AG_REPO_ROOT}/${PACKAGE_ROOT}/ci/branch-triage.sh"
+    local package_root triage_script
+    package_root="$(_guard_get_str "paths.package_root" "packages/agent-guard-core")"
+    triage_script="$(_guard_get_str "paths.triage_script" "${package_root}/ci/branch-triage.sh")"
+    triage_script="${_AG_REPO_ROOT}/${triage_script}"
     if [[ -f "${triage_script}" ]]; then
         bash "${triage_script}" "${PREFIX}"
     else
