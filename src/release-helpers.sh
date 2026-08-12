@@ -580,11 +580,89 @@ print(json.dumps({'reason': '${reason}', 'blockers': ['${atomic_blocker}'], 'wor
 }
 
 # ---------------------------------------------------------------------------
+# Helper: detect slots sharing the same live PID (usually one IDE process that
+# acquired multiple leases and never released the secondary ones). Keep the
+# most recently active identity and auto-release the others if safe.
+# ---------------------------------------------------------------------------
+_cleanup_shared_pid_sessions() {
+    local dry_run="${1:-}"
+    local identity_list prefix i identity pid last_activity
+    declare -A pid_to_idents
+
+    identity_list="$(bash "${AGENT_GUARD_CONFIG_BIN}" keys identities 2>/dev/null || true)"
+    for prefix in ${identity_list}; do
+        [[ -z "${prefix}" ]] && continue
+        local base_slots max_slots
+        base_slots="$(_guard_get "identities.${prefix}.slots" 2>/dev/null || echo "0")"
+        max_slots="$(_guard_get "identities.${prefix}.max_slots" "${base_slots}" 2>/dev/null || echo "${base_slots}")"
+        for i in $(seq 1 "${max_slots}"); do
+            identity="${prefix}${i}"
+            local sess_status sess_pid sess_last
+            sess_status="$(_load_session_field "${identity}" "status")"
+            sess_pid="$(_load_session_field "${identity}" "pid")"
+            sess_last="$(_load_session_field "${identity}" "last_activity")"
+
+            [[ "${sess_status}" == "active" ]] || continue
+            [[ -n "${sess_pid}" ]] || continue
+            _is_pid_alive "${sess_pid}" || continue
+
+            pid_to_idents["${sess_pid}"]="${pid_to_idents[${sess_pid}]:-}${pid_to_idents[${sess_pid}]:+,}${identity}:${sess_last}"
+        done
+    done
+
+    local released=0 skipped=0 inspected=0
+    for pid in "${!pid_to_idents[@]}"; do
+        local entries="${pid_to_idents[${pid}]}"
+        local count
+        count="$(echo "${entries}" | tr ',' '\n' | wc -l)"
+        [[ "${count}" -gt 1 ]] || continue
+
+        inspected=$((inspected + 1))
+        # Sort by last_activity descending (most recent first); format is identity:timestamp.
+        local sorted keeper
+        sorted="$(echo "${entries}" | tr ',' '\n' | sort -t':' -k2 -nr)"
+        keeper="$(echo "${sorted}" | head -n1 | cut -d':' -f1)"
+
+        echo "🧩 Shared PID ${pid} held by ${count} slots; keeping ${keeper} (most recent activity)." >&2
+
+        local entry
+        while IFS= read -r entry; do
+            identity="$(echo "${entry}" | cut -d':' -f1)"
+            [[ -z "${identity}" ]] && continue
+            local worktree_path
+            worktree_path="$(_get_worktree_path "${identity}")"
+
+            if [[ "${dry_run}" == "--dry-run" ]]; then
+                echo "   [dry-run] would auto-release ${identity}" >&2
+                continue
+            fi
+
+            if _auto_release_if_safe "${identity}" "${worktree_path}" "shared_pid" "shared_pid_cleanup_blocked"; then
+                released=$((released + 1))
+            else
+                echo "   🔒 ${identity} shares PID ${pid} but cannot be auto-released." >&2
+                skipped=$((skipped + 1))
+            fi
+        done < <(echo "${sorted}" | tail -n +2)
+    done
+
+    if [[ "${dry_run}" != "--dry-run" ]]; then
+        echo "🧹 Shared-PID cleanup complete: ${inspected} groups inspected, ${released} released, ${skipped} skipped." >&2
+    fi
+    return 0
+}
+
+# ---------------------------------------------------------------------------
 # Helper: scan all slots and auto-release stale ones that are safe to release.
 # ---------------------------------------------------------------------------
 _cleanup_stale_sessions() {
     local identity_list prefix i identity worktree_path
     local released=0 skipped=0
+
+    # First, release secondary slots that share a live PID with another slot.
+    # This must happen before stale cleanup so a freshly-released slot is not
+    # immediately re-scanned as stale.
+    _cleanup_shared_pid_sessions
 
     identity_list="$(bash "${AGENT_GUARD_CONFIG_BIN}" keys identities 2>/dev/null || true)"
     for prefix in ${identity_list}; do

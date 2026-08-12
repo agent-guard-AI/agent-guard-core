@@ -1,5 +1,29 @@
 # Changelog — agent-guard-core
 
+## 0.10.4 — Shared-PID Cleanup
+
+Adiciona limpeza automática de slots que compartilham o mesmo PID vivo. Esse
+ cenário ocorre quando um único processo IDE (ex.: `kimi-code`) adquire leases
+ de múltiplos slots e libera apenas o primário, deixando os secundários
+ fantasmas no `--status`. A melhoria mantém o slot com atividade mais recente
+ e libera os demais de forma segura (worktree limpo + sem PRs abertos).
+
+- `src/release-helpers.sh`:
+  - Nova função `_cleanup_shared_pid_sessions()` que detecta grupos de slots
+    ativos apontando para o mesmo PID vivo, ordena por `last_activity`
+    descendente e tenta auto-release dos secundários via
+    `_auto_release_if_safe()`.
+  - `_cleanup_stale_sessions()` agora invoca `_cleanup_shared_pid_sessions()`
+    antes da limpeza por stale time/PID morto, garantindo que leases órfãos
+    sejam tratados em primeiro lugar.
+  - Liberação de shared-PID é auditada no journal com ação
+    `shared_pid_cleanup_blocked` quando bloqueada por worktree sujo ou PRs
+    abertos.
+- `tests/agent-guard/agent-guard-shared-pid-cleanup-test.sh`:
+  - Testes comportamentais cobrindo: liberação do slot menos recente,
+    preservação do mais recente, proteção de worktree sujo e dispatch via
+    CLI `cleanup-stale`.
+
 ## 0.10.3 — Dead-PID Stale Cleanup + Descriptive Branch Names
 
 Corrige a falha de engenharia onde sessões cujo PID havia morrido permaneciam
