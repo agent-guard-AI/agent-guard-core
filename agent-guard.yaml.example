@@ -51,6 +51,13 @@ identities:
     worktree_prefix: myproject-ia-amp
     author_email: agent-amp{n}@example.dev
     author_name: MyProject Amp{n} Agent
+  kilo:
+    slots: 2
+    max_slots: 6
+    auto_expand: true
+    worktree_prefix: myproject-ia-kilo
+    author_email: agent-kilo{n}@example.dev
+    author_name: MyProject Kilo{n} Agent
 
 git:
   protected_branches:
@@ -100,3 +107,11 @@ wrappers:
     real_bin_path: /home/user/.amp/bin/amp
     default_role: ia-a
     identity_prefix: amp
+  kilo:
+    bin_dir: /home/user/.kilocode/bin
+    real_bin: kilo.real
+    default_role: ia-a
+  kilo:
+    bin_dir: /home/user/.kilocode/bin
+    real_bin: kilo.real
+    default_role: ia-a
