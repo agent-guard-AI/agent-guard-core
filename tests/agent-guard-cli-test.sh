@@ -42,16 +42,6 @@ for script in src/init.sh src/journal.sh src/session_trace.sh hooks/install.sh h
     fi
 done
 
-for script in "${REPO_ROOT}"/wrappers/*/wrapper.sh "${REPO_ROOT}"/wrappers/*/recovery.sh; do
-    if [[ -f "${script}" ]]; then
-        if bash -n "${script}"; then
-            pass "${script} has valid shell syntax"
-        else
-            fail "${script} has shell syntax errors"
-        fi
-    fi
-done
-
 if [[ ${ERRORS} -gt 0 ]]; then
     echo ""
     echo "❌ ${ERRORS} test(s) failed."

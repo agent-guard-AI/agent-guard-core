@@ -4,7 +4,7 @@ Protocolo open source de governança multi-IA para repositórios Git.
 
 Permite que múltiplos agentes de IA CLI colaborem no mesmo repositório sem colidir em branches, worktrees ou commits.
 
-> ⚠️ **Compatibilidade de wrappers:** o protocolo e os hooks são genéricos e podem ser estendidos para várias identidades. Wrappers CLI oficiais e testados: **Kimi (Moonshot AI)**, **Amp (Sourcegraph)** e **Kilo (Kilo Code / Kilo CLI)**. Outros agentes (Claude, Gemini, Grok etc.) podem usar o protocolo via init stub manual, mas não há wrapper automático para eles.
+> ⚠️ **Compatibilidade de wrappers:** o protocolo e os hooks são genéricos e podem ser estendidos para várias identidades. Wrappers CLI oficiais e testados: **Kimi (Moonshot AI)** e **Amp (Sourcegraph)**. Outros agentes (Claude, Gemini, Grok etc.) podem usar o protocolo via init stub manual, mas não há wrapper automático para eles.
 
 ## Por que usar
 
@@ -51,11 +51,8 @@ agent-guard-core/
 │   ├── kimi/
 │   │   ├── wrapper.sh           # Wrapper do Kimi CLI
 │   │   └── recovery.sh          # Restaura wrapper após updates
-│   ├── amp/
-│   │   ├── wrapper.sh           # Wrapper do Amp CLI (Sourcegraph)
-│   │   └── recovery.sh          # Restaura wrapper após updates
-│   └── kilo/
-│       ├── wrapper.sh           # Wrapper do Kilo CLI
+│   └── amp/
+│       ├── wrapper.sh           # Wrapper do Amp CLI (Sourcegraph)
 │       └── recovery.sh          # Restaura wrapper após updates
 ├── tests/
 │   └── run-all.sh               # Testes funcionais básicos
@@ -265,7 +262,7 @@ O script rejeita commits de IA que não carreguem metadados de worktree ou cujo 
 
 Adapters são thin wrappers que interceptam a chamada da ferramenta de IA e redirecionam para um worktree livre antes de delegar ao binário real.
 
-> **Atenção:** nesta versão, os adapters implementados e testados são os **wrappers do Kimi (Moonshot AI)** em `wrappers/kimi/`, do **Amp (Sourcegraph)** em `wrappers/amp/` e do **Kilo (Kilo Code / Kilo CLI)** em `wrappers/kilo/`. Outras ferramentas de IA CLI não possuem wrapper automático e devem usar o init stub manualmente.
+> **Atenção:** nesta versão, os adapters implementados e testados são os **wrappers do Kimi (Moonshot AI)** em `wrappers/kimi/` e do **Amp (Sourcegraph)** em `wrappers/amp/`. Outras ferramentas de IA CLI não possuem wrapper automático e devem usar o init stub manualmente.
 
 ### Wrapper Kimi (`wrappers/kimi/`)
 
@@ -321,47 +318,6 @@ Notas de implementação:
   bash packages/agent-guard-core/wrappers/kimi/recovery.sh --remove-wrapper
   ```
 
-### Wrapper Kilo (`wrappers/kilo/`)
-
-O wrapper `wrappers/kilo/wrapper.sh` substitui o binário `kilo` do Kilo Code / Kilo CLI para impor isolamento automaticamente, com o mesmo comportamento do wrapper Kimi:
-
-- Detecta automaticamente o repositório via `git rev-parse --show-toplevel`.
-- Lê `agent-guard.yaml` para descobrir caminhos, identidades e o binário real do Kilo.
-- Impede execução no repo principal e redireciona para um worktree livre.
-- Bloqueia worktrees sujos ou já em uso por outro processo.
-
-#### Seleção explícita de slot (`--slot` / `AGENT_GUARD_SLOT`)
-
-Por padrão o wrapper escolhe o slot automaticamente (retoma a última sessão ativa ou aloca o primeiro livre). Para ir direto a um slot específico em um único comando:
-
-```bash
-kilo --slot kilo3            # de qualquer diretório do ecossistema
-AGENT_GUARD_SLOT=kilo3 kilo  # equivalente via variável de ambiente
-```
-
-O wrapper decide automaticamente entre os três fluxos (Recusa / Adopt / Acquire) descritos acima para o Kimi.
-
-Notas de implementação:
-
-- O flag é consumido pelo wrapper e **nunca** é repassado ao binário real. Se o CLI um dia introduzir seu próprio `--slot`, use `AGENT_GUARD_SLOT`.
-- Cada wrapper só aceita slots da própria família de identidade (o wrapper Kilo aceita `kiloN`, nunca `claudeN`/`kimiN`). Configurável via `wrappers.kilo.identity_prefix` no `agent-guard.yaml`.
-- A detecção de processo ativo considera `comm == "kilo"` / `comm == "kilocode"` e argv contendo `kilo`/`kilocode`.
-
-**Instalação manual do wrapper:**
-
-```bash
-mv <bin_dir>/kilo <bin_dir>/kilo.real
-cp packages/agent-guard-core/wrappers/kilo/wrapper.sh <bin_dir>/kilo
-chmod +x <bin_dir>/kilo
-```
-
-- Recuperação automática após updates do Kilo CLI:
-  ```bash
-  bash packages/agent-guard-core/wrappers/kilo/recovery.sh
-  ```
-  O recovery faz backup do binário real em `kilo.real.<timestamp>` antes de
-  restaurar o wrapper e mantém apenas os 3 backups mais novos
-  (`AG_KILO_BACKUP_KEEP` para customizar), evitando acúmulo em disco.
 ### Wrapper Amp (`wrappers/amp/`)
 
 O wrapper `wrappers/amp/wrapper.sh` impõe isolamento automático para o Amp CLI (Sourcegraph). Diferente do wrapper Kimi (que substitui o binário in-place), o wrapper Amp vive em um diretório estável (`~/.local/hmvip/bin/amp`) que o auto-updater do Amp não toca, evitando quebras em updates.

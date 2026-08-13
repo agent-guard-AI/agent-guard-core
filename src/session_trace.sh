@@ -257,11 +257,17 @@ _trace_checkpoint() {
     mkdir -p "${cp_dir}"
 
     # Copia arquivos do trace atual.
+    # IMPORTANT: transcript.jsonl é truncado para as últimas 200 linhas antes
+    # de entrar no checkpoint Git. Transcripts completos (~13.4 MB de média)
+    # versionados em refs/agent-guard/sessions/v1 geram ~600 MB de bloat em 3
+    # dias, tornando cada checkout de CI (fetch-depth: 0) 30–60s mais lento.
+    # O transcript COMPLETO é preservado localmente em
+    # .agent-guard/session/checkpoints/<id>/transcript-full.jsonl (gitignored).
     if [[ -f "${session_dir}/current/session.json" ]]; then
         cp "${session_dir}/current/session.json" "${cp_dir}/session.json"
     fi
     if [[ -f "${session_dir}/current/transcript.jsonl" ]]; then
-        cp "${session_dir}/current/transcript.jsonl" "${cp_dir}/transcript.jsonl"
+        tail -n 200 "${session_dir}/current/transcript.jsonl" > "${cp_dir}/transcript.jsonl"
     fi
 
     # Estado do worktree.
@@ -310,6 +316,11 @@ _trace_checkpoint() {
 
     # Salva cópia local do checkpoint para acesso rápido.
     cp -r "${cp_dir}" "${session_dir}/checkpoints/${checkpoint_id}"
+
+    # Preserva o transcript COMPLETO localmente (fora do Git ref) para recovery.
+    if [[ -f "${session_dir}/current/transcript.jsonl" ]]; then
+        cp "${session_dir}/current/transcript.jsonl" "${session_dir}/checkpoints/${checkpoint_id}/transcript-full.jsonl"
+    fi
 
     # Registra no journal central.
     if command -v _journal_write_event >/dev/null 2>&1; then
