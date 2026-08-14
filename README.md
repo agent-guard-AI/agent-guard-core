@@ -4,7 +4,7 @@ Protocolo open source de governança multi-IA para repositórios Git.
 
 Permite que múltiplos agentes de IA CLI colaborem no mesmo repositório sem colidir em branches, worktrees ou commits.
 
-> ⚠️ **Compatibilidade de wrappers:** o protocolo e os hooks são genéricos e podem ser estendidos para várias identidades. Wrappers CLI oficiais e testados: **Kimi (Moonshot AI)**, **Amp (Sourcegraph)** e **Kilo (Kilo Code / Kilo CLI)**. Outros agentes (Claude, Gemini, Grok etc.) podem usar o protocolo via init stub manual, mas não há wrapper automático para eles.
+> ⚠️ **Compatibilidade de wrappers:** o protocolo e os hooks são genéricos e podem ser estendidos para várias identidades. Wrappers CLI oficiais e testados: **Kimi (Moonshot AI)**, **Amp (Sourcegraph)**, **Kilo (Kilo Code / Kilo CLI)** e **CodeWhale**. Outros agentes (Claude, Gemini, Grok etc.) podem usar o protocolo via init stub manual, mas não há wrapper automático para eles.
 
 ## Por que usar
 
@@ -73,7 +73,7 @@ agent-guard-core/
    ```
 2. Edite `agent-guard.yaml` na raiz do seu repo (criado a partir do exemplo).
 3. Commit o pacote e a configuração.
-4. Configure o wrapper da ferramenta de IA que você usa (ver `wrappers/kimi/`).
+4. Configure o wrapper da ferramenta de IA que você usa (ver `wrappers/kimi/`, `wrappers/amp/`, `wrappers/kilo/` ou `wrappers/codewhale/`).
 5. Para instalar apenas os hooks: `./packages/agent-guard-core/hooks/install.sh`.
 
 ## Configuração
@@ -265,7 +265,7 @@ O script rejeita commits de IA que não carreguem metadados de worktree ou cujo 
 
 Adapters são thin wrappers que interceptam a chamada da ferramenta de IA e redirecionam para um worktree livre antes de delegar ao binário real.
 
-> **Atenção:** nesta versão, os adapters implementados e testados são os **wrappers do Kimi (Moonshot AI)** em `wrappers/kimi/`, do **Amp (Sourcegraph)** em `wrappers/amp/` e do **Kilo (Kilo Code / Kilo CLI)** em `wrappers/kilo/`. Outras ferramentas de IA CLI não possuem wrapper automático e devem usar o init stub manualmente.
+> **Atenção:** nesta versão, os adapters implementados e testados são os **wrappers do Kimi (Moonshot AI)** em `wrappers/kimi/`, do **Amp (Sourcegraph)** em `wrappers/amp/`, do **Kilo (Kilo Code / Kilo CLI)** em `wrappers/kilo/` e do **CodeWhale** em `wrappers/codewhale/`. Outras ferramentas de IA CLI não possuem wrapper automático e devem usar o init stub manualmente.
 
 ### Wrapper Kimi (`wrappers/kimi/`)
 
@@ -320,6 +320,39 @@ Notas de implementação:
   ```bash
   bash packages/agent-guard-core/wrappers/kimi/recovery.sh --remove-wrapper
   ```
+
+### Wrapper CodeWhale (`wrappers/codewhale/`)
+
+O wrapper `wrappers/codewhale/wrapper.sh` substitui o binário `codewhale` do CodeWhale CLI para impor isolamento automaticamente. Como o CodeWhale é distribuído como um pacote npm cujo launcher é um script Node.js, o wrapper:
+
+- Detecta automaticamente o repositório via `git rev-parse --show-toplevel`.
+- Lê `agent-guard.yaml` para descobrir caminhos, identidades e o launcher real do CodeWhale.
+- Impede execução no repo principal e redireciona para um worktree livre.
+- Bloqueia worktrees sujos ou já em uso por outro processo.
+- Recupera automaticamente o wrapper após `npm install -g codewhale` ou self-updates do CLI, sem perder backups desnecessários.
+
+Seleção explícita de slot (`--slot` / `AGENT_GUARD_SLOT`):
+
+```bash
+codewhale --slot codewhale1
+AGENT_GUARD_SLOT=codewhale1 codewhale
+```
+
+Instalação manual do wrapper:
+
+```bash
+mv ~/.npm-global/bin/codewhale ~/.npm-global/bin/codewhale.real
+cp packages/agent-guard-core/wrappers/codewhale/wrapper.sh ~/.npm-global/bin/codewhale
+chmod +x ~/.npm-global/bin/codewhale
+```
+
+Recuperação automática após updates do CodeWhale CLI:
+
+```bash
+bash packages/agent-guard-core/wrappers/codewhale/recovery.sh
+```
+
+O recovery faz backup do launcher real em `codewhale.real.<timestamp>`, mantém apenas os 3 backups mais novos (`AG_CODEWHALE_BACKUP_KEEP` para customizar) e restaura o wrapper.
 
 ### Wrapper Kilo (`wrappers/kilo/`)
 

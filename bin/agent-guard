@@ -57,7 +57,7 @@ function _agent_guard_main() {
         source "${SESSION_TRACE_SCRIPT}"
     fi
 
-    KNOWN_IDENTITIES="kimi claude gemini grok amp kilo"
+    KNOWN_IDENTITIES="kimi claude gemini grok amp kilo codewhale"
     FIRST_ARG="${1:-}"
 
     if [[ -z "${FIRST_ARG}" ]]; then

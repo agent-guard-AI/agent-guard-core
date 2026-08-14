@@ -1,5 +1,37 @@
 # Changelog — agent-guard-core
 
+## 0.10.5 — CodeWhale Support
+
+Adiciona suporte oficial ao CodeWhale CLI, permitindo que sessões do CodeWhale
+nascam isoladas em worktrees próprios assim como Kimi, Amp e Kilo.
+
+- `wrappers/codewhale/wrapper.sh`:
+  - Wrapper do CodeWhale CLI que intercepta o launcher npm, adquire um slot
+    `codewhale<n>` via `init` e redireciona a sessão para o worktree alugado.
+  - Suporte a `--slot <identidade>` e `AGENT_GUARD_SLOT` para seleção explícita
+    de slot.
+  - Guarda contra execução no repo principal, worktrees estrangeiras e worktrees
+    sujas com trabalho de outro agente.
+  - Exporta `AGENT_GUARD_REPO_ROOT` para garantir que o `agent-guard-config`
+    leia o `agent-guard.yaml` correto independentemente do cwd.
+- `wrappers/codewhale/recovery.sh`:
+  - Recupera o wrapper automaticamente após `npm install -g codewhale` ou
+    self-updates que recriem o launcher original.
+  - Preserva o launcher real como `codewhale.real` e mantém backups rotativos
+    (`AG_CODEWHALE_BACKUP_KEEP`, padrão 3).
+- `packages/agent-guard-core/bin/agent-guard`:
+  - Adiciona `codewhale` em `KNOWN_IDENTITIES` para que o CLI reconheça a nova
+    identidade.
+- `agent-guard.yaml.example`:
+  - Adiciona identidade `codewhale` e configuração de wrapper de exemplo.
+- `README.md`:
+  - Documenta o wrapper CodeWhale na lista de adapters oficiais, na árvore de
+    componentes, na configuração de exemplo e na seção de adapters.
+- `tests/agent-guard/codewhale-wrapper-test.sh`:
+  - Testes comportamentais cobrindo: pass-through de management commands,
+    instalação do wrapper, restauração após npm update e respeito ao
+    `AGENT_GUARD_REPO_ROOT`.
+
 ## 0.10.4 — Shared-PID Cleanup
 
 Adiciona limpeza automática de slots que compartilham o mesmo PID vivo. Esse
