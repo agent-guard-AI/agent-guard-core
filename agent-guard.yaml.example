@@ -51,6 +51,13 @@ identities:
     worktree_prefix: myproject-ia-amp
     author_email: agent-amp{n}@example.dev
     author_name: MyProject Amp{n} Agent
+  codewhale:
+    slots: 2
+    max_slots: 10
+    auto_expand: true
+    worktree_prefix: myproject-ia-codewhale
+    author_email: agent-codewhale{n}@example.dev
+    author_name: MyProject CodeWhale{n} Agent
 
 git:
   protected_branches:
@@ -100,3 +107,8 @@ wrappers:
     real_bin_path: /home/user/.amp/bin/amp
     default_role: ia-a
     identity_prefix: amp
+  codewhale:
+    bin_dir: /home/user/.npm-global/bin
+    real_bin: codewhale.real
+    default_role: ia-a
+    identity_prefix: codewhale
