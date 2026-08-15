@@ -142,8 +142,9 @@ try_source_real_codewhale() {
 }
 
 _ag_load_config() {
+    local search_dir="${1:-${CWD}}"
     local git_root
-    git_root="$(git -C "${CWD}" rev-parse --show-toplevel 2>/dev/null || true)"
+    git_root="$(git -C "${search_dir}" rev-parse --show-toplevel 2>/dev/null || true)"
     if [[ -z "${git_root}" ]]; then
         return 1
     fi
@@ -195,6 +196,31 @@ _ag_load_config() {
     return 0
 }
 
+_ag_find_hmvip_repo() {
+    # Fallback discovery for the HMVIP repository when the wrapper is invoked
+    # from $HOME or another directory that is not inside an Agent Guard managed
+    # repository. This keeps the wrapper resilient to terminal startup dirs.
+    local main_repo="/home/hmvip-dev/hmvip"
+    local main_branch
+    main_branch="$(git -C "${main_repo}" rev-parse --abbrev-ref HEAD 2>/dev/null || true)"
+    if [[ -f "${main_repo}/agent-guard.yaml" && ("${main_branch}" == "develop" || "${main_branch}" == "main") ]]; then
+        echo "${main_repo}"
+        return 0
+    fi
+
+    local wt
+    for wt in /home/hmvip-dev/hmvip-ia-*; do
+        [[ -d "${wt}" ]] || continue
+        local wt_branch
+        wt_branch="$(git -C "${wt}" rev-parse --abbrev-ref HEAD 2>/dev/null || true)"
+        if [[ -f "${wt}/agent-guard.yaml" && ("${wt_branch}" == "develop" || "${wt_branch}" == "main") ]]; then
+            echo "${wt}"
+            return 0
+        fi
+    done
+    return 1
+}
+
 _ag_looks_like_main_repo() {
     if ! git -C "${CWD}" rev-parse --show-toplevel >/dev/null 2>&1; then
         return 1
@@ -205,27 +231,48 @@ _ag_looks_like_main_repo() {
     return 1
 }
 
+# ---------------------------------------------------------------------------
+# Management/read-only commands do not require a lease
+# ---------------------------------------------------------------------------
+_ag_is_management_command() {
+    for arg in "$@"; do
+        case "${arg}" in
+            --version|-V|--help|-h|update|upgrade|doctor|login|provider|export|migrate|auth)
+                return 0
+                ;;
+        esac
+    done
+    return 1
+}
+
 if ! _ag_load_config; then
-    if _ag_looks_like_main_repo; then
-        echo "❌❌❌ AG WRAPPER: main repository is not in a leasable state." >&2
-        echo "" >&2
-        echo "   The wrapper could not load agent-guard.yaml from:" >&2
-        echo "     ${CWD}" >&2
-        echo "" >&2
-        echo "   Common causes:" >&2
-        echo "     - The main repo is on a neutral branch (e.g. _released/*)." >&2
-        echo "     - The main repo is outdated and missing agent-guard.yaml." >&2
-        echo "     - agent-guard.yaml was deleted or renamed." >&2
-        echo "" >&2
-        echo "   Required actions (run as the repo owner, not as an AI agent):" >&2
-        echo "     cd ${CWD}" >&2
-        echo "     git checkout develop" >&2
-        echo "     git pull origin develop" >&2
-        echo "     # ensure agent-guard.yaml exists" >&2
-        echo "" >&2
-        echo "   Emergency bypass (use only for recovery):" >&2
-        echo "     AG_WRAPPER_BYPASS=1 codewhale ..." >&2
-        exit 1
+    # Management commands (--version, --help, ...) fora de repo passam direto,
+    # sem fallback de descoberta: contrato do codewhale-wrapper-test.sh.
+    if ! _ag_is_management_command "$@"; then
+        local _ag_fallback_repo
+        if _ag_fallback_repo="$(_ag_find_hmvip_repo 2>/dev/null)"; then
+            _ag_load_config "${_ag_fallback_repo}"
+        elif _ag_looks_like_main_repo; then
+            echo "❌❌❌ AG WRAPPER: main repository is not in a leasable state." >&2
+            echo "" >&2
+            echo "   The wrapper could not load agent-guard.yaml from:" >&2
+            echo "     ${CWD}" >&2
+            echo "" >&2
+            echo "   Common causes:" >&2
+            echo "     - The main repo is on a neutral branch (e.g. _released/*)." >&2
+            echo "     - The main repo is outdated and missing agent-guard.yaml." >&2
+            echo "     - agent-guard.yaml was deleted or renamed." >&2
+            echo "" >&2
+            echo "   Required actions (run as the repo owner, not as an AI agent):" >&2
+            echo "     cd ${CWD}" >&2
+            echo "     git checkout develop" >&2
+            echo "     git pull origin develop" >&2
+            echo "     # ensure agent-guard.yaml exists" >&2
+            echo "" >&2
+            echo "   Emergency bypass (use only for recovery):" >&2
+            echo "     AG_WRAPPER_BYPASS=1 codewhale ..." >&2
+            exit 1
+        fi
     fi
 
     # Not in an Agent Guard managed repository; pass through unchanged.
@@ -274,21 +321,11 @@ if [[ -z "${_AG_REAL_CW}" || ! -f "${_AG_REAL_CW}" ]]; then
     exit 1
 fi
 
-# ---------------------------------------------------------------------------
-# 4. Management/read-only commands do not require a lease
-# ---------------------------------------------------------------------------
-_ag_is_management_command() {
-    for arg in "$@"; do
-        case "${arg}" in
-            --version|-V|--help|-h|update|upgrade|doctor|login|provider|export|migrate|auth)
-                return 0
-                ;;
-        esac
-    done
-    return 1
-}
-
 if _ag_is_management_command "$@"; then
+    # Management commands do not need an Agent Guard lease, but the real CLI
+    # may create local caches (e.g. .codewhale/) in the cwd. Avoid polluting
+    # the repository by running from $HOME.
+    cd "${HOME}"
     exec node "${_AG_REAL_CW}" "$@"
 fi
 
