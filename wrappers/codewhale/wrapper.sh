@@ -407,7 +407,6 @@ if ! _ag_have_lease; then
             fi
             if [[ "${CWD}" == "${_AG_BASE_DIR}/${_AG_WT_PREFIX}"[0-9]* || "${CWD}" == "${_AG_BASE_DIR}/${_AG_WT_PREFIX}"[0-9]*/* ]]; then
                 # Inside a known worktree: try to reuse its lease if it is ours.
-                local candidate_identity
                 candidate_identity="$(basename "${CWD}" | sed "s/^${_AG_WT_PREFIX}//")"
                 if [[ -n "${candidate_identity}" && "${candidate_identity}" =~ ^[0-9]+$ ]]; then
                     candidate_identity="${prefix}${candidate_identity}"
