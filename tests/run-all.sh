@@ -30,6 +30,7 @@ run_test() {
 
 run_test "${SCRIPT_DIR}/agent-guard-cli-test.sh" "CLI smoke tests"
 run_test "${SCRIPT_DIR}/install-test.sh" "Installer tests"
+run_test "${SCRIPT_DIR}/auto-rescue-test.sh" "Auto-rescue functional tests"
 run_test "${SCRIPT_DIR}/test-tab-hook.sh" "Tab hook tests"
 run_test "${SCRIPT_DIR}/../../../tests/agent-guard/continue-all-test.sh" "Continue-all ranking tests"
 

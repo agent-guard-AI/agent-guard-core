@@ -1,5 +1,43 @@
 # Changelog — agent-guard-core
 
+## 0.10.6 — Auto-Rescue Protocol
+
+Resolve o bloqueio de slots cuja sessão anterior morreu sem commitar o
+worktree. Quando um agente trava, o terminal é fechado ou o processo morre, o
+worktree fica "sujo" e o próximo `go`/`adopt`/`attach` era barrado pelas
+camadas de proteção do agent-guard. Agora o agent-guard detecta sessões
+mortas com worktree sujo e cria automaticamente um commit de resgate, uma tag
+e um registro na nota do slot para revisão posterior.
+
+- `src/init.sh`:
+  - Novo Auto-Rescue Protocol (`_ag_auto_rescue_dirty_worktree` e
+    `_ag_update_task_note_rescue`):
+    - Cria commit `rescue(<id>): [IA-<id>] F? auto-rescue from ...` com
+      corpo `REVIEW REQUIRED`, listando todos os arquivos resgatados.
+    - Cria tag leve `rescue-<id>-<timestamp>` apontando para o rescue commit.
+    - Atualiza a nota do slot com seção "Resgate automático pendente de
+      revisão", hash, tag, motivo e arquivos resgatados.
+    - Commits de follow-up `rescue-note(<id>)` registram a nota com o hash
+      final, garantindo worktree limpo ao final.
+  - Ativação:
+    - `--adopt`: sempre resgata worktrees sujos de sessões confirmadas mortas.
+    - Aquisição de slot (`go`): slots mortos com worktree sujo são
+      considerados livres e resgatados após alocação.
+    - `--attach` via wrapper: resgata se a sessão anterior estiver morta.
+  - Segurança:
+    - Só resgata na branch própria do slot (`ia-<id>/*`, `_released/<id>`) ou
+      branch base segura (`develop`, `main`, `master`).
+    - Só resgata quando a sessão anterior está confirmada como morta.
+    - Respeita `AG_NO_AUTO_RESCUE=1` para desabilitar o comportamento.
+  - `_branch_belongs_to_identity_or_base` movida para escopo global para
+    ficar disponível com `AGENT_GUARD_FUNCTIONS_ONLY=1` e para o rescue.
+- `tests/auto-rescue-test.sh`:
+  - Teste funcional que simula sessão morta com worktree sujo, chama o
+    auto-rescue e verifica: worktree limpo, commit com `REVIEW REQUIRED`,
+    tag `rescue-*` e nota do slot atualizada.
+- `tests/run-all.sh`:
+  - Inclui `auto-rescue-test.sh` na suite do agent-guard-core.
+
 ## 0.10.5 — CodeWhale Support
 
 Adiciona suporte oficial ao CodeWhale CLI, permitindo que sessões do CodeWhale

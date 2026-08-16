@@ -1211,7 +1211,26 @@ _acquire_slot() {
             local dirty
             dirty="$(git -C "${worktree}" status --porcelain 2>/dev/null || true)"
             if [[ -n "${dirty}" ]]; then
-                return 1
+                # A dirty worktree normally blocks recycling, but if the
+                # previous session is dead we can rescue the work instead of
+                # forcing the user to adopt another slot.
+                local ds_status ds_pid
+                ds_status="$(_load_session_field "${identity}" "status" 2>/dev/null || true)"
+                ds_pid="$(_load_session_field "${identity}" "pid" 2>/dev/null || true)"
+                if [[ "${ds_status}" == "active" && -n "${ds_pid}" ]]; then
+                    if _is_pid_alive "${ds_pid}"; then
+                        return 1
+                    fi
+                    # Dead session: clear lease and allow rescue below.
+                    _clear_session "${identity}"
+                elif [[ "${ds_status}" == "active" ]]; then
+                    # Session record active but has no PID: treat as stale.
+                    _clear_session "${identity}"
+                fi
+
+                # Mark the allocation for rescue and consider the slot free.
+                _AG_ALLOC_NEEDS_RESCUE=1
+                return 0
             fi
 
             # Never recycle a worktree that is on another agent's task or
@@ -1491,6 +1510,184 @@ EOF
     fi
 
     mv "${tmp_file}" "${note_file}"
+}
+
+# ---------------------------------------------------------------------------
+# Helper: check whether the current branch belongs to the identity that owns
+# the worktree, or is a safe base branch (develop, main, etc.). Returns 1 when
+# the worktree is on another agent's task/neutral branch.
+# Moved to global scope so it is available with AGENT_GUARD_FUNCTIONS_ONLY=1
+# and for the auto-rescue helpers below.
+# ---------------------------------------------------------------------------
+_branch_belongs_to_identity_or_base() {
+    local worktree_path="$1"
+    local identity="$2"
+
+    local current_branch
+    current_branch="$(git -C "${worktree_path}" branch --show-current 2>/dev/null || echo "")"
+
+    # Empty/detached is treated as safe; the worktree setup will create a new
+    # branch from the base ref.
+    [[ -z "${current_branch}" ]] && return 0
+
+    # Own task branch or own neutral post-release branch.
+    if [[ "${current_branch}" == "ia-${identity}/"* || "${current_branch}" == "_released/${identity}" ]]; then
+        return 0
+    fi
+
+    # Configured base branch (usually develop) and common fallbacks.
+    local base_branch
+    base_branch="$(_guard_get_str "git.base_branch" "develop")"
+    if [[ "${current_branch}" == "${base_branch}" || "${current_branch}" == "origin/${base_branch}" ]]; then
+        return 0
+    fi
+    for fallback in develop main master; do
+        if [[ "${current_branch}" == "${fallback}" || "${current_branch}" == "origin/${fallback}" ]]; then
+            return 0
+        fi
+    done
+
+    return 1
+}
+
+# ---------------------------------------------------------------------------
+# Auto-Rescue Protocol: commit uncommitted work from a dead session.
+# ---------------------------------------------------------------------------
+# When an agent session dies unexpectedly (terminal closed, IDE crash, etc.),
+# the working tree may contain useful work-in-progress. Without rescue, the
+# next session cannot acquire or adopt the slot because every layer of the
+# agent guard (lease check, wrapper) refuses dirty worktrees.
+#
+# This helper creates an explicit "rescue" commit on the current branch,
+# tags it, and records the pending review in the slot task note. The agent
+# MUST inspect and decide later whether to keep the commit (continuation) or
+# revert it (trash/junk).
+#
+# Safety:
+#   - Only runs when the previous session is confirmed dead.
+#   - Only commits on the identity's own task branch or a safe base branch.
+#   - Respects AG_NO_AUTO_RESCUE=1 to disable the behavior.
+# ---------------------------------------------------------------------------
+_ag_auto_rescue_dirty_worktree() {
+    local identity="$1"
+    local worktree_path="$2"
+    local reason="${3:-dead session}"
+
+    if [[ "${AG_NO_AUTO_RESCUE:-}" == "1" ]]; then
+        echo "⚠️  Auto-rescue disabled by AG_NO_AUTO_RESCUE=1; leaving worktree dirty." >&2
+        return 1
+    fi
+
+    if [[ ! -d "${worktree_path}" ]]; then
+        echo "⚠️  Cannot auto-rescue: worktree does not exist: ${worktree_path}" >&2
+        return 1
+    fi
+
+    local dirty_files
+    dirty_files="$(git -C "${worktree_path}" status --porcelain 2>/dev/null || true)"
+    if [[ -z "${dirty_files}" ]]; then
+        return 0
+    fi
+
+    if ! _branch_belongs_to_identity_or_base "${worktree_path}" "${identity}"; then
+        echo "⚠️  Cannot auto-rescue: branch does not belong to ${identity}." >&2
+        return 1
+    fi
+
+    local git_user git_email
+    git_user="$(git -C "${worktree_path}" config user.name 2>/dev/null || true)"
+    git_email="$(git -C "${worktree_path}" config user.email 2>/dev/null || true)"
+    if [[ -z "${git_user}" || -z "${git_email}" ]]; then
+        echo "⚠️  Cannot auto-rescue: git user.name/email not configured in ${worktree_path}." >&2
+        return 1
+    fi
+
+    local timestamp rescue_tag
+    timestamp="$(date +%Y%m%d-%H%M%S)"
+    rescue_tag="rescue-${identity}-${timestamp}"
+
+    cd "${worktree_path}" || return 1
+
+    if ! git add -A >/dev/null 2>&1; then
+        echo "⚠️  Auto-rescue: git add failed." >&2
+        return 1
+    fi
+
+    local commit_body
+    commit_body="rescue(${identity}): [IA-${identity}] F? auto-rescue from ${reason}
+
+This is an automatic rescue commit. The previous session died unexpectedly
+and the working tree contained uncommitted changes.
+
+REVIEW REQUIRED: inspect the diff and decide whether to keep this work
+(continuation) or revert it (trash/junk).
+
+Files rescued:
+${dirty_files}
+
+To inspect: git show ${rescue_tag}
+To revert:  git revert <commit-hash>"
+
+    if ! git commit -m "${commit_body}" >/dev/null 2>&1; then
+        echo "⚠️  Auto-rescue: git commit failed." >&2
+        return 1
+    fi
+
+    local rescue_hash
+    rescue_hash="$(git rev-parse --short HEAD 2>/dev/null || echo "unknown")"
+
+    git tag "${rescue_tag}" "${rescue_hash}" 2>/dev/null || true
+
+    echo "🚑 Auto-rescue: created commit ${rescue_hash} for uncommitted work." >&2
+    echo "   Tag: ${rescue_tag}" >&2
+    echo "   Review required before continuing — check the slot task note." >&2
+
+    _ag_update_task_note_rescue "${identity}" "${rescue_hash}" "${rescue_tag}" "${reason}" "${dirty_files}"
+
+    # The note was modified after the rescue commit (it needs the final hash).
+    # Create a follow-up rescue-note commit so the worktree ends clean and the
+    # note accurately references the rescue commit.
+    if ! git diff --cached --quiet 2>/dev/null || ! git diff --quiet 2>/dev/null; then
+        git add -A >/dev/null 2>&1 || true
+        if git commit -m "rescue-note(${identity}): [IA-${identity}] F? registro de resgate ${rescue_hash}" >/dev/null 2>&1; then
+            echo "📝 Auto-rescue note recorded in follow-up commit." >&2
+        fi
+    fi
+
+    return 0
+}
+
+# ---------------------------------------------------------------------------
+# Record a pending rescue in the slot task note.
+# ---------------------------------------------------------------------------
+_ag_update_task_note_rescue() {
+    local identity="$1"
+    local rescue_hash="$2"
+    local rescue_tag="$3"
+    local reason="$4"
+    local files="$5"
+    local tasks_dir="${_AG_REPO_ROOT}/.agent-guard/tasks"
+    local note_file="${tasks_dir}/${identity}.md"
+
+    [[ ! -f "${note_file}" ]] && return 0
+
+    local today
+    today="$(date +%Y-%m-%d)"
+
+    {
+        echo ""
+        echo "## ⚠️ Resgate automático pendente de revisão — ${today}"
+        echo ""
+        echo "- **Commit:** \`${rescue_hash}\`"
+        echo "- **Tag:** \`${rescue_tag}\`"
+        echo "- **Motivo:** ${reason}"
+        echo ""
+        echo "**Arquivos resgatados:**"
+        echo "${files}" | sed 's/^/  - /'
+        echo ""
+        echo "**Ação necessária:** decida se esse commit é continuação de trabalho (mantenha) ou lixo (reverta com \`git revert ${rescue_hash}\`)."
+        echo ""
+    } >> "${note_file}"
 }
 
 # ---------------------------------------------------------------------------
@@ -2046,45 +2243,6 @@ while [[ $# -gt 0 ]]; do
             ;;
     esac
 done
-
-# ---------------------------------------------------------------------------
-# Helper: check whether the current branch belongs to the identity that owns
-# the worktree, or is a safe base branch (develop, main, etc.). Returns 1 when
-# the worktree is on another agent's task/neutral branch.
-# (_branch_is_current_agent_task and _branch_is_neutral_released live in
-# release-helpers.sh so they are available with AGENT_GUARD_FUNCTIONS_ONLY=1.)
-# ---------------------------------------------------------------------------
-_branch_belongs_to_identity_or_base() {
-    local worktree_path="$1"
-    local identity="$2"
-
-    local current_branch
-    current_branch="$(git -C "${worktree_path}" branch --show-current 2>/dev/null || echo "")"
-
-    # Empty/detached is treated as safe; the worktree setup will create a new
-    # branch from the base ref.
-    [[ -z "${current_branch}" ]] && return 0
-
-    # Own task branch or own neutral post-release branch.
-    if [[ "${current_branch}" == "ia-${identity}/"* || "${current_branch}" == "_released/${identity}" ]]; then
-        return 0
-    fi
-
-    # Configured base branch (usually develop) and common fallbacks.
-    local base_branch
-    base_branch="$(_guard_get_str "git.base_branch" "develop")"
-    if [[ "${current_branch}" == "${base_branch}" || "${current_branch}" == "origin/${base_branch}" ]]; then
-        return 0
-    fi
-    for fallback in develop main master; do
-        if [[ "${current_branch}" == "${fallback}" || "${current_branch}" == "origin/${fallback}" ]]; then
-            return 0
-        fi
-    done
-
-    return 1
-}
-
 
 # ---------------------------------------------------------------------------
 # Orphan Rescue Protocol helpers
@@ -2791,6 +2949,26 @@ if [[ "${MODE}" == "attach" ]]; then
         echo "⚠️  Working tree has uncommitted changes:"
         echo "${DIRTY_FILES}" | sed 's/^/   /'
         echo ""
+
+        local attach_session_status attach_session_pid attach_session_dead
+        attach_session_status="$(_load_session_field "${IDENTITY_FROM_BRANCH}" "status" 2>/dev/null || true)"
+        attach_session_pid="$(_load_session_field "${IDENTITY_FROM_BRANCH}" "pid" 2>/dev/null || true)"
+
+        attach_session_dead="false"
+        if [[ "${attach_session_status}" != "active" ]]; then
+            attach_session_dead="true"
+        elif [[ -z "${attach_session_pid}" ]]; then
+            attach_session_dead="true"
+        elif ! _is_pid_alive "${attach_session_pid}"; then
+            attach_session_dead="true"
+        fi
+
+        if [[ "${attach_session_dead}" == "true" ]]; then
+            echo "   Previous session is dead; attempting auto-rescue..." >&2
+            if _ag_auto_rescue_dirty_worktree "${IDENTITY_FROM_BRANCH}" "${WORKTREE_PATH}" "attached after dead session"; then
+                DIRTY_FILES=""
+            fi
+        fi
     fi
 
     _set_git_author "${IDENTITY_FROM_BRANCH}" "${WORKTREE_PATH}"
@@ -2943,9 +3121,14 @@ if [[ "${MODE}" == "adopt" ]]; then
         echo ""
         echo "${DIRTY_FILES}" | sed 's/^/   /'
         echo ""
-        echo "   Nothing was touched. Inspect before continuing:"
-        echo "     git status && git diff"
-        echo "   Decide: commit as WIP/checkpoint on this branch, or ask the user."
+        if _ag_auto_rescue_dirty_worktree "${ADOPT_IDENTITY}" "${WORKTREE_PATH}" "adopted dead session"; then
+            DIRTY_FILES=""
+        else
+            echo "   Auto-rescue failed or was disabled (AG_NO_AUTO_RESCUE=1)."
+            echo "   Resolve manually before continuing:"
+            echo "     git status && git diff"
+            echo "   Decide: commit as WIP/checkpoint on this branch, or run with AG_ALLOW_DIRTY_WORKTREE=1."
+        fi
     fi
 
     ADOPT_STASHES="$(git stash list 2>/dev/null || true)"
@@ -3179,6 +3362,7 @@ fi
 # ---------------------------------------------------------------------------
 # 14. Acquire slot atomically
 # ---------------------------------------------------------------------------
+_AG_ALLOC_NEEDS_RESCUE=0
 if ! _acquire_slot "${PREFIX}" "${ROLE}" "${IMPACT_PLUGINS}" "${FORCED_IDENTITY}"; then
     return 1 2>/dev/null || exit 1
 fi
@@ -3186,6 +3370,7 @@ fi
 IDENTITY="${_AG_ALLOC_IDENTITY}"
 BRANCH_NAME="${_AG_ALLOC_BRANCH}"
 IMPACT_PLUGINS="${_AG_ALLOC_IMPACT_PLUGINS}"
+_AG_ALLOC_NEEDS_RESCUE="${_AG_ALLOC_NEEDS_RESCUE:-0}"
 unset _AG_ALLOC_IDENTITY _AG_ALLOC_BRANCH _AG_ALLOC_IMPACT_PLUGINS
 
 # ---------------------------------------------------------------------------
@@ -3200,6 +3385,13 @@ if [[ "${USE_WORKTREE}" == "true" ]]; then
     WORKTREE_PATH="$(echo "${WORKTREE_RESULT}" | sed -n '1p')"
     BRANCH_NAME="$(echo "${WORKTREE_RESULT}" | sed -n '2p')"
     cd "${WORKTREE_PATH}" || return 1 2>/dev/null || exit 1
+
+    # If we acquired a dirty slot whose previous session died, rescue the
+    # uncommitted work so the wrapper and other gates see a clean worktree.
+    if [[ "${_AG_ALLOC_NEEDS_RESCUE:-0}" == "1" ]]; then
+        _ag_auto_rescue_dirty_worktree "${IDENTITY}" "${WORKTREE_PATH}" "acquired dirty slot from dead session" || true
+        _AG_ALLOC_NEEDS_RESCUE=0
+    fi
 else
     # Deprecated shared mode: create branch in current repo
     git -C "${_AG_REPO_ROOT}" checkout -b "${BRANCH_NAME}" origin/develop 2>/dev/null || \
