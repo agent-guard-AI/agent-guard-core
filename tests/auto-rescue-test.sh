@@ -155,5 +155,119 @@ if [[ ${ERRORS} -gt 0 ]]; then
     exit 1
 fi
 
+pass "All auto-rescue functional tests passed."
 echo ""
-echo "✅ All auto-rescue functional tests passed."
+
+# ---------------------------------------------------------------------------
+# 5. Corrupted slot-note rescue scenario.
+# ---------------------------------------------------------------------------
+CORRUPT_DIR="$(mktemp -d)"
+trap 'rm -rf "${TMP_DIR}" "${CORRUPT_DIR}"' EXIT
+
+cd "${CORRUPT_DIR}"
+git init --quiet
+git config user.name "Test Agent"
+git config user.email "agent-test@hmvip.dev"
+
+mkdir -p .agent-guard/tasks
+cat > .agent-guard/tasks/codewhale2.md <<'EOF'
+# Tarefa do slot `codewhale2`
+
+**Branch:** `ia-codewhale2/ia-a/task-test`
+**Tópico:** `teste de nota corrompida`
+
+## Tarefa ATUAL — 2026-08-16
+Trabalho em andamento.
+
+### Próximo passo
+Continuar teste.
+EOF
+
+cp "${SCRIPT_DIR}/../agent-guard.yaml" agent-guard.yaml 2>/dev/null || cat > agent-guard.yaml <<'EOF'
+---
+project:
+  name: test
+  domain: test.dev
+
+paths:
+  main_repo: /tmp/nonexistent
+  base_dir: /tmp/nonexistent
+  package_root: packages/agent-guard-core
+  session_storage: .agent-guard/sessions
+  init_script: .agent-guard-init
+
+identities:
+  codewhale:
+    slots: 2
+    max_slots: 10
+    auto_expand: true
+    worktree_prefix: hmvip-ia-codewhale
+    author_email: agent-codewhale{n}@test.dev
+    author_name: Test CodeWhale{n} Agent
+
+git:
+  protected_branches:
+    - develop
+    - main
+  base_branch: develop
+EOF
+
+git add agent-guard.yaml .agent-guard/tasks/codewhale2.md
+git commit --quiet -m "chore(test): initial setup for corrupted note"
+
+git checkout --quiet -b ia-codewhale2/ia-a/task-test
+
+# Simulate a crashed session that truncated the task section.
+cat > .agent-guard/tasks/codewhale2.md <<'EOF'
+# Tarefa do slot `codewhale2`
+
+**Branch:** `ia-codewhale2/ia-a/task-test`
+**Tópico:** ``
+
+## Tarefa ATUAL — 2026-08-16
+
+## Próximo passo
+
+EOF
+
+AGENT_GUARD_FUNCTIONS_ONLY=1
+source "${TMP_DIR}/packages/agent-guard-core/src/init.sh"
+
+if ! _ag_auto_rescue_dirty_worktree "codewhale2" "${CORRUPT_DIR}" "test corrupted note"; then
+    fail "_ag_auto_rescue_dirty_worktree returned non-zero for corrupted note"
+fi
+
+if [[ -z "$(git status --porcelain)" ]]; then
+    pass "corrupted note: worktree is clean after rescue"
+else
+    fail "corrupted note: worktree still dirty after rescue"
+    git status --short
+fi
+
+NOTE2=".agent-guard/tasks/codewhale2.md"
+if grep -q "Trabalho em andamento" "${NOTE2}"; then
+    pass "corrupted note: original content restored from HEAD"
+else
+    fail "corrupted note: original content not restored"
+fi
+
+if grep -q "Nota de slot restaurada pelo auto-rescue" "${NOTE2}"; then
+    pass "corrupted note: rescue warning appended"
+else
+    fail "corrupted note: rescue warning missing"
+fi
+
+if grep -qE '^\*\*Tópico:\*\* *\`\`' "${NOTE2}"; then
+    fail "corrupted note: empty topic marker still present"
+else
+    pass "corrupted note: empty topic marker removed"
+fi
+
+if [[ ${ERRORS} -gt 0 ]]; then
+    echo ""
+    echo "❌ ${ERRORS} test(s) failed."
+    exit 1
+fi
+
+echo ""
+echo "✅ All auto-rescue functional tests passed (including corrupted-note scenario)."

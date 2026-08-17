@@ -1568,6 +1568,92 @@ _branch_belongs_to_identity_or_base() {
 #   - Only commits on the identity's own task branch or a safe base branch.
 #   - Respects AG_NO_AUTO_RESCUE=1 to disable the behavior.
 # ---------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# Detect whether a slot task note looks corrupted/truncated (e.g. after a
+# crashed session wrote garbage or empty content). A healthy note must have
+# a non-empty task section between headings.
+# ---------------------------------------------------------------------------
+_ag_note_is_corrupted() {
+    local note_file="$1"
+
+    # Missing or empty file is obviously corrupted.
+    if [[ ! -f "${note_file}" ]] || [[ ! -s "${note_file}" ]]; then
+        return 0
+    fi
+
+    local line_count
+    line_count="$(wc -l < "${note_file}" 2>/dev/null || echo 0)"
+    if [[ "${line_count}" -lt 5 ]]; then
+        return 0
+    fi
+
+    # If the "Tarefa ATUAL" section exists but has no content before the next
+    # heading, consider it corrupted (truncated/empty placeholder).
+    if grep -q '^## Tarefa ATUAL' "${note_file}" 2>/dev/null; then
+        local in_section=0
+        local found_content=0
+        while IFS= read -r line; do
+            if [[ "${line}" =~ ^##[[:space:]]Tarefa[[:space:]]ATUAL ]]; then
+                in_section=1
+                continue
+            fi
+            if [[ "${in_section}" -eq 1 && "${line}" =~ ^## ]]; then
+                break
+            fi
+            if [[ "${in_section}" -eq 1 && -n "${line}" && ! "${line}" =~ ^[[:space:]]*$ ]]; then
+                found_content=1
+                break
+            fi
+        done < "${note_file}"
+        if [[ "${found_content}" -eq 0 ]]; then
+            return 0
+        fi
+    fi
+
+    # Empty topic marker is a known corruption pattern from command substitution.
+    if grep -qE '\*\*Tópico:\*\* *\`\`' "${note_file}" 2>/dev/null; then
+        return 0
+    fi
+
+    return 1
+}
+
+# ---------------------------------------------------------------------------
+# Restore a corrupted slot task note from HEAD and append a rescue warning.
+# ---------------------------------------------------------------------------
+_ag_rescue_restore_note() {
+    local identity="$1"
+    local worktree_path="$2"
+    local note_file="${worktree_path}/.agent-guard/tasks/${identity}.md"
+
+    cd "${worktree_path}" || return 1
+
+    if git diff --quiet HEAD -- "${note_file}" 2>/dev/null; then
+        # No differences from HEAD — nothing to restore, just warn.
+        echo "⚠️  Auto-rescue: note ${note_file} looks corrupted but matches HEAD." >&2
+        return 1
+    fi
+
+    if ! git checkout HEAD -- ".agent-guard/tasks/${identity}.md" >/dev/null 2>&1; then
+        echo "⚠️  Auto-rescue: failed to restore note from HEAD." >&2
+        return 1
+    fi
+
+    local today
+    today="$(date +%Y-%m-%d)"
+    {
+        echo ""
+        echo "## ⚠️ Nota de slot restaurada pelo auto-rescue — ${today}"
+        echo ""
+        echo "A sessão anterior foi encerrada de forma inesperada e deixou a nota de slot em estado inconsistente."
+        echo "O conteúdo foi restaurado a partir do último commit conhecido (HEAD)."
+        echo "Revisão recomendada: verifique se há informações importantes da sessão morta que precisam ser recriadas."
+        echo ""
+    } >> "${note_file}"
+
+    return 0
+}
+
 _ag_auto_rescue_dirty_worktree() {
     local identity="$1"
     local worktree_path="$2"
@@ -1600,6 +1686,38 @@ _ag_auto_rescue_dirty_worktree() {
     if [[ -z "${git_user}" || -z "${git_email}" ]]; then
         echo "⚠️  Cannot auto-rescue: git user.name/email not configured in ${worktree_path}." >&2
         return 1
+    fi
+
+    # Re-analysis: if the only dirty file is the slot's own task note and it
+    # looks corrupted/truncated (e.g. after a crashed session), restore the
+    # last known good version from HEAD instead of committing garbage.
+    local dirty_line_count
+    dirty_line_count="$(echo "${dirty_files}" | wc -l)"
+    if [[ "${dirty_line_count}" -eq 1 ]]; then
+        local only_dirty_path
+        only_dirty_path="$(echo "${dirty_files}" | awk '{print $2}')"
+        if [[ "${only_dirty_path}" == ".agent-guard/tasks/${identity}.md" ]]; then
+            local note_path="${worktree_path}/${only_dirty_path}"
+            if _ag_note_is_corrupted "${note_path}"; then
+                echo "🚑 Auto-rescue: slot note ${only_dirty_path} appears corrupted; restoring from HEAD before reassuming." >&2
+                if _ag_rescue_restore_note "${identity}" "${worktree_path}"; then
+                    if ! git add -A >/dev/null 2>&1; then
+                        echo "⚠️  Auto-rescue: git add failed after note restore." >&2
+                        return 1
+                    fi
+                    if ! git commit -m "rescue-note(${identity}): [IA-${identity}] F? nota de slot restaurada após sessão morta" >/dev/null 2>&1; then
+                        echo "⚠️  Auto-rescue: commit of restored note failed." >&2
+                        return 1
+                    fi
+                    local rescue_hash
+                    rescue_hash="$(git rev-parse --short HEAD 2>/dev/null || echo "unknown")"
+                    echo "🚑 Auto-rescue: restored note committed as ${rescue_hash}." >&2
+                    echo "   Review recommended — the previous session may have lost context." >&2
+                    return 0
+                fi
+                echo "⚠️  Auto-rescue: note restore failed, falling back to standard rescue." >&2
+            fi
+        fi
     fi
 
     local timestamp rescue_tag
@@ -2072,6 +2190,15 @@ _create_or_reuse_worktree() {
     fi
 
     cd "${worktree_path}" || return 1
+
+    # If the allocator flagged this slot as needing rescue (dirty worktree
+    # from a dead session), run auto-rescue before the dirty check so the
+    # worktree becomes clean and the slot can be reused. Without this, the
+    # dirty check below would abort allocation even though the slot was
+    # intentionally selected by _slot_is_free.
+    if [[ "${_AG_ALLOC_NEEDS_RESCUE:-0}" == "1" ]]; then
+        _ag_auto_rescue_dirty_worktree "${identity}" "${worktree_path}" "acquired dirty slot from dead session" || true
+    fi
 
     # Dirty check
     local dirty

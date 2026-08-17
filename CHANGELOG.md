@@ -1,5 +1,47 @@
 # Changelog — agent-guard-core
 
+## 0.10.7 — CodeWhale `ad`/`go` Launch Fix
+
+Corrige a falha em que `hmvip ad codewhale<N>` e `hmvip go codewhale<N>`
+adotavam/alugavam o slot mas não lançavam o agente CodeWhale, e elimina o
+cenário de shells Bash antigos que ainda carregavam uma definição de `hmvip()`
+sem suporte ao prefixo `codewhale`.
+
+Causa raiz:
+- O script `init.sh` do agent-guard termina com `return 0`. Quando ele era
+  `source`d diretamente dentro da função `hmvip()` de `.kiro/shell/hmvip.sh`,
+  esse `return` abortava a função `hmvip()` inteira — o comando subsequente
+  `codewhale --slot <id>` nunca era alcançado.
+- Worktrees em branches antigas podem conter um `.hmvip-agent-init` desatualizado;
+  o wrapper do CodeWhale usava o init do worktree atual em vez do mais recente
+  disponível no ecossistema.
+
+Correções:
+- `.kiro/shell/hmvip.sh`:
+  - `_hmvip_safe_source` agora delega o `source` para uma função auxiliar
+    interna (`_hmvip_source_inner`). Assim o `return` do init aborta apenas a
+    auxiliar, e o fluxo principal de `hmvip()` continua e consegue lançar o
+    agente.
+  - Auto-recarga: a função `hmvip()` detecta quando o arquivo-fonte no disco
+    é mais novo que a definição carregada no shell e se recarrega
+    automaticamente, evitando que terminais abertos antes de um merge usem uma
+    versão obsoleta.
+- `packages/agent-guard-core/wrappers/codewhale/wrapper.sh`:
+  - Agora resolve o init mais atualizado disponível (repo principal em
+    `develop`/`main`, depois worktree em trunk, depois worktree com
+    `packages/agent-guard-core` modificado mais recentemente), espelhando a
+    lógica de `.kiro/shell/hmvip.sh`.
+- `packages/agent-guard-core/wrappers/codewhale/resolve-init.sh`:
+  - Helper extraído com a lógica de resolução do init, reutilizável pelo
+    wrapper e testável isoladamente.
+- Testes:
+  - `tests/agent-guard/hmvip-safe-source-test.sh`: regressão que garante que
+    `_hmvip_safe_source` continua executando após o `return` do init.
+  - `tests/agent-guard/codewhale-resolve-init-test.sh`: valida a ordem de
+    prioridade da resolução do init.
+  - `packages/agent-guard-core/tests/run-all.sh`: inclui os novos testes na
+    suite.
+
 ## 0.10.6 — Auto-Rescue Protocol
 
 Resolve o bloqueio de slots cuja sessão anterior morreu sem commitar o
