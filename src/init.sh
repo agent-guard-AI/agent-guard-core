@@ -2073,6 +2073,15 @@ _create_or_reuse_worktree() {
 
     cd "${worktree_path}" || return 1
 
+    # If the allocator flagged this slot as needing rescue (dirty worktree
+    # from a dead session), run auto-rescue before the dirty check so the
+    # worktree becomes clean and the slot can be reused. Without this, the
+    # dirty check below would abort allocation even though the slot was
+    # intentionally selected by _slot_is_free.
+    if [[ "${_AG_ALLOC_NEEDS_RESCUE:-0}" == "1" ]]; then
+        _ag_auto_rescue_dirty_worktree "${identity}" "${worktree_path}" "acquired dirty slot from dead session" || true
+    fi
+
     # Dirty check
     local dirty
     dirty="$(git status --porcelain 2>/dev/null || true)"
