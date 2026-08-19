@@ -146,6 +146,14 @@ if [[ -f "${RELEASE_HELPERS_SCRIPT}" ]]; then
 fi
 
 # ---------------------------------------------------------------------------
+# 1.6.2 Load Slack notification helpers
+# ---------------------------------------------------------------------------
+SLACK_NOTIFY_SCRIPT="${SCRIPT_DIR}/slack-notify.sh"
+if [[ -f "${SLACK_NOTIFY_SCRIPT}" ]]; then
+    source "${SLACK_NOTIFY_SCRIPT}"
+fi
+
+# ---------------------------------------------------------------------------
 # 1.5. Ensure Kimi CLI wrapper is in place
 # ---------------------------------------------------------------------------
 # The wrapper is the entrypoint that redirects sessions to isolated worktrees.
@@ -2765,6 +2773,9 @@ if [[ "${MODE}" == "release" ]]; then
         return 1 2>/dev/null || exit 1
     fi
 
+    # Keep original branch for Slack notification before neutral checkout.
+    RELEASE_ORIGINAL_BRANCH="$(git -C "${CURRENT_WORKTREE}" branch --show-current 2>/dev/null || echo "")"
+
     if ! _validate_worktree_release_ready "${CURRENT_WORKTREE}"; then
         echo "🔒 Session NOT released. Resolve the issues above and run --release again." >&2
         return 1 2>/dev/null || exit 1
@@ -2810,6 +2821,11 @@ print(json.dumps({'reason': 'release', 'blockers': ['neutral_branch_failed'], 'w
     # Record release in session journal for crash recovery.
     if command -v _journal_release >/dev/null 2>&1; then
         _journal_release
+    fi
+
+    # Notify Slack (best-effort, fail-silent).
+    if command -v _guard_notify_release >/dev/null 2>&1; then
+        _guard_notify_release "${CURRENT_IDENTITY}" "${RELEASE_ORIGINAL_BRANCH}"
     fi
 
     echo "🔓 Released session for ${CURRENT_IDENTITY}"
@@ -2881,6 +2897,11 @@ print(json.dumps({
     'status': '${_rec_status}'
 }))" 2>/dev/null || echo \"{\"health\": \"${_rec_health}\", \"drift\": \"${_rec_drift}\"}\")"
                     _journal_write_event "slot_drift_detected" "${drift_payload}" "${_AG_REPO_ROOT:-${MAIN_REPO}}"
+                fi
+
+                # Notify Slack about structural drift (best-effort, fail-silent).
+                if command -v _guard_notify_drift >/dev/null 2>&1; then
+                    _guard_notify_drift "${identity}" "${_rec_branch:-}" "${_rec_drift:-}"
                 fi
             fi
         done
@@ -3295,6 +3316,11 @@ if [[ "${MODE}" == "adopt" ]]; then
         fi
     fi
 
+    # Notify Slack (best-effort, fail-silent).
+    if command -v _guard_notify_init >/dev/null 2>&1; then
+        _guard_notify_init "${ADOPT_IDENTITY}" "${ADOPT_BRANCH}" "adopted"
+    fi
+
     echo "✅ Git author set to ${GIT_AUTHOR_EMAIL}"
     if [[ "${ADOPT_FOREIGN_BRANCH}" == "true" ]]; then
         echo "✅ Session active on ${ADOPT_IDENTITY} — orphan slot adopted."
@@ -3440,6 +3466,11 @@ elif [[ -n "${CURRENT_IDENTITY}" && -n "${CURRENT_BRANCH}" && "${CURRENT_BRANCH}
         _journal_checkpoint "session acquired (reuse)" "${CURRENT_WORKTREE}" "${CURRENT_BRANCH}"
     fi
 
+    # Notify Slack (best-effort, fail-silent).
+    if command -v _guard_notify_init >/dev/null 2>&1; then
+        _guard_notify_init "${CURRENT_IDENTITY}" "${CURRENT_BRANCH}"
+    fi
+
     echo "✅ Git author set to ${GIT_AUTHOR_EMAIL}"
 
     _show_open_prs_for_identity "${CURRENT_IDENTITY}"
@@ -3546,6 +3577,11 @@ if command -v _journal_init >/dev/null 2>&1; then
 fi
 if command -v _journal_checkpoint >/dev/null 2>&1; then
     _journal_checkpoint "session acquired" "${WORKTREE_PATH}" "${BRANCH_NAME}"
+fi
+
+# Notify Slack (best-effort, fail-silent).
+if command -v _guard_notify_init >/dev/null 2>&1; then
+    _guard_notify_init "${IDENTITY}" "${BRANCH_NAME}"
 fi
 
 # Soft-lock overlap warning
