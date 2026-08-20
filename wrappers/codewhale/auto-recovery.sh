@@ -64,14 +64,15 @@ if [[ -f "${AGENT_GUARD_CONFIG}" ]]; then
     CODEWHALE_BIN_DIR="$(bash "${AGENT_GUARD_CONFIG}" get wrappers.codewhale.bin_dir "${CODEWHALE_BIN_DIR}" 2>/dev/null || echo "${CODEWHALE_BIN_DIR}")"
 fi
 CODEWHALE_BIN="${CODEWHALE_BIN_DIR}/codewhale"
+WRAPPER_SRC="${REPO_ROOT}/${PACKAGE_ROOT}/wrappers/codewhale/wrapper.sh"
 
 _is_wrapper() {
     local path="$1"
     [[ -f "${path}" ]] && head -n 5 "${path}" 2>/dev/null | grep -q "Agent Guard — CodeWhale CLI Wrapper"
 }
 
-# Nothing to do: wrapper is already in place.
-if _is_wrapper "${CODEWHALE_BIN}"; then
+# Nothing to do: wrapper is already in place AND matches the source.
+if _is_wrapper "${CODEWHALE_BIN}" && cmp -s "${WRAPPER_SRC}" "${CODEWHALE_BIN}" 2>/dev/null; then
     exit 0
 fi
 
