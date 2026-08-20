@@ -141,8 +141,8 @@ _ag_prune_real_backups() {
 # so a backup burst is cleaned up even when no recovery is needed.
 _ag_prune_real_backups
 
-# Nothing to do if already wrapper.
-if _is_wrapper "${CODEWHALE_BIN}"; then
+# Nothing to do if already wrapper AND matches the source.
+if _is_wrapper "${CODEWHALE_BIN}" && cmp -s "${WRAPPER_SRC}" "${CODEWHALE_BIN}" 2>/dev/null; then
     echo "✅ ${CODEWHALE_BIN} is already the Agent Guard wrapper."
     exit 0
 fi

@@ -237,7 +237,7 @@ _ag_looks_like_main_repo() {
 _ag_is_management_command() {
     for arg in "$@"; do
         case "${arg}" in
-            --version|-V|--help|-h|update|upgrade|doctor|login|provider|export|migrate|auth)
+            --version|-V|--help|-h|update|upgrade|doctor|login|provider|export|migrate|auth|model|config)
                 return 0
                 ;;
         esac
