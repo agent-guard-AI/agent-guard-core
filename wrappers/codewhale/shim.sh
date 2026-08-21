@@ -46,4 +46,6 @@ if [[ -f "${AGENT_GUARD_CONFIG}" ]]; then
 fi
 
 # Delegate to the real wrapper (never to ourselves).
-exec "${CODEWHALE_BIN_DIR}/codewhale" "$@"
+# Preserve argv[0] so that per-slot symlinks (codewhale1, codewhale2, ...)
+# are visible to the wrapper when invoked through this shim.
+exec -a "$(basename "$0")" "${CODEWHALE_BIN_DIR}/codewhale" "$@"
