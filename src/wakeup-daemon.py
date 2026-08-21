@@ -113,6 +113,55 @@ def _wakeup_dir(repo_root: Path) -> Path:
     return path
 
 
+def _pid_path(repo_root: Path) -> Path:
+    return _wakeup_dir(repo_root) / "daemon.pid"
+
+
+def _read_pid_file(path: Path) -> Optional[Dict[str, Any]]:
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        if isinstance(data, dict) and "pid" in data and "host" in data and "port" in data:
+            return data
+    except Exception:
+        pass
+    return None
+
+
+def _is_daemon_alive(pid: int, host: str, port: int) -> bool:
+    """Check if another daemon process is alive and listening."""
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except Exception:
+        return False
+
+    try:
+        with socket.create_connection((host, port), timeout=2):
+            return True
+    except Exception:
+        return False
+
+
+def _claim_pid_file(path: Path, pid: int, host: str, port: int) -> bool:
+    try:
+        path.write_text(
+            json.dumps({"pid": pid, "host": host, "port": port, "ts": time.time()}),
+            encoding="utf-8",
+        )
+        path.chmod(0o600)
+        return True
+    except Exception:
+        return False
+
+
+def _release_pid_file(path: Path) -> None:
+    try:
+        path.unlink(missing_ok=True)
+    except Exception:
+        pass
+
+
 def _signature(secret: str, body: bytes) -> str:
     return hmac.new(
         secret.encode("utf-8"), body, "sha256"
@@ -323,6 +372,24 @@ def main() -> int:
             file=sys.stderr,
         )
 
+    pid_path = _pid_path(config.repo_root)
+    existing = _read_pid_file(pid_path)
+    if existing and _is_daemon_alive(
+        int(existing["pid"]), str(existing["host"]), int(existing["port"])
+    ):
+        print(
+            f"[wakeup-daemon] already running on "
+            f"http://{existing['host']}:{existing['port']} (pid {existing['pid']}); exiting.",
+            file=sys.stderr,
+        )
+        return 0
+
+    # Stale PID file: remove and claim for this process.
+    _release_pid_file(pid_path)
+    if not _claim_pid_file(pid_path, os.getpid(), config.host, config.port):
+        print("[wakeup-daemon] failed to write PID file; exiting.", file=sys.stderr)
+        return 1
+
     WakeupHandler.config = config
 
     server = HTTPServer((config.host, config.port), WakeupHandler)
@@ -330,6 +397,7 @@ def main() -> int:
 
     def _shutdown(_signum: int, _frame: Any) -> None:
         print("\n[wakeup-daemon] shutting down...", file=sys.stderr)
+        _release_pid_file(pid_path)
         server.shutdown()
 
     signal.signal(signal.SIGTERM, _shutdown)
@@ -339,7 +407,10 @@ def main() -> int:
         f"[wakeup-daemon] listening on http://{config.host}:{config.port}",
         file=sys.stderr,
     )
-    server.serve_forever()
+    try:
+        server.serve_forever()
+    finally:
+        _release_pid_file(pid_path)
     return 0
 
 

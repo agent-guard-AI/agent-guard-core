@@ -31,4 +31,38 @@ if [[ -z "${HMVIP_WAKEUP_SECRET:-}" ]]; then
     exit 1
 fi
 
+# Resolve host/port for health check (env wins, then agent-guard.yaml, then defaults).
+DEFAULT_HOST="127.0.0.1"
+DEFAULT_PORT="17321"
+HOST="${HMVIP_WAKEUP_HOST:-${DEFAULT_HOST}}"
+PORT="${HMVIP_WAKEUP_PORT:-${DEFAULT_PORT}}"
+if [[ -f "${REPO_ROOT}/agent-guard.yaml" ]] && command -v python3 >/dev/null 2>&1; then
+    YAML_HOST="$(python3 -c '
+import yaml, sys
+try:
+    cfg = yaml.safe_load(open(sys.argv[1]))
+    print(cfg.get("wakeup", {}).get("host", ""))
+except Exception:
+    pass
+' "${REPO_ROOT}/agent-guard.yaml" 2>/dev/null)"
+    YAML_PORT="$(python3 -c '
+import yaml, sys
+try:
+    cfg = yaml.safe_load(open(sys.argv[1]))
+    print(cfg.get("wakeup", {}).get("port", ""))
+except Exception:
+    pass
+' "${REPO_ROOT}/agent-guard.yaml" 2>/dev/null)"
+    HOST="${HMVIP_WAKEUP_HOST:-${YAML_HOST:-${HOST}}}"
+    PORT="${HMVIP_WAKEUP_PORT:-${YAML_PORT:-${PORT}}}"
+fi
+
+# Singleton guard: if a daemon is already healthy, do not start another.
+if command -v curl >/dev/null 2>&1; then
+    if curl -fsS --max-time 2 "http://${HOST}:${PORT}/health" >/dev/null 2>&1; then
+        echo "[wakeup-daemon] already healthy on http://${HOST}:${PORT}; not starting." >&2
+        exit 0
+    fi
+fi
+
 exec python3 "${DAEMON_PY}" "$@"
