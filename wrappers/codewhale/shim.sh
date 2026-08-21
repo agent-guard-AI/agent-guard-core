@@ -15,19 +15,16 @@ if [[ "${AG_SHIM_BYPASS:-}" == "1" ]]; then
     exec "${HOME}/.npm-global/bin/codewhale" "$@"
 fi
 
-# Resolve the repository root. Prefer the current repo when it carries the
-# agent-guard contract, otherwise fall back to the canonical HMVIP root.
+# Resolve the repository root. Always use the canonical HMVIP root for the
+# global shim so that stale worktrees never propagate an outdated wrapper.
+# Override via AG_REPO_ROOT only for testing/emergency recovery.
 REPO_ROOT="/home/hmvip-dev/hmvip"
 if [[ -n "${AG_REPO_ROOT:-}" ]]; then
     REPO_ROOT="${AG_REPO_ROOT}"
-elif git rev-parse --show-toplevel >/dev/null 2>&1; then
-    current_root="$(git rev-parse --show-toplevel)"
-    if [[ -f "${current_root}/agent-guard.yaml" ]]; then
-        REPO_ROOT="${current_root}"
-    fi
 fi
 
 export AGENT_GUARD_REPO_ROOT="${REPO_ROOT}"
+AUTO_RECOVERY="${REPO_ROOT}/packages/agent-guard-core/wrappers/codewhale/auto-recovery.sh"
 if [[ -f "${AUTO_RECOVERY}" ]]; then
     bash "${AUTO_RECOVERY}" --repo-root "${REPO_ROOT}" --quiet
 else
