@@ -137,6 +137,16 @@ if [[ -f "${HOME}/.local/bin/codewhale" ]]; then
     fi
 fi
 
+# Create per-slot symlinks so users can type `codewhale1`, `codewhale2`, etc.
+_SLOTS="$(bash "${AGENT_GUARD_CONFIG}" get identities.codewhale.slots '2' 2>/dev/null || echo '2')"
+for _n in $(seq 1 "${_SLOTS}"); do
+    _slot_link="${SHIM_DIR}/codewhale${_n}"
+    rm -f "${_slot_link}"
+    ln -s "${SHIM_TARGET}" "${_slot_link}"
+done
+
+echo ""
+echo "✅ Created slot symlinks: codewhale1 .. codewhale${_SLOTS} in ${SHIM_DIR}"
 echo ""
 echo "✅ CodeWhale shim installed."
 echo "   Next time npm replaces the wrapper, the shim will restore it automatically."

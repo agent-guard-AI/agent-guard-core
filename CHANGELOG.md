@@ -1,5 +1,40 @@
 # Changelog — agent-guard-core
 
+## 0.10.8 — CodeWhale Default Command & Slot Symlinks
+
+Corrige a falha remanescente em que `hmvip go codewhale<N>` e
+`codewhale --slot <id>` adotavam/alugavam o slot mas não abriam o aplicativo
+CodeWhale, deixando o terminal apenas na pasta do worktree alugado. Também
+adiciona atalhos diretos `codewhale1`, `codewhale2`, etc. que alugam/abrem o
+slot correspondente num único comando.
+
+Causa raiz:
+- O CodeWhale CLI 0.9.5+ não inicia uma sessão interativa quando invocado sem
+  subcomando; ele imprime a ajuda e sai. O wrapper executava
+  `node codewhale.real` sem argumentos após consumir `--slot <id>`.
+
+Correções:
+- `packages/agent-guard-core/wrappers/codewhale/wrapper.sh`:
+  - Quando nenhum subcomando é fornecido, o wrapper agora passa o comando
+    padrão configurado (`wrappers.codewhale.default_command`, fallback `run`).
+  - Detecta invocação via symlink de slot (`codewhale1`, `codewhale2`, ...) e
+    infere `--slot codewhale<N>` automaticamente.
+- `packages/agent-guard-core/wrappers/codewhale/shim.sh`:
+  - Preserva `argv[0]` ao delegar para o wrapper, permitindo que symlinks de
+    slot cheguem ao wrapper com o nome correto.
+- `packages/agent-guard-core/wrappers/codewhale/shim-setup.sh`:
+  - Cria symlinks `codewhale1` .. `codewhale<N>` no diretório do shim,
+    onde `<N>` é lido de `identities.codewhale.slots`.
+- `agent-guard.yaml`:
+  - Adicionada configuração `wrappers.codewhale.default_command: run`.
+
+Testes:
+- `tests/agent-guard/codewhale-wrapper-test.sh`:
+  - Regressão que garante que `codewhale` sem argumentos passa `run` para o
+    binário real.
+  - Regressão que `codewhale1` (symlink) infere o slot e abre o comando
+    padrão.
+
 ## 0.10.7 — CodeWhale `ad`/`go` Launch Fix
 
 Corrige a falha em que `hmvip ad codewhale<N>` e `hmvip go codewhale<N>`

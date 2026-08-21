@@ -90,6 +90,13 @@ if [[ $# -gt 0 ]]; then
     fi
 fi
 
+# Detect invocation via per-slot symlink (e.g. codewhale1 -> codewhale).
+# Allows `codewhale1` as shorthand for `codewhale --slot codewhale1`.
+_WRAPPER_NAME="$(basename "${BASH_SOURCE[0]}")"
+if [[ -z "${_AG_SLOT:-}" && "${_WRAPPER_NAME}" =~ ^codewhale([0-9]+)$ ]]; then
+    _AG_SLOT="codewhale${BASH_REMATCH[1]}"
+fi
+
 # ---------------------------------------------------------------------------
 # 1. Resolve current working directory
 # ---------------------------------------------------------------------------
@@ -167,6 +174,7 @@ _ag_load_config() {
     _AG_BASE_DIR="$(bash "${config_bin}" get paths.base_dir "$(dirname "${_AG_MAIN_REPO}")" 2>/dev/null || echo "$(dirname "${_AG_MAIN_REPO}")")"
     _AG_BIN_DIR="$(bash "${config_bin}" get wrappers.codewhale.bin_dir "${HOME}/.npm-global/bin" 2>/dev/null || echo "${HOME}/.npm-global/bin")"
     _AG_REAL_BIN_NAME="$(bash "${config_bin}" get wrappers.codewhale.real_bin 'codewhale.real' 2>/dev/null || echo 'codewhale.real')"
+    _AG_DEFAULT_COMMAND="$(bash "${config_bin}" get wrappers.codewhale.default_command 'run' 2>/dev/null || echo 'run')"
     _AG_IDENTITY_VAR="$(bash "${config_bin}" get commit.identity_env_var 'AGENT_GUARD_IDENTITY' 2>/dev/null || echo 'AGENT_GUARD_IDENTITY')"
     _AG_INIT_SCRIPT_NAME="$(bash "${config_bin}" get paths.init_script '.agent-guard-init' 2>/dev/null || echo '.agent-guard-init')"
     _AG_KNOWN_IDENTITIES="$(bash "${config_bin}" keys identities 2>/dev/null || true)"
@@ -478,4 +486,10 @@ fi
 # ---------------------------------------------------------------------------
 # 13. Execute real CodeWhale
 # ---------------------------------------------------------------------------
+# CodeWhale 0.9.5+ does not start an interactive session when invoked without
+# a subcommand (it prints help and exits). Default to the configured command
+# (usually `run`) so that `codewhale --slot <id>` actually opens the agent.
+if [[ $# -eq 0 ]]; then
+    set -- "${_AG_DEFAULT_COMMAND:-run}"
+fi
 exec node "${_AG_REAL_CW}" "$@"
