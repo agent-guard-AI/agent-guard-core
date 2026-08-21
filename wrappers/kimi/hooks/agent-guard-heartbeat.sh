@@ -50,6 +50,32 @@ function _ag_heartbeat_main() {
     fi
 
     _update_last_activity "${identity}" >/dev/null 2>&1 || true
+
+    # Surface any pending wakeup alert for this identity.
+    local wakeup_file="${repo_root}/.agent-guard/wakeup/${identity}.json"
+    if [[ -f "${wakeup_file}" ]]; then
+        local alert_title alert_severity alert_summary alert_source
+        alert_title="$(jq -r '.title // "Wakeup"' "${wakeup_file}" 2>/dev/null || echo "Wakeup")"
+        alert_severity="$(jq -r '.severity // "P1"' "${wakeup_file}" 2>/dev/null || echo "P1")"
+        alert_summary="$(jq -r '.summary // ""' "${wakeup_file}" 2>/dev/null || true)"
+        alert_source="$(jq -r '.source // ""' "${wakeup_file}" 2>/dev/null || true)"
+
+        # Print a highly visible marker to stderr so the IA sees it.
+        {
+            echo ""
+            echo "┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓"
+            echo "┃ 🚨 WAKEUP ALERT [${alert_severity}] para slot ${identity}"
+            echo "┃ ${alert_title}"
+            [[ -n "${alert_summary}" ]] && echo "┃ ${alert_summary}"
+            [[ -n "${alert_source}" ]] && echo "┃ Fonte: ${alert_source}"
+            echo "┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛"
+            echo ""
+        } >&2
+
+        # Move to acknowledged state so we do not spam every heartbeat.
+        mv "${wakeup_file}" "${wakeup_file}.ack" >/dev/null 2>&1 || true
+    fi
+
     return 0
 }
 

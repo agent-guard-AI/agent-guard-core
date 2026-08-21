@@ -1,0 +1,34 @@
+#!/usr/bin/env bash
+#
+# wakeup-daemon — launcher for the local HMVIP wakeup daemon.
+#
+# Usage:
+#   source .hmvip-agent-init --wakeup-daemon   # future integration
+#   bash packages/agent-guard-core/bin/wakeup-daemon
+#
+# Environment:
+#   HMVIP_WAKEUP_SECRET   required shared HMAC secret
+#   HMVIP_WAKEUP_PORT     optional port override
+#   HMVIP_WAKEUP_HOST     optional host override
+#   HMVIP_DISABLE_WAKEUP  set to 1 to noop
+#   HMVIP_DISABLE_NOTIFY  set to 1 to skip desktop notifications
+
+set -uo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
+DAEMON_PY="${REPO_ROOT}/packages/agent-guard-core/src/wakeup-daemon.py"
+
+if [[ ! -f "${DAEMON_PY}" ]]; then
+    echo "[wakeup-daemon] ${DAEMON_PY} not found." >&2
+    exit 1
+fi
+
+if [[ -z "${HMVIP_WAKEUP_SECRET:-}" ]]; then
+    echo "[wakeup-daemon] HMVIP_WAKEUP_SECRET is not set." >&2
+    echo "[wakeup-daemon] Set it before starting the daemon, e.g.:" >&2
+    echo "  export HMVIP_WAKEUP_SECRET=\$(openssl rand -hex 32)" >&2
+    exit 1
+fi
+
+exec python3 "${DAEMON_PY}" "$@"
