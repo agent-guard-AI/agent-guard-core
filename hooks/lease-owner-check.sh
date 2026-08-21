@@ -85,7 +85,9 @@ lease_owner_check() {
         kill -0 "${pid}" 2>/dev/null || continue
 
         # Lease vivo neste worktree: exige ancestralidade de processo.
-        if _lease_is_ancestor "${pid}"; then
+        # Se o processo atual É o próprio lease (sessão dona diretamente),
+        # permite sem precisar subir a árvore de processos.
+        if [[ "$$" == "${pid}" ]] || _lease_is_ancestor "${pid}"; then
             return 0
         fi
 
