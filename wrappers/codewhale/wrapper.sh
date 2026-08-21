@@ -175,6 +175,9 @@ _ag_load_config() {
     _AG_BIN_DIR="$(bash "${config_bin}" get wrappers.codewhale.bin_dir "${HOME}/.npm-global/bin" 2>/dev/null || echo "${HOME}/.npm-global/bin")"
     _AG_REAL_BIN_NAME="$(bash "${config_bin}" get wrappers.codewhale.real_bin 'codewhale.real' 2>/dev/null || echo 'codewhale.real')"
     _AG_DEFAULT_COMMAND="$(bash "${config_bin}" get wrappers.codewhale.default_command 'run' 2>/dev/null || echo 'run')"
+    _AG_STARTUP_DAILY_CHECK_ENABLED="$(bash "${config_bin}" get wrappers.codewhale.startup_daily_check.enabled 'false' 2>/dev/null || echo 'false')"
+    _AG_STARTUP_DAILY_CHECK_BACKGROUND="$(bash "${config_bin}" get wrappers.codewhale.startup_daily_check.background 'true' 2>/dev/null || echo 'true')"
+    _AG_STARTUP_DAILY_CHECK_SCRIPT="$(bash "${config_bin}" get wrappers.codewhale.startup_daily_check.script_path '.agent/scripts/hmvip-codewhale-startup-check.sh' 2>/dev/null || echo '.agent/scripts/hmvip-codewhale-startup-check.sh')"
     _AG_IDENTITY_VAR="$(bash "${config_bin}" get commit.identity_env_var 'AGENT_GUARD_IDENTITY' 2>/dev/null || echo 'AGENT_GUARD_IDENTITY')"
     _AG_INIT_SCRIPT_NAME="$(bash "${config_bin}" get paths.init_script '.agent-guard-init' 2>/dev/null || echo '.agent-guard-init')"
     _AG_KNOWN_IDENTITIES="$(bash "${config_bin}" keys identities 2>/dev/null || true)"
@@ -257,7 +260,7 @@ if ! _ag_load_config; then
     # Management commands (--version, --help, ...) fora de repo passam direto,
     # sem fallback de descoberta: contrato do codewhale-wrapper-test.sh.
     if ! _ag_is_management_command "$@"; then
-        local _ag_fallback_repo
+        _ag_fallback_repo=""
         if _ag_fallback_repo="$(_ag_find_hmvip_repo 2>/dev/null)"; then
             _ag_load_config "${_ag_fallback_repo}"
         elif _ag_looks_like_main_repo; then
@@ -492,4 +495,27 @@ fi
 if [[ $# -eq 0 ]]; then
     set -- "${_AG_DEFAULT_COMMAND:-run}"
 fi
+
+# ---------------------------------------------------------------------------
+# 13.5 Optional startup daily-check hook
+# ---------------------------------------------------------------------------
+# When enabled, run a configured script once per session startup. This gives
+# every CodeWhale slot the same "on startup" automation without requiring a
+# per-slot UI configuration. The script itself (e.g. hmvip-codewhale-startup-
+# check.sh) should use a lock to avoid duplicate work when many slots start at
+# the same time.
+if [[ "${_AG_STARTUP_DAILY_CHECK_ENABLED:-false}" =~ ^([Tt]rue|1)$ && -n "${_AG_STARTUP_DAILY_CHECK_SCRIPT:-}" ]]; then
+    _AG_STARTUP_SCRIPT_PATH="${_AG_REPO_ROOT}/${_AG_STARTUP_DAILY_CHECK_SCRIPT}"
+    if [[ -f "${_AG_STARTUP_SCRIPT_PATH}" ]]; then
+        _AG_STARTUP_LOG="/tmp/hmvip-codewhale-startup-check-${_AG_IDENTITY:-unknown}.log"
+        if [[ "${_AG_STARTUP_DAILY_CHECK_BACKGROUND:-true}" =~ ^([Tt]rue|1)$ ]]; then
+            (
+                bash "${_AG_STARTUP_SCRIPT_PATH}" >"${_AG_STARTUP_LOG}" 2>&1 || true
+            ) &
+        else
+            bash "${_AG_STARTUP_SCRIPT_PATH}" >"${_AG_STARTUP_LOG}" 2>&1 || true
+        fi
+    fi
+fi
+
 exec node "${_AG_REAL_CW}" "$@"

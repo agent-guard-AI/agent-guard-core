@@ -1,5 +1,29 @@
 # Changelog — agent-guard-core
 
+## 0.10.9 — CodeWhale Global Startup Daily Check
+
+Adiciona um hook de startup no wrapper do CodeWhale para que **todos os slots
+`codewhale*`** executem automaticamente o check diário consolidado ao abrir,
+sem depender de configuração manual na UI do CodeWhale por slot.
+
+Mudanças:
+- `packages/agent-guard-core/wrappers/codewhale/wrapper.sh`:
+  - Novo passo opcional de `startup_daily_check`, configurável via
+    `agent-guard.yaml` (`wrappers.codewhale.startup_daily_check`).
+  - Quando habilitado, executa o script configurado ao final do startup do
+    wrapper, antes de delegar para o binário real do CodeWhale.
+  - Suporta execução em background (padrão) para não atrasar a abertura da
+    sessão, ou foreground para cenários controlados.
+- `agent-guard.yaml`:
+  - Habilitado por padrão para o ecossistema HMVIP:
+    `wrappers.codewhale.startup_daily_check.enabled: true`.
+- `.agent/scripts/hmvip-codewhale-startup-check.sh`:
+  - Usa `flock` para evitar execuções concorrentes e spam no Slack quando
+    vários slots iniciam simultaneamente.
+- `tests/agent-guard/codewhale-wrapper-test.sh`:
+  - Regressão garantindo que o hook executa o script quando habilitado.
+  - Regressão garantindo que o hook é ignorado quando desabilitado.
+
 ## 0.10.8 — CodeWhale Default Command & Slot Symlinks
 
 Corrige a falha remanescente em que `hmvip go codewhale<N>` e
