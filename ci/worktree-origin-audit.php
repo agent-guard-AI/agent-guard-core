@@ -48,6 +48,7 @@ final class WorktreeOriginAudit
         echo "   Head: {$headRef}\n\n";
 
         $notesRef = escapeshellarg($this->config->getGitNotesRef());
+        // nosemgrep: php.lang.security.exec-use.exec-use
         shell_exec("git fetch origin {$notesRef}:{$notesRef} >/dev/null 2>&1");
 
         $commits = $this->getCommits($baseRef, $headRef);

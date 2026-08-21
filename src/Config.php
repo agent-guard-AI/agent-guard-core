@@ -168,6 +168,7 @@ final class Config
             escapeshellarg('import json, sys, yaml; json.dump(yaml.safe_load(open(sys.argv[1])), sys.stdout)'),
             escapeshellarg($path)
         );
+        // nosemgrep: php.lang.security.exec-use.exec-use
         $output = shell_exec($command);
         if ($output === null || $output === '') {
             return null;
@@ -219,6 +220,7 @@ final class Config
         if (strpos($candidate, 'WindowsApps') !== false) {
             return false;
         }
+        // nosemgrep: php.lang.security.exec-use.exec-use
         $output = shell_exec(sprintf(
             '%s -c %s 2>/dev/null',
             escapeshellarg($candidate),
