@@ -394,14 +394,6 @@ _ag_check_worktree_clean() {
 }
 
 # ---------------------------------------------------------------------------
-# 7.5 Resolve the best init script to source
-# ---------------------------------------------------------------------------
-# Load helper that mirrors .kiro/shell/hmvip.sh logic, avoiding stale inits.
-# shellcheck disable=SC1090
-source "${SCRIPT_DIR}/wrappers/codewhale/resolve-init.sh"
-_AG_INIT_SCRIPT_PATH="$(_ag_resolve_init_script)"
-
-# ---------------------------------------------------------------------------
 # 8. Acquire lease if needed
 # ---------------------------------------------------------------------------
 if ! _ag_have_lease; then
@@ -426,7 +418,7 @@ if ! _ag_have_lease; then
                     echo "   Adopting the requested slot." >&2
                     candidate_identity="${_AG_SLOT}"
                 fi
-                source "${_AG_INIT_SCRIPT_PATH}" --attach "${candidate_identity}" 2>/dev/null && _AG_SKIP_INIT="true" || true
+                source "${_AG_REPO_ROOT}/${_AG_INIT_SCRIPT_NAME}" --attach "${candidate_identity}" 2>/dev/null && _AG_SKIP_INIT="true" || true
                 break
             fi
         done
@@ -435,9 +427,9 @@ if ! _ag_have_lease; then
     if [[ "${_AG_SKIP_INIT}" != "true" ]]; then
         # If an explicit slot was requested, use it; otherwise let init pick.
         if [[ -n "${_AG_SLOT}" ]]; then
-            source "${_AG_INIT_SCRIPT_PATH}" "${_AG_SLOT}" ia-a
+            source "${_AG_REPO_ROOT}/${_AG_INIT_SCRIPT_NAME}" "${_AG_SLOT}" ia-a
         else
-            source "${_AG_INIT_SCRIPT_PATH}" codewhale ia-a
+            source "${_AG_REPO_ROOT}/${_AG_INIT_SCRIPT_NAME}" codewhale ia-a
         fi
     fi
 
