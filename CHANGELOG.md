@@ -1,6 +1,6 @@
 # Changelog — agent-guard-core
 
-## 0.10.9 — CodeWhale Global Startup Daily Check
+## 0.10.9 — CodeWhale Global Daily Check (startup + timer)
 
 Adiciona um hook de startup no wrapper do CodeWhale para que **todos os slots
 `codewhale*`** executem automaticamente o check diário consolidado ao abrir,
@@ -23,6 +23,17 @@ Mudanças:
 - `tests/agent-guard/codewhale-wrapper-test.sh`:
   - Regressão garantindo que o hook executa o script quando habilitado.
   - Regressão garantindo que o hook é ignorado quando desabilitado.
+
+### Agendamento diário (independente de slot online)
+- `.kiro/systemd/hmvip-daily-check.timer`:
+  - Dispara todos os dias às 09:00 UTC, mesmo se nenhum slot CodeWhale estiver
+    aberto.
+- `.kiro/systemd/hmvip-daily-check.service`:
+  - Executa `.agent/scripts/hmvip-codewhale-startup-check.sh` com PATH e
+    `EnvironmentFile` configurados.
+- `.agent/scripts/hmvip-daily-check-install-systemd.sh`:
+  - Instala/copia timer e service para `~/.config/systemd/user`, cria o
+    `EnvironmentFile` de exemplo e habilita o timer.
 
 ## 0.10.8 — CodeWhale Default Command & Slot Symlinks
 
