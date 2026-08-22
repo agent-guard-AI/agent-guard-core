@@ -253,6 +253,11 @@ def _write_pending_alert(repo_root: Path, identity: str, payload: Dict[str, Any]
         "title": payload.get("title", ""),
         "summary": payload.get("summary", ""),
         "source": payload.get("source", ""),
+        "context": payload.get("context", ""),
+        "task": payload.get("task", ""),
+        "next_step": payload.get("next_step", ""),
+        "domain": payload.get("domain", ""),
+        "assigned_by": payload.get("assigned_by", "Luna/OpenClaw"),
         "received_at": datetime.now(timezone.utc).isoformat(),
         "expires_at": (
             datetime.now(timezone.utc).timestamp()

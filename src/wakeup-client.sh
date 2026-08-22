@@ -31,6 +31,11 @@ SEVERITY="P1"
 TITLE=""
 SUMMARY=""
 SOURCE=""
+CONTEXT=""
+TASK=""
+NEXT_STEP=""
+DOMAIN=""
+ASSIGNED_BY=""
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -39,6 +44,11 @@ while [[ $# -gt 0 ]]; do
     --title) TITLE="$2"; shift 2 ;;
     --summary) SUMMARY="$2"; shift 2 ;;
     --source) SOURCE="$2"; shift 2 ;;
+    --context) CONTEXT="$2"; shift 2 ;;
+    --task) TASK="$2"; shift 2 ;;
+    --next-step) NEXT_STEP="$2"; shift 2 ;;
+    --domain) DOMAIN="$2"; shift 2 ;;
+    --assigned-by) ASSIGNED_BY="$2"; shift 2 ;;
     *) echo "[wakeup-client] unknown arg: $1" >&2; shift ;;
   esac
 done
@@ -97,8 +107,13 @@ print(json.dumps({
     "title": sys.argv[3],
     "summary": sys.argv[4],
     "source": sys.argv[5],
+    "context": sys.argv[6],
+    "task": sys.argv[7],
+    "next_step": sys.argv[8],
+    "domain": sys.argv[9],
+    "assigned_by": sys.argv[10],
 }))
-' "$IDENTITY" "$SEVERITY" "$TITLE" "$SUMMARY" "$SOURCE")"
+' "$IDENTITY" "$SEVERITY" "$TITLE" "$SUMMARY" "$SOURCE" "$CONTEXT" "$TASK" "$NEXT_STEP" "$DOMAIN" "$ASSIGNED_BY")"
 
 # Compute HMAC over the exact bytes that curl will send (no trailing newline).
 SIGNATURE="$(printf '%s' "$PAYLOAD" | python3 -c '
