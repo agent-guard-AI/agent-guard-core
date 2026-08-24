@@ -1,5 +1,29 @@
 # Changelog — agent-guard-core
 
+## 0.10.10 — Local Checkpoint Retention Hardening
+
+Reduz o consumo ilimitado de disco por checkpoints locais de sessão,
+especialmente quando muitos slots estão ativos simultaneamente.
+
+Causa raiz:
+- O watcher do Kimi criava um checkpoint local a cada 5 minutos por slot.
+- Cada checkpoint copiava o transcript completo da sessão (~13–27 MB).
+- A retenção padrão era de 3 dias, sem limite de contagem.
+- Resultado: 6.092 checkpoints e 63 GB em menos de 3 dias em um notebook
+  com 8 slots ativos.
+
+Mudanças:
+- `packages/agent-guard-core/src/session_trace.sh`:
+  - `AGENT_GUARD_LOCAL_CHECKPOINT_RETENTION_DAYS` padrão: 3 → 2 dias.
+  - `AGENT_GUARD_KIMI_WATCH_CHECKPOINT_INTERVAL_SECONDS` padrão: 300 → 900 s
+    (checkpoint automático a cada 15 minutos em vez de 5).
+  - Novo limite `AGENT_GUARD_MAX_LOCAL_CHECKPOINTS` padrão: 50. Mesmo dentro
+    da janela de retenção, só os 50 checkpoints mais recentes são mantidos
+    localmente.
+  - `_trace_prune_local_checkpoints` aplica as duas regras: idade e contagem.
+- `tests/agent-guard/session_trace-test.sh`:
+  - Testes de regressão para remoção por idade e enforce do limite de 50.
+
 ## 0.10.9 — CodeWhale Global Daily Check (startup + timer)
 
 Adiciona um hook de startup no wrapper do CodeWhale para que **todos os slots

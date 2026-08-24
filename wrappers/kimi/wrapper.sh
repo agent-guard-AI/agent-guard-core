@@ -983,7 +983,7 @@ if [[ -f "${_ag_session_trace_script}" && -n "${_AG_WORKTREE:-}" && -n "${_AG_ID
             # session inside the worktree after the parent wrapper exits.
             cd / >/dev/null 2>&1 || true
             source "${_ag_session_trace_script}" >/dev/null 2>&1
-            _trace_watch_kimi_session "$$" "${_AG_WORKTREE}" "${_ag_session_trace_dir}" "${watch_interval}" "${AGENT_GUARD_KIMI_WATCH_CHECKPOINT_INTERVAL_SECONDS:-300}" >/dev/null 2>&1
+            _trace_watch_kimi_session "$$" "${_AG_WORKTREE}" "${_ag_session_trace_dir}" "${watch_interval}" "${AGENT_GUARD_KIMI_WATCH_CHECKPOINT_INTERVAL_SECONDS:-900}" >/dev/null 2>&1
         ) </dev/null >/dev/null 2>&1 &
         disown 2>/dev/null || true
     fi
