@@ -263,6 +263,9 @@ _trace_checkpoint() {
     # dias, tornando cada checkout de CI (fetch-depth: 0) 30–60s mais lento.
     # O transcript COMPLETO é preservado localmente em
     # .agent-guard/session/checkpoints/<id>/transcript-full.jsonl (gitignored).
+    # A limpeza local mantém no máximo AGENT_GUARD_LOCAL_CHECKPOINT_RETENTION_DAYS
+    # (padrão 2) e AGENT_GUARD_MAX_LOCAL_CHECKPOINTS (padrão 50) para evitar
+    # consumo ilimitado de disco em sessões longas ou muitos slots ativos.
     if [[ -f "${session_dir}/current/session.json" ]]; then
         cp "${session_dir}/current/session.json" "${cp_dir}/session.json"
     fi
@@ -333,8 +336,9 @@ _trace_checkpoint() {
     echo "${checkpoint_id}"
 }
 
-# Remove checkpoints locais mais antigos que o limite configurado.
-# A fonte verdadeira permanece na ref Git refs/agent-guard/sessions/v1.
+# Remove checkpoints locais mais antigos que o limite configurado ou que
+# excedam a contagem maxima. A fonte verdadeira permanece na ref Git
+# refs/agent-guard/sessions/v1.
 _trace_prune_local_checkpoints() {
     local session_dir="${1:-}"
     if [[ -z "${session_dir}" ]]; then
@@ -346,16 +350,21 @@ _trace_prune_local_checkpoints() {
         return 0
     fi
 
-    local retention_days
-    retention_days="${AGENT_GUARD_LOCAL_CHECKPOINT_RETENTION_DAYS:-3}"
+    local retention_days max_local_checkpoints
+    retention_days="${AGENT_GUARD_LOCAL_CHECKPOINT_RETENTION_DAYS:-2}"
     if ! [[ "${retention_days}" =~ ^[0-9]+$ ]] || [[ "${retention_days}" -le 0 ]]; then
-        retention_days=3
+        retention_days=2
+    fi
+    max_local_checkpoints="${AGENT_GUARD_MAX_LOCAL_CHECKPOINTS:-50}"
+    if ! [[ "${max_local_checkpoints}" =~ ^[0-9]+$ ]] || [[ "${max_local_checkpoints}" -le 0 ]]; then
+        max_local_checkpoints=50
     fi
 
     local cutoff
     cutoff="$(date -u +%s)"
     cutoff=$((cutoff - retention_days * 86400))
 
+    # 1. Remove checkpoints mais antigos que o limite de dias.
     local checkpoint_dir basename ts
     while IFS= read -r checkpoint_dir; do
         basename="$(basename "${checkpoint_dir}")"
@@ -364,6 +373,21 @@ _trace_prune_local_checkpoints() {
             rm -rf "${checkpoint_dir}"
         fi
     done < <(find "${checkpoints_dir}" -maxdepth 1 -mindepth 1 -type d 2>/dev/null)
+
+    # 2. Se ainda houver mais checkpoints do que o limite, mantem os mais
+    # recentes e remove o excedente (independente da idade).
+    local count
+    count="$(find "${checkpoints_dir}" -maxdepth 1 -mindepth 1 -type d 2>/dev/null | wc -l)"
+    if [[ "${count}" -gt "${max_local_checkpoints}" ]]; then
+        local to_remove
+        to_remove=$((count - max_local_checkpoints))
+        find "${checkpoints_dir}" -maxdepth 1 -mindepth 1 -type d -printf '%f\n' 2>/dev/null \
+            | sort -rn \
+            | tail -n "${to_remove}" \
+            | while IFS= read -r basename; do
+                rm -rf "${checkpoints_dir}/${basename}"
+            done
+    fi
 }
 
 # Constroi uma tree Git a partir de arquivos em um diretório.
@@ -526,7 +550,7 @@ _trace_watch_kimi_session() {
     local worktree="${2:-$(_trace_get_worktree)}"
     local session_dir="${3:-$(_trace_get_session_dir)}"
     local interval_seconds="${4:-${AGENT_GUARD_KIMI_WATCH_INTERVAL_SECONDS:-60}}"
-    local checkpoint_interval_seconds="${5:-${AGENT_GUARD_KIMI_WATCH_CHECKPOINT_INTERVAL_SECONDS:-300}}"
+    local checkpoint_interval_seconds="${5:-${AGENT_GUARD_KIMI_WATCH_CHECKPOINT_INTERVAL_SECONDS:-900}}"
 
     if [[ -z "${parent_pid}" || -z "${worktree}" || -z "${session_dir}" ]]; then
         return 1
