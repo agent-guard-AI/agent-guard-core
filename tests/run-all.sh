@@ -29,6 +29,8 @@ run_test() {
 }
 
 run_test "${SCRIPT_DIR}/agent-guard-cli-test.sh" "CLI smoke tests"
+run_test "${SCRIPT_DIR}/boot-cache-test.sh" "Boot cache tests (ADR-0051)"
+run_test "${SCRIPT_DIR}/heartbeat-throttle-test.sh" "Heartbeat throttle tests (ADR-0051)"
 run_test "${SCRIPT_DIR}/install-test.sh" "Installer tests"
 run_test "${SCRIPT_DIR}/auto-rescue-test.sh" "Auto-rescue functional tests"
 run_test "${SCRIPT_DIR}/test-tab-hook.sh" "Tab hook tests"

@@ -49,7 +49,37 @@ function _ag_heartbeat_main() {
         return 0
     fi
 
-    _update_last_activity "${identity}" >/dev/null 2>&1 || true
+    # Throttle de heartbeat (ADR-0051): so atualiza last_activity a cada 5 prompts
+    # ou 60s, o que vier primeiro. Reduz I/O e chamadas ao agent-guard em sessoes
+    # ativas sem degradar a deteccao de stale/shell-pinned.
+    local throttle_file throttle_now should_update=0
+    throttle_file="${repo_root}/.agent-guard/session/heartbeat-throttle.json"
+    throttle_now="$(date +%s)"
+    should_update=1
+    if [[ -f "${throttle_file}" ]]; then
+        local last_update prompts_since last_identity
+        last_update="$(jq -r '.last_update // 0' "${throttle_file}" 2>/dev/null || echo 0)"
+        prompts_since="$(jq -r '.prompts_since // 0' "${throttle_file}" 2>/dev/null || echo 0)"
+        last_identity="$(jq -r '.identity // ""' "${throttle_file}" 2>/dev/null || true)"
+        if [[ "${last_identity}" == "${identity}" && "${last_update}" -gt 0 ]]; then
+            # "a cada 5 prompts" => 4 prompts podem ser throttled; o 5o dispara update.
+            if [[ "${prompts_since}" -lt 4 && "$((throttle_now - last_update))" -lt 60 ]]; then
+                should_update=0
+            fi
+        fi
+    fi
+
+    if [[ "${should_update}" -eq 1 ]]; then
+        _update_last_activity "${identity}" >/dev/null 2>&1 || true
+        mkdir -p "$(dirname "${throttle_file}")"
+        printf '{"identity":"%s","last_update":%s,"prompts_since":0}' "${identity}" "${throttle_now}" >"${throttle_file}.tmp" && mv "${throttle_file}.tmp" "${throttle_file}" || true
+    else
+        # Incrementa contador de prompts mesmo quando throttled.
+        local new_prompts_since
+        new_prompts_since="$(jq -r '.prompts_since // 0' "${throttle_file}" 2>/dev/null || echo 0)"
+        new_prompts_since="$((new_prompts_since + 1))"
+        jq --argjson n "${new_prompts_since}" '.prompts_since = $n' "${throttle_file}" >"${throttle_file}.tmp" 2>/dev/null && mv "${throttle_file}.tmp" "${throttle_file}" || true
+    fi
 
     # Surface any pending wakeup alert for this identity.
     local wakeup_file="${repo_root}/.agent-guard/wakeup/${identity}.json"

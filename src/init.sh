@@ -154,6 +154,16 @@ if [[ -f "${SLACK_NOTIFY_SCRIPT}" ]]; then
 fi
 
 # ---------------------------------------------------------------------------
+# 1.6.3 Load boot cache helpers (ADR-0051)
+# ---------------------------------------------------------------------------
+# Must be available even with AGENT_GUARD_FUNCTIONS_ONLY=1 so hooks and
+# skills can query the cache without side effects.
+BOOT_CACHE_SCRIPT="${SCRIPT_DIR}/boot-cache.sh"
+if [[ -f "${BOOT_CACHE_SCRIPT}" ]]; then
+    source "${BOOT_CACHE_SCRIPT}"
+fi
+
+# ---------------------------------------------------------------------------
 # 1.5. Ensure Kimi CLI wrapper is in place
 # ---------------------------------------------------------------------------
 # The wrapper is the entrypoint that redirects sessions to isolated worktrees.
@@ -2818,6 +2828,11 @@ print(json.dumps({'reason': 'release', 'blockers': ['neutral_branch_failed'], 'w
 
     _clear_session "${CURRENT_IDENTITY}"
 
+    # Invalidate boot cache on release so the next session does not reuse stale layers.
+    if command -v _boot_state_invalidate >/dev/null 2>&1; then
+        _boot_state_invalidate "${CURRENT_WORKTREE}" >/dev/null 2>&1 || true
+    fi
+
     # Record release in session journal for crash recovery.
     if command -v _journal_release >/dev/null 2>&1; then
         _journal_release
@@ -3130,6 +3145,12 @@ if [[ "${MODE}" == "attach" ]]; then
     impact_json="$(echo "${IMPACT_PLUGINS}" | ${AG_PYTHON} -c "import sys,json; print(json.dumps([p.strip() for p in sys.stdin.read().split(',') if p.strip()]))" 2>/dev/null || echo "[]")"
     _save_session "${IDENTITY_FROM_BRANCH}" "active" "${ROLE}" "${ATTACH_BRANCH}" "$(_ag_session_pid "${WORKTREE_PATH}")" "${WORKTREE_PATH}" "${impact_json}"
 
+    # Persist boot cache so subsequent compacted sessions can skip redundant layers.
+    local _boot_artifacts="${WORKTREE_PATH}/ALERTAS.md ${WORKTREE_PATH}/ALERTAS-RECENT.md"
+    if command -v _boot_state_save >/dev/null 2>&1; then
+        _boot_state_save "${IDENTITY_FROM_BRANCH}" "${WORKTREE_PATH}" "${ATTACH_BRANCH}" "lease token-economy todo" "${_boot_artifacts}" >/dev/null 2>&1 || true
+    fi
+
     # Keep the slot task note aligned with the current branch/topic.
     _update_task_note_branch_topic "${IDENTITY_FROM_BRANCH}" "${ATTACH_BRANCH}" "${TASK_TOPIC}"
 
@@ -3299,6 +3320,12 @@ if [[ "${MODE}" == "adopt" ]]; then
     impact_json="$(echo "${IMPACT_PLUGINS}" | ${AG_PYTHON} -c "import sys,json; print(json.dumps([p.strip() for p in sys.stdin.read().split(',') if p.strip()]))" 2>/dev/null || echo "[]")"
     _save_session "${ADOPT_IDENTITY}" "active" "${ROLE}" "${ADOPT_BRANCH}" "$(_ag_session_pid "${WORKTREE_PATH}")" "${WORKTREE_PATH}" "${impact_json}"
 
+    # Persist boot cache so subsequent compacted sessions can skip redundant layers.
+    local _boot_artifacts="${WORKTREE_PATH}/ALERTAS.md ${WORKTREE_PATH}/ALERTAS-RECENT.md"
+    if command -v _boot_state_save >/dev/null 2>&1; then
+        _boot_state_save "${ADOPT_IDENTITY}" "${WORKTREE_PATH}" "${ADOPT_BRANCH}" "lease token-economy todo" "${_boot_artifacts}" >/dev/null 2>&1 || true
+    fi
+
     # Expanded slots (beyond the base count) must have a retomada note.
     _ensure_task_note "${ADOPT_IDENTITY}"
 
@@ -3349,6 +3376,18 @@ if git -C "${CURRENT_DIR}" rev-parse --show-toplevel >/dev/null 2>&1; then
     if [[ -n "${CURRENT_WORKTREE}" ]]; then
         wt_name="$(basename "${CURRENT_WORKTREE}")"
         CURRENT_IDENTITY="$(_detect_identity_from_worktree_name "${wt_name}" | awk '{print $1 $2}')"
+    fi
+fi
+
+# ---------------------------------------------------------------------------
+# 11.1. Try to load boot cache early (ADR-0051)
+# ---------------------------------------------------------------------------
+# This is safe even with AGENT_GUARD_FUNCTIONS_ONLY=1: it only reads a local
+# JSON file and exports environment variables. Skills can consult
+# HMVIP_BOOT_CACHE_VALID to skip boot layers when the cache is fresh.
+if command -v _boot_state_load >/dev/null 2>&1; then
+    if [[ -n "${CURRENT_WORKTREE}" && -n "${CURRENT_IDENTITY}" ]]; then
+        _boot_state_load "${CURRENT_IDENTITY}" "${CURRENT_WORKTREE}" "lease token-economy todo" >/dev/null 2>&1 || true
     fi
 fi
 
@@ -3455,6 +3494,12 @@ elif [[ -n "${CURRENT_IDENTITY}" && -n "${CURRENT_BRANCH}" && "${CURRENT_BRANCH}
 
     impact_json="$(echo "${IMPACT_PLUGINS}" | ${AG_PYTHON} -c "import sys,json; print(json.dumps([p.strip() for p in sys.stdin.read().split(',') if p.strip()]))" 2>/dev/null || echo "[]")"
     _save_session "${CURRENT_IDENTITY}" "active" "${ROLE}" "${CURRENT_BRANCH}" "$(_ag_session_pid "${CURRENT_WORKTREE}")" "${CURRENT_WORKTREE}" "${impact_json}"
+
+    # Persist boot cache so subsequent compacted sessions can skip redundant layers.
+    local _boot_artifacts="${CURRENT_WORKTREE}/ALERTAS.md ${CURRENT_WORKTREE}/ALERTAS-RECENT.md"
+    if command -v _boot_state_save >/dev/null 2>&1; then
+        _boot_state_save "${CURRENT_IDENTITY}" "${CURRENT_WORKTREE}" "${CURRENT_BRANCH}" "lease token-economy todo" "${_boot_artifacts}" >/dev/null 2>&1 || true
+    fi
 
     # Keep the slot task note aligned with the current branch/topic.
     _update_task_note_branch_topic "${CURRENT_IDENTITY}" "${CURRENT_BRANCH}" "${TASK_TOPIC}"
@@ -3565,6 +3610,12 @@ _export_session_env "${WORKTREE_PATH}" "${BRANCH_NAME}" "${IMPACT_PLUGINS}"
 
 impact_json="$(echo "${IMPACT_PLUGINS}" | ${AG_PYTHON} -c "import sys,json; print(json.dumps([p.strip() for p in sys.stdin.read().split(',') if p.strip()]))" 2>/dev/null || echo "[]")"
 _save_session "${IDENTITY}" "active" "${ROLE}" "${BRANCH_NAME}" "$(_ag_session_pid "${WORKTREE_PATH}")" "${WORKTREE_PATH}" "${impact_json}"
+
+# Persist boot cache so subsequent compacted sessions can skip redundant layers.
+local _boot_artifacts="${WORKTREE_PATH}/ALERTAS.md ${WORKTREE_PATH}/ALERTAS-RECENT.md"
+if command -v _boot_state_save >/dev/null 2>&1; then
+    _boot_state_save "${IDENTITY}" "${WORKTREE_PATH}" "${BRANCH_NAME}" "lease token-economy todo" "${_boot_artifacts}" >/dev/null 2>&1 || true
+fi
 
 # Expanded slots (beyond the base count) must have a retomada note.
 _ensure_task_note "${IDENTITY}"

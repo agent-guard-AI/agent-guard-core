@@ -83,6 +83,9 @@ journal:
 session:
   stale_threshold_hours: 24
   auto_release_stale: true
+  # Boot cache TTL: how long a reused session can skip redundant boot layers.
+  # P0-sensitive layers (ALERTAS.md, council digest) use max(half this, 900s).
+  boot_cache_ttl_seconds: 3600
   orphan_rescue:
     enabled: true
     ttl_days: 7
