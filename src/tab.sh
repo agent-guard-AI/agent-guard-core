@@ -398,15 +398,9 @@ event = "UserPromptSubmit"
 command = "${hook_path} working"
 timeout = 5
 
-[[hooks]]
-event = "PreToolUse"
-command = "${hook_path} working"
-timeout = 5
-
-[[hooks]]
-event = "SubagentStart"
-command = "${hook_path} working"
-timeout = 5
+# Nota: PreToolUse e SubagentStart foram removidos propositalmente no ADR-0051
+# para reduzir invocacoes de hook (~2-3 por turno em media) sem perder status visual.
+# O evento UserPromptSubmit ja atualiza o titulo no inicio de cada turno.
 
 [[hooks]]
 event = "PermissionRequest"
