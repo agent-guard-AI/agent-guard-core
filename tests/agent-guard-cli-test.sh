@@ -30,7 +30,7 @@ else
     fail "agent-guard CLI has shell syntax errors"
 fi
 
-for script in src/init.sh src/journal.sh src/session_trace.sh hooks/install.sh hooks/lease-owner-check.sh; do
+for script in src/init.sh src/journal.sh src/session_trace.sh hooks/install.sh hooks/lease-owner-check.sh src/safe-squash.sh; do
     if [[ -f "${REPO_ROOT}/${script}" ]]; then
         if bash -n "${REPO_ROOT}/${script}"; then
             pass "${script} has valid shell syntax"
@@ -41,6 +41,13 @@ for script in src/init.sh src/journal.sh src/session_trace.sh hooks/install.sh h
         fail "${script} not found"
     fi
 done
+
+# safe-squash command is registered in the agent-guard CLI.
+if grep -qE 'safe-squash\|sq\)' "${REPO_ROOT}/bin/agent-guard"; then
+    pass "safe-squash command is registered in agent-guard CLI"
+else
+    fail "safe-squash command is missing from agent-guard CLI"
+fi
 
 for script in "${REPO_ROOT}"/wrappers/*/wrapper.sh "${REPO_ROOT}"/wrappers/*/recovery.sh; do
     if [[ -f "${script}" ]]; then

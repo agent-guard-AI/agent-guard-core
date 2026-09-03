@@ -248,9 +248,13 @@ function _agent_guard_main() {
             _hmvip_continue_all_cmd "$@"
             return $?
             ;;
+        safe-squash|sq)
+            source "${SCRIPT_DIR}/src/safe-squash.sh" "$@"
+            return $?
+            ;;
         *)
             echo "❌ Unknown command or identity: ${COMMAND}" >&2
-            echo "   Commands: init, status, release, attach, triage, journal, resume, checkpoint, session, prune, cleanup-stale, orphan-sweep, tab, tabs, grid" >&2
+            echo "   Commands: init, status, release, attach, triage, journal, resume, checkpoint, session, prune, cleanup-stale, orphan-sweep, tab, tabs, grid, safe-squash" >&2
             echo "   Legacy:   <kimi|claude|gemini|grok> <role>" >&2
             return 1
             ;;
