@@ -268,6 +268,12 @@ function _agent_guard_main() {
             source "${SCRIPT_DIR}/src/safe-squash.sh" "$@"
             return $?
             ;;
+        slots)
+            # Facade leve read-only sobre o session storage (F5B). Nao carrega
+            # o init.sh: um unico passo python, sem reconcile/git/gh.
+            bash "${SCRIPT_DIR}/bin/agent-guard-slots" "$@"
+            return $?
+            ;;
         shadow|sh)
             # Shadow é read-only; usa functions-only igual ao prune.
             AGENT_GUARD_FUNCTIONS_ONLY=1
@@ -282,7 +288,7 @@ function _agent_guard_main() {
             ;;
         *)
             echo "❌ Unknown command or identity: ${COMMAND}" >&2
-            echo "   Commands: init, status (s), release (r), switch (sw), attach (a), adopt (ad), triage, journal (j), resume (res), checkpoint (cp), session (sess), prune, cleanup-stale (cs), orphan-sweep (os), tab, tabs, grid, task (t), safe-squash (sq), shadow (sh)" >&2
+            echo "   Commands: init, status (s), release (r), switch (sw), attach (a), adopt (ad), triage, journal (j), resume (res), checkpoint (cp), session (sess), prune, cleanup-stale (cs), orphan-sweep (os), tab, tabs, grid, task (t), safe-squash (sq), shadow (sh), slots" >&2
             echo "   Identities are loaded from agent-guard.yaml." >&2
             return 1
             ;;
