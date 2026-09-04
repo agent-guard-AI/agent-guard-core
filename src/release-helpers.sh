@@ -20,6 +20,14 @@ if [[ -f "${_RH_CORE_DIR}/src/journal.sh" ]]; then
     eval "${_RH_OLD_SHELL_FLAGS}" 2>/dev/null || true
 fi
 
+# Load task lifecycle helpers for task-state aware release checks.
+if [[ -f "${_RH_CORE_DIR}/src/task-lifecycle.sh" ]]; then
+    _RH_OLD_SHELL_FLAGS="$(set +o)"
+    # shellcheck source=/dev/null
+    source "${_RH_CORE_DIR}/src/task-lifecycle.sh" || true
+    eval "${_RH_OLD_SHELL_FLAGS}" 2>/dev/null || true
+fi
+
 # ---------------------------------------------------------------------------
 # Helper: check whether the worktree is on the identity's own task branch.
 # ---------------------------------------------------------------------------
@@ -234,6 +242,42 @@ _pr_list_open_for_identity() {
 }
 
 # ---------------------------------------------------------------------------
+# Helper: return the task state blocker for an identity, if any.
+# Prints one blocker line or empty if releasable.
+# Requires task-lifecycle.sh to be sourced.
+# ---------------------------------------------------------------------------
+_release_task_state_blocker() {
+    local identity="${1:-}"
+    local worktree_path="${2:-}"
+    if [[ -z "${identity}" ]]; then
+        return 0
+    fi
+    if ! command -v _task_note_path >/dev/null 2>&1; then
+        return 0
+    fi
+    local repo_root="${MAIN_REPO:-${_AG_REPO_ROOT:-}}"
+    if [[ -z "${repo_root}" && -n "${worktree_path}" ]]; then
+        repo_root="$(cd "${worktree_path}/.." 2>/dev/null && pwd)"
+    fi
+    [[ -n "${repo_root}" ]] || return 0
+
+    local note_path
+    note_path="$(_task_note_path "${identity}" "${repo_root}")"
+    [[ -f "${note_path}" ]] || return 0
+
+    local state
+    state="$(_task_get_field "${note_path}" "state" 2>/dev/null || true)"
+    state="${state:-legacy}"
+    case "${state}" in
+        planning|coding|review|blocked)
+            echo "task_state:${state}"
+            ;;
+        done|legacy|""|*)
+            return 0
+            ;;
+    esac
+}
+
 # Helper: return a list of release blockers for a worktree.
 # Prints one blocker per line (empty output means releasable).
 # Reuses the same logic as _validate_worktree_release_ready and the PR guard.
@@ -259,7 +303,8 @@ _worktree_release_blockers() {
     fi
 
     local dirty_files
-    dirty_files="$(git -C "${worktree_path}" status --porcelain 2>/dev/null || true)"
+    # Agent Guard runtime artifacts (.agent-guard/) live outside version control.
+    dirty_files="$(git -C "${worktree_path}" status --porcelain 2>/dev/null | grep -v '\.agent-guard/' || true)"
     if [[ -n "${dirty_files}" ]]; then
         echo "dirty_worktree"
     fi
@@ -288,6 +333,13 @@ _worktree_release_blockers() {
         if [[ "${pr_count}" -gt 0 ]]; then
             echo "open_prs:${pr_count}"
         fi
+    fi
+
+    # Task lifecycle guard: block release unless task state is done or legacy.
+    local task_blocker
+    task_blocker="$(_release_task_state_blocker "${identity}" "${worktree_path}")"
+    if [[ -n "${task_blocker}" ]]; then
+        echo "${task_blocker}"
     fi
 }
 
@@ -328,7 +380,11 @@ _validate_worktree_release_ready() {
     fi
 
     local dirty_files
-    dirty_files="$(git -C "${worktree_path}" status --porcelain 2>/dev/null || true)"
+    # Agent Guard runtime artifacts (.agent-guard/) live outside version control.
+    # They must never block release, even when the worktree's branch does not
+    # yet carry the ignore rule (e.g., fresh worktrees created before the
+    # .gitignore was committed).
+    dirty_files="$(git -C "${worktree_path}" status --porcelain 2>/dev/null | grep -v '\.agent-guard/' || true)"
     if [[ -n "${dirty_files}" ]]; then
         echo "" >&2
         echo "❌❌❌ ERROR: WORKING TREE DIRTY ❌❌❌" >&2

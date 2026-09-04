@@ -173,6 +173,9 @@ _ag_load_config() {
     _AG_IDENTITY_VAR="$(bash "${config_bin}" get commit.identity_env_var 'AGENT_GUARD_IDENTITY' 2>/dev/null || echo 'AGENT_GUARD_IDENTITY')"
     _AG_INIT_SCRIPT_NAME="$(bash "${config_bin}" get paths.init_script '.agent-guard-init' 2>/dev/null || echo '.agent-guard-init')"
     _AG_KNOWN_IDENTITIES="$(bash "${config_bin}" keys identities 2>/dev/null || true)"
+    _AG_STARTUP_DAILY_CHECK_ENABLED="$(bash "${config_bin}" get wrappers.kimi.startup_daily_check.enabled 'false' 2>/dev/null || echo 'false')"
+    _AG_STARTUP_DAILY_CHECK_BACKGROUND="$(bash "${config_bin}" get wrappers.kimi.startup_daily_check.background 'true' 2>/dev/null || echo 'true')"
+    _AG_STARTUP_DAILY_CHECK_SCRIPT="$(bash "${config_bin}" get wrappers.kimi.startup_daily_check.script_path '.agent/scripts/hmvip-luna-daily-issue-digest.sh' 2>/dev/null || echo '.agent/scripts/hmvip-luna-daily-issue-digest.sh')"
 
     # Resolve real kimi binary.
     if ! _AG_REAL_KIMI="$(try_source_real_kimi "${_AG_BIN_DIR}" "${_AG_REAL_BIN_NAME}")"; then
@@ -1020,6 +1023,26 @@ fi
 # ---------------------------------------------------------------------------
 if [[ "${CWD}" == "${_AG_MAIN_REPO}" ]]; then
     cd "${_AG_WORKTREE}"
+fi
+
+# ---------------------------------------------------------------------------
+# 12.5 Optional startup daily-check hook (Luna issue digest)
+# ---------------------------------------------------------------------------
+# When enabled, run a configured script once per session startup. The script
+# itself uses flock to avoid duplicate work when many slots start at the same
+# time; only the first slot per day posts the digest to Slack.
+if [[ "${_AG_STARTUP_DAILY_CHECK_ENABLED:-false}" =~ ^([Tt]rue|1)$ && -n "${_AG_STARTUP_DAILY_CHECK_SCRIPT:-}" ]]; then
+    _AG_STARTUP_SCRIPT_PATH="${_AG_MAIN_REPO}/${_AG_STARTUP_DAILY_CHECK_SCRIPT}"
+    if [[ -f "${_AG_STARTUP_SCRIPT_PATH}" ]]; then
+        _AG_STARTUP_LOG="/tmp/hmvip-luna-daily-issue-digest-${_AG_IDENTITY:-unknown}.log"
+        if [[ "${_AG_STARTUP_DAILY_CHECK_BACKGROUND:-true}" =~ ^([Tt]rue|1)$ ]]; then
+            (
+                bash "${_AG_STARTUP_SCRIPT_PATH}" >"${_AG_STARTUP_LOG}" 2>&1 || true
+            ) &
+        else
+            bash "${_AG_STARTUP_SCRIPT_PATH}" >"${_AG_STARTUP_LOG}" 2>&1 || true
+        fi
+    fi
 fi
 
 # ---------------------------------------------------------------------------

@@ -29,8 +29,17 @@ run_test() {
 }
 
 run_test "${SCRIPT_DIR}/agent-guard-cli-test.sh" "CLI smoke tests"
+run_test "${SCRIPT_DIR}/hook-provenance-test.sh" "Hook provenance tests"
+run_test "${SCRIPT_DIR}/safe-squash-test.sh" "safe-squash functional tests"
+run_test "${SCRIPT_DIR}/task-lifecycle-parser-test.sh" "Task lifecycle parser tests"
+run_test "${SCRIPT_DIR}/task-cli-test.sh" "Task lifecycle CLI tests"
+run_test "${SCRIPT_DIR}/task-lifecycle-gates-test.sh" "Task lifecycle gate tests"
+run_test "${SCRIPT_DIR}/task-lifecycle-hooks-test.sh" "Task lifecycle hook tests"
+run_test "${SCRIPT_DIR}/status-json-test.sh" "Machine API status --json tests"
 run_test "${SCRIPT_DIR}/boot-cache-test.sh" "Boot cache tests (ADR-0051)"
+run_test "${SCRIPT_DIR}/boot-cache-layer-test.sh" "Boot cache consciousness layers (ADR-0052)"
 run_test "${SCRIPT_DIR}/heartbeat-throttle-test.sh" "Heartbeat throttle tests (ADR-0051)"
+run_test "${SCRIPT_DIR}/hook-dispatcher-test.sh" "Hook dispatcher tests (ADR-0052)"
 run_test "${SCRIPT_DIR}/install-test.sh" "Installer tests"
 run_test "${SCRIPT_DIR}/auto-rescue-test.sh" "Auto-rescue functional tests"
 run_test "${SCRIPT_DIR}/test-tab-hook.sh" "Tab hook tests"

@@ -7,7 +7,20 @@
 
 set -euo pipefail
 
-REPO_ROOT="$(git rev-parse --show-toplevel)"
+WORKTREE_PATH="$(git rev-parse --show-toplevel 2>/dev/null || echo "")"
+if [[ -z "${WORKTREE_PATH}" ]]; then
+    exit 0
+fi
+
+# Resolve the main repository root (where .agent-guard/tasks lives), even when
+# running inside a linked git worktree.
+git_common_dir="$(git -C "${WORKTREE_PATH}" rev-parse --git-common-dir 2>/dev/null || echo ".git")"
+if [[ "${git_common_dir}" = /* ]]; then
+    REPO_ROOT="$(cd "$(dirname "${git_common_dir}")" 2>/dev/null && pwd || echo "${WORKTREE_PATH}")"
+else
+    REPO_ROOT="$(cd "${WORKTREE_PATH}/${git_common_dir}/.." 2>/dev/null && pwd || echo "${WORKTREE_PATH}")"
+fi
+
 AGENT_GUARD_BIN="${REPO_ROOT}/packages/agent-guard-core/bin/agent-guard-config"
 
 if [[ ! -f "${AGENT_GUARD_BIN}" ]]; then
@@ -16,11 +29,6 @@ if [[ ! -f "${AGENT_GUARD_BIN}" ]]; then
 fi
 
 NOTES_REF="$(bash "${AGENT_GUARD_BIN}" get git.notes_ref 'refs/notes/agent-guard-worktree')"
-
-WORKTREE_PATH="$(git rev-parse --show-toplevel 2>/dev/null || echo "")"
-if [[ -z "${WORKTREE_PATH}" ]]; then
-    exit 0
-fi
 
 WORKTREE_NAME="$(basename "${WORKTREE_PATH}")"
 IDENTITY=""
@@ -67,6 +75,24 @@ if [[ -f "${JOURNAL_SCRIPT}" ]]; then
     export AGENT_GUARD_BRANCH="${BRANCH}"
     export AGENT_GUARD_WORKTREE_PATH="${WORKTREE_PATH}"
     _journal_commit "${COMMIT_SHA}" "${COMMIT_MSG}"
+fi
+
+# Task lifecycle: primeiro commit em task branch move state planning -> coding.
+TASK_LIFECYCLE_SCRIPT="${REPO_ROOT}/packages/agent-guard-core/src/task-lifecycle.sh"
+if [[ -f "${TASK_LIFECYCLE_SCRIPT}" && -n "${IDENTITY}" ]]; then
+    # shellcheck source=/dev/null
+    source "${TASK_LIFECYCLE_SCRIPT}"
+    NOTE_PATH="${REPO_ROOT}/.agent-guard/tasks/${IDENTITY}.md"
+    if [[ -f "${NOTE_PATH}" ]]; then
+        CURRENT_STATE="$(_task_get_field "${NOTE_PATH}" "state" 2>/dev/null || true)"
+        if [[ "${CURRENT_STATE}" == "planning" ]]; then
+            if _task_set_state "${NOTE_PATH}" "coding" "primeiro commit" "${IDENTITY}" "${REPO_ROOT}" 2>/dev/null; then
+                if command -v _journal_task_state_changed >/dev/null 2>&1; then
+                    _journal_task_state_changed "${IDENTITY}" "" "planning" "coding" "primeiro commit"
+                fi
+            fi
+        fi
+    fi
 fi
 
 # Capture a session-trace checkpoint for every commit so the conversation
