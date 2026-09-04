@@ -1,5 +1,35 @@
 # Changelog — agent-guard-core
 
+## Unreleased — F5B Wave 1: decoupling de leitores externos (SPEC F5)
+
+Remove leituras diretas do session storage por consumidores externos. Nenhum
+write migrado; semântica de fail-open e comportamento por estado preservados.
+
+- `packages/agent-guard-core/bin/agent-guard-slots` (novo): facade pública
+  leve e read-only sobre o session storage. `[--identity <id>]`, saída JSON
+  `{"schema_version":3,"command":"slots",...}` com campos RAW (`status, role,
+  pid, branch, worktree_path, last_activity, released_at, timestamp`).
+  Resolução de path espelha o kernel (`paths.session_storage` →
+  `session.session_storage` → `session.lease_storage` → `.agent-guard/sessions`).
+  Arquivo malformado vira entrada `status: "unknown"` (preserva a distinção
+  ausente vs malformado dos leitores diretos). Fail-open: erro qualquer →
+  `slots: []`, exit 0. Nenhum reconcile/git/gh — um único passo python.
+- `bin/agent-guard`: novo comando `slots` (não carrega init.sh).
+- Migrados para a facade (13 sites, 0 writes): `wrappers/kimi/wrapper.sh` (3),
+  `wrappers/kilo/wrapper.sh` (3), `wrappers/amp/wrapper.sh` (4 — o amp espelha
+  o padrão completo do kimi, incluindo o watcher de session-end), e
+  `.kiro/shell/hmvip.sh` (3: `_hmvip_resume`, `_hmvip_menu_slots`, ação
+  retomar). Wrappers ganharam `_ag_slots_snapshot` (cache por processo) e
+  `_ag_slot_field`. `HMVIP_SESSION_DIR` removida do hmvip.sh.
+- Testes: `tests/agent-guard/f5b-decoupling-test.sh` (15 checks herméticos:
+  campos RAW, `--identity`, fail-open, equivalência de decisão direto-vs-facade
+  e anti-regressão por grep).
+- NÃO tocados (conforme escopo F5B): `hooks/lease-owner-check.sh`
+  (DO_NOT_TOUCH), writes `tab_*` de `agent-guard-tab.sh`/`agent-guard-session-end.sh`,
+  fallback de `kimi-tab-hook.sh` (NEEDS_SHIM, F5C), bloco legado G8.2 em
+  `ci-core.yml` (path morto `agent-leases/`, remoção em PR separado).
+- Audit: `.kiro/specs/agent-guard-v1-kernel-refactor-20260903/audit/f5b-wave1-decision.md`.
+
 ## Unreleased — Session Shadow / Liveness API (SPEC F4)
 
 Adiciona o Session Shadow: snapshot leve e read-only de liveness por slot,

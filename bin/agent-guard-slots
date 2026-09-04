@@ -1,0 +1,132 @@
+#!/usr/bin/env bash
+#
+# agent-guard-slots — facade leve e read-only sobre o session storage interno.
+#
+# Uso:
+#   agent-guard-slots [--identity <id>]
+#
+# Saida (stdout), JSON:
+#   {"schema_version":3,"command":"slots","generated_at":"<iso>","slots":[{
+#     "identity","status","role","pid","branch","worktree_path",
+#     "last_activity","released_at","timestamp"
+#   }]}
+#
+# Contrato (F5B):
+#   - READ-ONLY: nunca escreve no session storage (resolucao de path igual ao
+#     kernel: paths.session_storage -> session.session_storage ->
+#     session.lease_storage -> .agent-guard/sessions).
+#   - RAW: emite os campos exatamente como gravados no storage. Sem reconcile,
+#     sem deteccao de liveness, sem chamadas git/gh — um unico passo python.
+#     E a semantica equivalente a ler os arquivos diretamente.
+#   - FAIL-OPEN: qualquer erro (storage ausente, yaml invalido, falha de I/O)
+#     produz {"schema_version":3,"slots":[]} com exit 0. Consumidores que liam
+#     os arquivos diretamente preservam seu fail-open, pois entrada ausente ==
+#     arquivo ausente.
+#   - Malformado: arquivo com JSON invalido vira entrada
+#     {"identity": "<id>", "status": "unknown"}, preservando a distincao
+#     (existente nos leitores diretos) entre arquivo ausente e arquivo
+#     malformado.
+#
+# Este binario e a API publica para consumidores externos (wrappers, hmvip.sh,
+# Agent Ops). Nenhum consumidor novo deve ler .kiro/locks/agent-sessions/*.json
+# diretamente (SPEC agent-guard-v1-kernel-refactor, F5).
+
+# Preserve caller shell options; never leak set -euo pipefail.
+_AG_SLOTS_OLD_FLAGS="$(set +o)"
+_ag_slots_restore_flags() {
+    eval "${_AG_SLOTS_OLD_FLAGS}" 2>/dev/null || true
+}
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+
+AG_PYTHON="$(bash "${SCRIPT_DIR}/bin/agent-guard-python" 2>/dev/null || echo "python3")"
+export AG_PYTHON
+
+IDENTITY_FILTER=""
+if [[ "${1:-}" == "--identity" && -n "${2:-}" ]]; then
+    IDENTITY_FILTER="$2"
+fi
+
+_slots_repo_root() {
+    if [[ -n "${AGENT_GUARD_REPO_ROOT:-}" && -f "${AGENT_GUARD_REPO_ROOT}/agent-guard.yaml" ]]; then
+        echo "${AGENT_GUARD_REPO_ROOT}"
+        return 0
+    fi
+    local git_root
+    git_root="$(git rev-parse --show-toplevel 2>/dev/null || true)"
+    if [[ -n "${git_root}" && -f "${git_root}/agent-guard.yaml" ]]; then
+        echo "${git_root}"
+        return 0
+    fi
+    echo "$(pwd)"
+}
+
+REPO_ROOT="$(_slots_repo_root)"
+# Mirror the kernel's storage resolution order (src/init.sh): paths.*
+# first, then legacy session.* keys, then the same default.
+SESSION_STORAGE="$(bash "${SCRIPT_DIR}/bin/agent-guard-config" get paths.session_storage "" 2>/dev/null || true)"
+if [[ -z "${SESSION_STORAGE}" ]]; then
+    SESSION_STORAGE="$(bash "${SCRIPT_DIR}/bin/agent-guard-config" get session.session_storage "" 2>/dev/null || true)"
+fi
+if [[ -z "${SESSION_STORAGE}" ]]; then
+    SESSION_STORAGE="$(bash "${SCRIPT_DIR}/bin/agent-guard-config" get session.lease_storage "" 2>/dev/null || true)"
+fi
+SESSION_STORAGE="${SESSION_STORAGE:-.agent-guard/sessions}"
+SESSION_DIR="${REPO_ROOT}/${SESSION_STORAGE}"
+
+export _AG_SLOTS_DIR="${SESSION_DIR}"
+export _AG_SLOTS_IDENTITY_FILTER="${IDENTITY_FILTER}"
+
+"${AG_PYTHON}" <<'PY'
+import json, os, sys, datetime
+
+session_dir = os.environ.get("_AG_SLOTS_DIR", "")
+identity_filter = os.environ.get("_AG_SLOTS_IDENTITY_FILTER", "")
+
+out = {
+    "schema_version": 3,
+    "command": "slots",
+    "generated_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+    "slots": [],
+}
+
+try:
+    if session_dir and os.path.isdir(session_dir):
+        for name in sorted(os.listdir(session_dir)):
+            if not name.endswith(".json"):
+                continue
+            identity = name[:-5]
+            if identity_filter and identity != identity_filter:
+                continue
+            path = os.path.join(session_dir, name)
+            try:
+                with open(path, encoding="utf-8", errors="replace") as f:
+                    data = json.load(f)
+                if not isinstance(data, dict):
+                    raise ValueError("not an object")
+                slot = {
+                    "identity": identity,
+                    "status": data.get("status", ""),
+                    "role": data.get("role", ""),
+                    "pid": data.get("pid", ""),
+                    "branch": data.get("branch", ""),
+                    "worktree_path": data.get("worktree_path", ""),
+                    "last_activity": data.get("last_activity", ""),
+                    "released_at": data.get("released_at", ""),
+                    "timestamp": data.get("timestamp", ""),
+                }
+            except Exception:
+                # Malformed session file: preserve the direct-read semantics
+                # (callers distinguished missing vs unreadable).
+                slot = {"identity": identity, "status": "unknown"}
+            out["slots"].append(slot)
+except Exception:
+    pass
+
+json.dump(out, sys.stdout)
+PY
+
+_ag_slots_restore_flags
+exit 0

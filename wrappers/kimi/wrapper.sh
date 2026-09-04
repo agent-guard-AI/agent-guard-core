@@ -536,6 +536,49 @@ _ag_worktree_has_live_agent() {
 # invocations from clobbering each other's lease output in /tmp.
 _AG_WRAPPER_LOG="/tmp/ag-wrapper-lease-${_AG_SLOT:-$$}.log"
 
+# ---------------------------------------------------------------------------
+# Public session snapshot (F5B) — leitura unica do session storage via facade
+# agent-guard-slots. Substitui leituras diretas de
+# .kiro/locks/agent-sessions/*.json. O snapshot fica em cache pela vida do
+# wrapper. Fail-open: se a facade falhar, o snapshot fica vazio e todos os
+# consumidores abaixo se comportam exatamente como com arquivo de sessao
+# ausente (comportamento anterior preservado).
+_AG_SLOTS_SNAPSHOT=""
+_ag_slots_snapshot() {
+    if [[ -z "${_AG_SLOTS_SNAPSHOT}" ]]; then
+        # Resolve the facade from the repo's package copy (next to the config
+        # bin), not from SCRIPT_DIR: the installed wrapper lives outside the
+        # package (e.g. ~/.kimi-code/bin/kimi), where SCRIPT_DIR/../.. is not
+        # the package root.
+        local _slots_bin
+        _slots_bin="$(dirname "${_AG_CONFIG_BIN}")/agent-guard-slots"
+        _AG_SLOTS_SNAPSHOT="$(AGENT_GUARD_REPO_ROOT="${_AG_MAIN_REPO}" bash "${_slots_bin}" 2>/dev/null || true)"
+        if [[ -z "${_AG_SLOTS_SNAPSHOT}" ]] || ! printf '%s' "${_AG_SLOTS_SNAPSHOT}" | ${AG_PYTHON} -c 'import json,sys; json.load(sys.stdin)' >/dev/null 2>&1; then
+            _AG_SLOTS_SNAPSHOT='{"schema_version":3,"command":"slots","slots":[]}'
+        fi
+    fi
+    printf '%s' "${_AG_SLOTS_SNAPSHOT}"
+}
+
+# _ag_slot_field <identity> <field> — valor de um campo no snapshot publico.
+# Vazio quando a identidade nao tem entrada (equivale a arquivo ausente).
+_ag_slot_field() {
+    local _field_id="$1" _field_name="$2"
+    printf '%s' "$(_ag_slots_snapshot)" | ${AG_PYTHON} -c '
+import json, sys
+_id, field = sys.argv[1], sys.argv[2]
+try:
+    slots = json.load(sys.stdin).get("slots", [])
+except Exception:
+    slots = []
+for s in slots:
+    if s.get("identity") == _id:
+        v = s.get(field, "")
+        print("" if v is None else v)
+        break
+' "${_field_id}" "${_field_name}" 2>/dev/null || true
+}
+
 # Return the most recent resumable worktree for a given identity prefix.
 # Reads the newest entries from the Agent Guard journal and, for the newest
 # identity matches ${prefix}<number>, checks whether the recorded worktree is
@@ -547,19 +590,29 @@ _ag_find_resumable_worktree() {
     journal_path="${_AG_MAIN_REPO}/$(bash "${_AG_CONFIG_BIN}" get journal.path ".agent-guard/journal/agent-guard.jsonl" 2>/dev/null || echo ".agent-guard/journal/agent-guard.jsonl")"
     [[ ! -f "${journal_path}" ]] && return 1
 
-    local session_dir
-    session_dir="${_AG_MAIN_REPO}/$(bash "${_AG_CONFIG_BIN}" get paths.session_storage ".agent-guard/sessions")"
-
     # Identify the agent IDE/session that owns this wrapper invocation so the
     # Python helper can ignore processes from the same session.
     local own_agent_ancestor
     _ag_scan_proc_once
     own_agent_ancestor="$(_ag_find_agent_ancestor "$$")"
 
-    ${AG_PYTHON} - "${journal_path}" "${prefix}" "${session_dir}" "${own_agent_ancestor}" "${_AG_PROC_SCAN_AGENT_PIDS}" "${_AG_PROC_SCAN_WORKTREE_PIDS}" "${_AG_PROC_SCAN_PPID_MAP}" <<'PY'
+    local slots_snapshot
+    slots_snapshot="$(_ag_slots_snapshot)"
+
+    ${AG_PYTHON} - "${journal_path}" "${prefix}" "${slots_snapshot}" "${own_agent_ancestor}" "${_AG_PROC_SCAN_AGENT_PIDS}" "${_AG_PROC_SCAN_WORKTREE_PIDS}" "${_AG_PROC_SCAN_PPID_MAP}" <<'PY'
 import json, sys, os, re, subprocess
-journal_path, prefix, session_dir, own_agent_ancestor, agent_pids_str, worktree_pids_str, ppid_map_str = sys.argv[1:8]
+journal_path, prefix, slots_json, own_agent_ancestor, agent_pids_str, worktree_pids_str, ppid_map_str = sys.argv[1:8]
 identity_re = re.compile(rf'^{re.escape(prefix)}\\d+$')
+
+# Public session snapshot (identity -> slot record) from the agent-guard-slots
+# facade. A missing identity equals a missing session file (fail-open).
+slot_map = {}
+try:
+    for _s in json.loads(slots_json).get('slots', []):
+        if _s.get('identity'):
+            slot_map[_s['identity']] = _s
+except Exception:
+    pass
 
 # Reuse the single /proc scan performed by the bash wrapper.
 agent_pids = set(agent_pids_str.split())
@@ -664,19 +717,14 @@ for e in events:
     except Exception:
         continue
 
-    # If a session file exists and points to a live PID, the session is still
-    # held by a running process and must not be hijacked.
-    session_file = os.path.join(session_dir, f'{identity}.json')
-    if os.path.isfile(session_file):
-        try:
-            with open(session_file) as f:
-                data = json.load(f)
-            if data.get('status') == 'active':
-                pid = data.get('pid')
-                if pid and os.path.isdir(f'/proc/{pid}'):
-                    continue
-        except Exception:
-            pass
+    # If the public session snapshot shows this identity active with a live
+    # PID, the session is still held by a running process and must not be
+    # hijacked. A missing entry equals a missing session file (fail-open).
+    sess = slot_map.get(identity)
+    if sess and sess.get('status') == 'active':
+        pid = sess.get('pid')
+        if pid and os.path.isdir(f'/proc/{pid}'):
+            continue
 
     # Even when the session file is missing or stale, refuse to resume a
     # worktree that currently hosts another live agent process.
@@ -691,8 +739,6 @@ PY
 }
 
 _ag_find_free_kimi_worktree() {
-    local session_dir
-    session_dir="${_AG_MAIN_REPO}/$(bash "${_AG_CONFIG_BIN}" get paths.session_storage ".agent-guard/sessions")"
     for prefix in ${_AG_KNOWN_IDENTITIES}; do
         [[ "${prefix}" == "kimi" ]] || continue
         local wt_prefix
@@ -708,7 +754,6 @@ _ag_find_free_kimi_worktree() {
         for n in $(seq 1 "${max_slots}"); do
             local identity="${prefix}${n}"
             local worktree="${_AG_BASE_DIR}/${wt_prefix}${n}"
-            local session_file="${session_dir}/${identity}.json"
 
             # The wrapper does not create missing worktrees here; creation is
             # delegated to the init script when expansion is required.
@@ -725,10 +770,13 @@ _ag_find_free_kimi_worktree() {
                 is_free=false
             fi
 
-            if [[ "${is_free}" == "true" && -f "${session_file}" ]]; then
+            # Session state comes from the public snapshot (F5B). Entry absent
+            # == session file absent; status "unknown" (malformed) == previous
+            # "free" fallback. Only active+live-PID marks the slot as held.
+            if [[ "${is_free}" == "true" ]]; then
                 local status pid
-                status="$(${AG_PYTHON} -c "import json,sys; d=json.load(open('${session_file}')); print(d.get('status','free'))" 2>/dev/null || echo free)"
-                pid="$(${AG_PYTHON} -c "import json,sys; d=json.load(open('${session_file}')); print(d.get('pid',''))" 2>/dev/null || echo '')"
+                status="$(_ag_slot_field "${identity}" status)"
+                pid="$(_ag_slot_field "${identity}" pid)"
                 if [[ "${status}" == "active" && -n "${pid}" && -d "/proc/${pid}" ]]; then
                     is_free=false
                 fi
@@ -804,13 +852,13 @@ if ! _ag_have_lease; then
             exit 1
         fi
 
-        # 2. Decide adopt vs acquire from the slot's session file.
-        _ag_session_dir="${_AG_MAIN_REPO}/$(bash "${_AG_CONFIG_BIN}" get paths.session_storage ".agent-guard/sessions" 2>/dev/null || echo ".agent-guard/sessions")"
-        _ag_session_file="${_ag_session_dir}/${_AG_SLOT}.json"
+        # 2. Decide adopt vs acquire from the public session snapshot (F5B).
+        # Entry absent == session file absent; "unknown" (malformed) behaves
+        # like the previous "free" fallback.
         _ag_slot_mode="acquire"
-        if [[ -f "${_ag_session_file}" && -d "${_ag_slot_worktree}" ]]; then
-            _ag_sess_status="$(${AG_PYTHON} -c "import json,sys; d=json.load(open(sys.argv[1])); print(d.get('status','free'))" "${_ag_session_file}" 2>/dev/null || echo free)"
-            _ag_sess_pid="$(${AG_PYTHON} -c "import json,sys; d=json.load(open(sys.argv[1])); print(d.get('pid',''))" "${_ag_session_file}" 2>/dev/null || echo '')"
+        if [[ -d "${_ag_slot_worktree}" ]]; then
+            _ag_sess_status="$(_ag_slot_field "${_AG_SLOT}" status)"
+            _ag_sess_pid="$(_ag_slot_field "${_AG_SLOT}" pid)"
             if [[ "${_ag_sess_status}" == "active" && -n "${_ag_sess_pid}" ]]; then
                 if _ag_pid_is_alive "${_ag_sess_pid}"; then
                     echo "❌ AG WRAPPER: slot '${_AG_SLOT}' is held by live PID ${_ag_sess_pid}." >&2
