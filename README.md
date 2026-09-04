@@ -4,7 +4,7 @@ Protocolo open source de governança multi-IA para repositórios Git.
 
 Permite que múltiplos agentes de IA CLI colaborem no mesmo repositório sem colidir em branches, worktrees ou commits.
 
-> ⚠️ **Compatibilidade de wrappers:** o protocolo e os hooks são genéricos e podem ser estendidos para várias identidades. Wrappers CLI oficiais e testados: **Kimi (Moonshot AI)**, **Amp (Sourcegraph)**, **Kilo (Kilo Code / Kilo CLI)** e **CodeWhale**. Outros agentes (Claude, Gemini, Grok etc.) podem usar o protocolo via init stub manual, mas não há wrapper automático para eles.
+> ⚠️ **Compatibilidade de wrappers:** o protocolo e os hooks são genéricos e podem ser estendidos para várias identidades. Wrappers CLI oficiais e testados: **Kimi (Moonshot AI)**, **Amp (Sourcegraph)**, **Kilo (Kilo Code / Kilo CLI)** e **CodeWhale**. O wrapper Kilo está em produção desde ago/2026 com session trace, heartbeat automático e recovery via cron. Outros agentes (Claude, Gemini, Grok etc.) podem usar o protocolo via init stub manual, mas não há wrapper automático para eles.
 
 ## Por que usar
 
@@ -362,6 +362,8 @@ O wrapper `wrappers/kilo/wrapper.sh` substitui o binário `kilo` do Kilo Code / 
 - Lê `agent-guard.yaml` para descobrir caminhos, identidades e o binário real do Kilo.
 - Impede execução no repo principal e redireciona para um worktree livre.
 - Bloqueia worktrees sujos ou já em uso por outro processo.
+- **Session trace + heartbeat**: inicializa rastreamento de sessão em background (best-effort) para recuperação de contexto após crash. Heartbeat a cada 5 minutos (`AGENT_GUARD_HEARTBEAT_INTERVAL_SECONDS`).
+- **Resumo automático de sessão**: ao retomar um slot, consulta `gh pr list` e mostra PRs abertos vinculados à identidade.
 
 #### Seleção explícita de slot (`--slot` / `AGENT_GUARD_SLOT`)
 
@@ -378,23 +380,66 @@ Notas de implementação:
 
 - O flag é consumido pelo wrapper e **nunca** é repassado ao binário real. Se o CLI um dia introduzir seu próprio `--slot`, use `AGENT_GUARD_SLOT`.
 - Cada wrapper só aceita slots da própria família de identidade (o wrapper Kilo aceita `kiloN`, nunca `claudeN`/`kimiN`). Configurável via `wrappers.kilo.identity_prefix` no `agent-guard.yaml`.
-- A detecção de processo ativo considera `comm == "kilo"` / `comm == "kilocode"` e argv contendo `kilo`/`kilocode`.
+- A detecção de processo ativo considera `comm == "kilo"` / `comm == "kilocode"` / `comm == "kiro"` e argv contendo `kilo`/`kilocode`/`kiro`.
 
-**Instalação manual do wrapper:**
+**Comandos de gerenciamento (bypass de lease):**
+
+`kilo --version`, `kilo --help`, `kilo login`, `kilo provider`, `kilo export`, `kilo migrate`, `kilo acp`, `kilo update`, `kilo upgrade` e `kilo doctor` não requerem lease e passam direto ao binário real.
+
+**Bypass de emergência:**
 
 ```bash
+AG_WRAPPER_BYPASS=1 kilo ...  # pula o wrapper (apenas para debugging/recuperação)
+```
+
+#### Instalação do wrapper
+
+**Instalação manual:**
+
+```bash
+# Preservar binário real
 mv <bin_dir>/kilo <bin_dir>/kilo.real
+# Instalar wrapper
 cp packages/agent-guard-core/wrappers/kilo/wrapper.sh <bin_dir>/kilo
 chmod +x <bin_dir>/kilo
 ```
 
-- Recuperação automática após updates do Kilo CLI:
-  ```bash
-  bash packages/agent-guard-core/wrappers/kilo/recovery.sh
-  ```
-  O recovery faz backup do binário real em `kilo.real.<timestamp>` antes de
-  restaurar o wrapper e mantém apenas os 3 backups mais novos
-  (`AG_KILO_BACKUP_KEEP` para customizar), evitando acúmulo em disco.
+**Instalação via recovery script (idempotente):**
+
+```bash
+bash packages/agent-guard-core/wrappers/kilo/recovery.sh --repo-root /path/to/repo
+```
+
+#### Recuperação automática após updates
+
+O Kilo CLI pode sobrescrever o binário durante `kilo update` ou `npm install -g @kilocode/cli`. O script de recovery detecta e restaura o wrapper automaticamente:
+
+```bash
+bash packages/agent-guard-core/wrappers/kilo/recovery.sh
+```
+
+O recovery:
+- Faz backup do binário real em `kilo.real.<timestamp>` antes de restaurar o wrapper.
+- Mantém apenas os 3 backups mais novos (`AG_KILO_BACKUP_KEEP` para customizar), evitando acúmulo em disco.
+- Usa atomic replace (write-temp + mv) para evitar ETXTBSY ("text file busy").
+
+**Cron recomendado** (após updates frequentes do Kilo CLI):
+
+```bash
+# A cada 6 horas — dentro do limite de 4×/dia para watchdogs
+0 */6 * * * bash /path/to/packages/agent-guard-core/wrappers/kilo/recovery.sh --repo-root /path/to/repo >> /var/log/hmvip-kilo-recovery.log 2>&1
+```
+
+#### Diferenças em relação a outros wrappers
+
+| Aspecto | Kimi | Kilo | Amp |
+|---------|------|------|-----|
+| Localização do wrapper | `~/.kimi-code/bin/kimi` (substitui binário) | `~/.kilocode/bin/kilo` ou `~/.npm-global/bin/kilo` (substitui binário) | `~/.local/hmvip/bin/amp` (diretório separado) |
+| Binário real | `~/.kimi-code/bin/kimi.real` (backup) | `~/.kilocode/bin/kilo.real` (backup) | `~/.amp/bin/amp` (intacto) |
+| Risco de update quebrar | Alto (update sobrescreve) | Alto (update sobrescreve) | Baixo (update não toca o wrapper) |
+| Recovery | Backup + restore in-place | Backup + restore in-place + cron recomendado | Copy wrapper para dir estável |
+| Session trace | Via watcher em background | Via watcher em background + heartbeat 5min | Via watcher em background |
+| Process detection | `kimi`, `kilocode`, `claude`, etc. | `kilo`, `kilocode`, `kiro` | `amp` |
 ### Wrapper Amp (`wrappers/amp/`)
 
 O wrapper `wrappers/amp/wrapper.sh` impõe isolamento automático para o Amp CLI (Sourcegraph). Diferente do wrapper Kimi (que substitui o binário in-place), o wrapper Amp vive em um diretório estável (`~/.local/hmvip/bin/amp`) que o auto-updater do Amp não toca, evitando quebras em updates.

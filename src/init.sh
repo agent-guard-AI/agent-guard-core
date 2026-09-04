@@ -124,7 +124,14 @@ _detect_config_root() {
     echo "${_AG_REPO_ROOT}"
 }
 
-AGENT_GUARD_REPO_ROOT="$(_detect_config_root)"
+# Respect an explicitly provided AGENT_GUARD_REPO_ROOT (e.g. from a runner that
+# knows which checkout owns the canonical agent-guard.yaml). Otherwise detect
+# it from the current checkout/worktree.
+if [[ -n "${AGENT_GUARD_REPO_ROOT:-}" && -f "${AGENT_GUARD_REPO_ROOT}/agent-guard.yaml" ]]; then
+    : # keep caller-provided repo root
+else
+    AGENT_GUARD_REPO_ROOT="$(_detect_config_root)"
+fi
 export AGENT_GUARD_REPO_ROOT
 
 # ---------------------------------------------------------------------------
@@ -133,6 +140,17 @@ export AGENT_GUARD_REPO_ROOT
 JOURNAL_SCRIPT="${SCRIPT_DIR}/journal.sh"
 if [[ -f "${JOURNAL_SCRIPT}" ]]; then
     source "${JOURNAL_SCRIPT}"
+fi
+
+# ---------------------------------------------------------------------------
+# 1.6.0a Load task lifecycle service
+# ---------------------------------------------------------------------------
+TASK_LIFECYCLE_SCRIPT="${SCRIPT_DIR}/task-lifecycle.sh"
+if [[ -f "${TASK_LIFECYCLE_SCRIPT}" ]]; then
+    _AG_INIT_OLD_FLAGS_TMP="$(set +o)"
+    source "${TASK_LIFECYCLE_SCRIPT}"
+    eval "${_AG_INIT_OLD_FLAGS_TMP}" 2>/dev/null || true
+    unset _AG_INIT_OLD_FLAGS_TMP
 fi
 
 # ---------------------------------------------------------------------------
@@ -459,6 +477,7 @@ _tab_dot_for_state() {
 # _rec_drift is a short human-readable description of any inconsistency.
 _status_reconcile_session() {
     local identity="$1"
+    local read_only="${2:-}"
     local session_file
     session_file="$(_get_session_file "${identity}")"
 
@@ -530,7 +549,8 @@ _status_reconcile_session() {
         if [[ -n "${actual_branch}" && "${actual_branch}" != "${_rec_branch}" ]]; then
             branch_drift="branch mismatch"
             # Reconcile the session file so subsequent reads are correct.
-            if _save_session_field "${identity}" "branch" "${actual_branch}"; then
+            # In read-only mode we report the drift without mutating storage.
+            if [[ "${read_only}" != "__read_only__" ]] && _save_session_field "${identity}" "branch" "${actual_branch}"; then
                 _rec_branch="${actual_branch}"
             fi
         fi
@@ -573,6 +593,13 @@ _status_reconcile_session() {
             _rec_drift="released marker on task branch"
         fi
     fi
+}
+
+# Read-only variant of _status_reconcile_session.
+# Fills the same _rec_* variables without writing to session files.
+_status_inspect_session() {
+    local identity="$1"
+    _status_reconcile_session "${identity}" "__read_only__"
 }
 
 # Return 0 if the worktree currently hosts a live agent process other than
@@ -997,6 +1024,18 @@ _save_session() {
     dir="$(dirname "${session_file}")"
     mkdir -p "${dir}"
 
+    # Read task metadata from structured slot note, if available.
+    local task_id="" task_state="" task_topic=""
+    if command -v _task_note_path >/dev/null 2>&1 && command -v _task_get_field >/dev/null 2>&1; then
+        local note_path
+        note_path="$(_task_note_path "${identity}" "${_AG_REPO_ROOT:-${MAIN_REPO:-$(pwd)}}")"
+        if [[ -f "${note_path}" ]]; then
+            task_id="$(_task_get_field "${note_path}" "id" 2>/dev/null || true)"
+            task_state="$(_task_get_field "${note_path}" "state" 2>/dev/null || true)"
+            task_topic="$(_task_get_field "${note_path}" "topic" 2>/dev/null || true)"
+        fi
+    fi
+
     export _AG_S_IDENTITY="${identity}"
     export _AG_S_STATUS="${status}"
     export _AG_S_ROLE="${role}"
@@ -1004,6 +1043,9 @@ _save_session() {
     export _AG_S_PID="${pid}"
     export _AG_S_WORKTREE="${worktree_path}"
     export _AG_S_IMPACT="${impact_plugins}"
+    export _AG_S_TASK_ID="${task_id}"
+    export _AG_S_TASK_STATE="${task_state}"
+    export _AG_S_TASK_TOPIC="${task_topic}"
     export _AG_S_SESSION_FILE="${session_file}"
 
     ${AG_PYTHON} -c "
@@ -1020,11 +1062,16 @@ data = {
     'worktree_path': os.environ['_AG_S_WORKTREE'],
     'impact_plugins': json.loads(os.environ.get('_AG_S_IMPACT','[]'))
 }
+# Task metadata cache (note remains SSOT).
+for k in ('task_id','task_state','task_topic'):
+    v = os.environ.get(f'_AG_S_{k.upper()}')
+    if v:
+        data[k] = v
 with open(os.environ['_AG_S_SESSION_FILE'], 'w') as f:
     json.dump(data, f, indent=2)
 " >/dev/null 2>&1
     local py_exit=$?
-    unset _AG_S_IDENTITY _AG_S_STATUS _AG_S_ROLE _AG_S_BRANCH _AG_S_PID _AG_S_WORKTREE _AG_S_IMPACT _AG_S_SESSION_FILE
+    unset _AG_S_IDENTITY _AG_S_STATUS _AG_S_ROLE _AG_S_BRANCH _AG_S_PID _AG_S_WORKTREE _AG_S_IMPACT _AG_S_TASK_ID _AG_S_TASK_STATE _AG_S_TASK_TOPIC _AG_S_SESSION_FILE
     return ${py_exit}
 }
 
@@ -1465,17 +1512,101 @@ print(t[:50])
 " "${topic}" 2>/dev/null || echo ''
 }
 
+# Ensure the runtime .agent-guard/ directory is ignored by git so that
+# slot notes, journal, and session artifacts never block release.
+_ag_ensure_agent_guard_ignored() {
+    local repo_root="${1:-${_AG_REPO_ROOT}}"
+    local gitignore="${repo_root}/.gitignore"
+
+    if [[ ! -d "${repo_root}/.git" ]]; then
+        return 0
+    fi
+
+    # Already ignored at any level — nothing to do.
+    if git -C "${repo_root}" check-ignore -q ".agent-guard/" 2>/dev/null; then
+        return 0
+    fi
+
+    # Append a newline and the ignore entry if .gitignore exists; otherwise create it.
+    if [[ -f "${gitignore}" ]]; then
+        if ! grep -qxF ".agent-guard/" "${gitignore}" 2>/dev/null; then
+            {
+                echo ""
+                echo "# Agent Guard runtime artifacts (slot notes, journal, session traces)"
+                echo ".agent-guard/"
+            } >> "${gitignore}"
+        fi
+    else
+        {
+            echo "# Agent Guard runtime artifacts (slot notes, journal, session traces)"
+            echo ".agent-guard/"
+        } > "${gitignore}"
+    fi
+}
+
 # Update the slot task note with the current branch and optional topic.
 # Creates the note if it does not exist.
 _update_task_note_branch_topic() {
     local identity="$1"
     local branch="$2"
     local topic="${3:-}"
+
+    # Runtime artifacts must not block release or dirty the worktree.
+    _ag_ensure_agent_guard_ignored
+
     local tasks_dir="${_AG_REPO_ROOT}/.agent-guard/tasks"
     mkdir -p "${tasks_dir}"
+    chmod 700 "${tasks_dir}"
     local note_file="${tasks_dir}/${identity}.md"
     local today
     today="$(date +%Y-%m-%d)"
+
+    # If task-lifecycle service is available, prefer structured notes.
+    if command -v _task_create >/dev/null 2>&1 && command -v _task_has_frontmatter >/dev/null 2>&1; then
+        if [[ ! -f "${note_file}" ]]; then
+            _task_create "${identity}" "${topic}" "${branch}" "${note_file}"
+            # Append a minimal body so the note is still human-friendly.
+            {
+                echo ""
+                echo "## Tarefa ATUAL — ${today}"
+                echo "**Descreva aqui o trabalho em andamento.**"
+                echo ""
+                echo "### Commits/PRs recentes"
+                echo "(nenhum)"
+                echo ""
+                echo "### Próximo passo"
+                echo "(não definido)"
+                echo ""
+                echo "### Como retomar"
+                echo "\`\`\`bash"
+                echo "hmvip resume ${identity}"
+                echo "\`\`\`"
+            } >> "${note_file}"
+            chmod 600 "${note_file}"
+            if command -v _journal_task_created >/dev/null 2>&1; then
+                local task_id
+                task_id="$(echo "${topic}" | tr '[:upper:]' '[:lower:]' | tr -cs 'a-z0-9' '-' | sed 's/^-//;s/-$//')"
+                _journal_task_created "${identity}" "${task_id}" "${topic}" "${branch}" "${note_file}"
+            fi
+            return 0
+        fi
+
+        local has_frontmatter
+        has_frontmatter="$(_task_has_frontmatter "${note_file}")"
+        if [[ "${has_frontmatter}" == "true" ]]; then
+            local json
+            json="$(_task_read_frontmatter "${note_file}")"
+            local updated
+            updated="$(_task_update_metadata "${json}" "branch" "${branch}")"
+            updated="$(_task_update_metadata "${updated}" "topic" "${topic}")"
+            updated="$(_task_update_metadata "${updated}" "updated_at" "$(date -Iseconds)")"
+            local body
+            body="$(echo "${json}" | ${AG_PYTHON} -c 'import sys,json; print(json.load(sys.stdin).get("body",""))')"
+            _task_write_note "${note_file}" "${updated}" "${body}"
+            return 0
+        fi
+        # Legacy note: fall through to markdown-based update to avoid forced migration.
+    fi
 
     if [[ ! -f "${note_file}" ]]; then
         local topic_line=""
@@ -1502,6 +1633,7 @@ _update_task_note_branch_topic() {
 hmvip resume ${identity}
 \`\`\`
 EOF
+        chmod 600 "${note_file}"
         return 0
     fi
 
@@ -1528,6 +1660,7 @@ EOF
     fi
 
     mv "${tmp_file}" "${note_file}"
+    chmod 600 "${note_file}"
 }
 
 # ---------------------------------------------------------------------------
@@ -2015,6 +2148,36 @@ _ensure_hooks_installed() {
     done
 }
 
+# ---------------------------------------------------------------------------
+# Ensure Superpowers plugin re-discovers project skills.
+# The plugin caches discovered skills in skills-lock.json. If that cache is
+# older than the local .agents/skills/ tree, project skills (including
+# hmvip-ecosystem-boot-protocol) may not be available to the Skill tool.
+# Removing the stale lock forces re-discovery on the next session start.
+# ---------------------------------------------------------------------------
+_ensure_superpowers_skill_discovery() {
+    local worktree_path="$1"
+    local lock_file="${worktree_path}/skills-lock.json"
+
+    if [[ ! -f "${lock_file}" ]]; then
+        return 0
+    fi
+
+    local skills_dir="${worktree_path}/.agents/skills"
+    if [[ ! -d "${skills_dir}" ]]; then
+        return 0
+    fi
+
+    local lock_mtime skills_mtime
+    lock_mtime="$(stat -c %Y "${lock_file}" 2>/dev/null || echo 0)"
+    skills_mtime="$(find "${skills_dir}" -type f -printf '%T@\n' 2>/dev/null | sort -rn | head -n 1 | cut -d. -f1 || echo 0)"
+
+    if [[ "${skills_mtime}" -gt "${lock_mtime}" ]]; then
+        rm -f "${lock_file}"
+        echo "🔄 Agent Guard: skills-lock.json removido (skills locais mais novos que o cache)." >&2
+    fi
+}
+
 _anti_stale_check() {
     local worktree_path="$1"
     local current_branch
@@ -2262,6 +2425,7 @@ FORCE_RELEASE="false"
 USE_WORKTREE="true"
 MODE="acquire"
 TASK_TOPIC=""
+STATUS_JSON="false"
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -2304,6 +2468,10 @@ while [[ $# -gt 0 ]]; do
             ;;
         --status)
             MODE="status"
+            shift
+            ;;
+        --json)
+            STATUS_JSON="true"
             shift
             ;;
         --triage)
@@ -2786,6 +2954,10 @@ if [[ "${MODE}" == "release" ]]; then
     # Keep original branch for Slack notification before neutral checkout.
     RELEASE_ORIGINAL_BRANCH="$(git -C "${CURRENT_WORKTREE}" branch --show-current 2>/dev/null || echo "")"
 
+    # Runtime artifacts (slot notes, journal, session traces) must never block
+    # release. Ensure .agent-guard/ is ignored before the dirty-file check.
+    _ag_ensure_agent_guard_ignored
+
     if ! _validate_worktree_release_ready "${CURRENT_WORKTREE}"; then
         echo "🔒 Session NOT released. Resolve the issues above and run --release again." >&2
         return 1 2>/dev/null || exit 1
@@ -2849,6 +3021,163 @@ fi
 
 # ---------------------------------------------------------------------------
 # 8. --status mode
+# ---------------------------------------------------------------------------
+
+# Emite status no formato JSON (Machine API v2).
+# Read-only: nunca escreve em session files. Usa _status_inspect_session.
+_emit_status_json() {
+    # Resolve o repositório principal (não o worktree atual) via git common-dir.
+    local git_common_dir
+    git_common_dir="$(git -C "${_AG_REPO_ROOT:-${SCRIPT_DIR}}" rev-parse --git-common-dir 2>/dev/null || echo ".git")"
+    local repo_root
+    if [[ "${git_common_dir}" = /* ]]; then
+        repo_root="$(cd "$(dirname "${git_common_dir}")" && pwd)"
+    else
+        repo_root="$(cd "${_AG_REPO_ROOT:-${SCRIPT_DIR}}/${git_common_dir}/.." && pwd)"
+    fi
+    local default_branch="develop"
+    if git -C "${repo_root}" rev-parse --abbrev-ref origin/HEAD >/dev/null 2>&1; then
+        default_branch="$(git -C "${repo_root}" rev-parse --abbrev-ref origin/HEAD 2>/dev/null | sed 's|^origin/||')"
+    fi
+
+    local tmp_dir
+    tmp_dir="$(mktemp -d)"
+    local identities_file="${tmp_dir}/identities.jsonl"
+    local sessions_file="${tmp_dir}/sessions.jsonl"
+    local worktrees_file="${tmp_dir}/worktrees.jsonl"
+    touch "${identities_file}" "${sessions_file}" "${worktrees_file}"
+
+    identity_list="$(bash "${AGENT_GUARD_CONFIG_BIN}" keys identities)"
+    for prefix in ${identity_list}; do
+        [[ -z "${prefix}" ]] && continue
+        base_slots="$(_guard_get "identities.${prefix}.slots")"
+        max_slots="$(_guard_get "identities.${prefix}.max_slots" "${base_slots}")"
+        for i in $(seq 1 "${max_slots}"); do
+            identity="${prefix}${i}"
+            worktree_path="$(_get_worktree_path "${identity}")"
+            wt_exists="false"
+            [[ -e "${worktree_path}/.git" ]] && wt_exists="true"
+
+            # Read-only inspection: never mutates session files.
+            _status_inspect_session "${identity}"
+
+            local pid_value="${_rec_pid:-}"
+            local pid_live="false"
+            if [[ -n "${pid_value}" ]] && _is_pid_alive "${pid_value}" 2>/dev/null; then
+                pid_live="true"
+            fi
+
+            # Emite uma linha JSONL por entidade via env vars para evitar quoting.
+            AG_JSON_IDENTITY="${identity}" \
+            AG_JSON_PREFIX="${prefix}" \
+            AG_JSON_SLOT="${i}" \
+            AG_JSON_STATUS="${_rec_status:-free}" \
+            AG_JSON_HEALTH="${_rec_health:-}" \
+            AG_JSON_ROLE="${_rec_role:-}" \
+            AG_JSON_PID="${pid_value:-}" \
+            AG_JSON_PID_LIVE="${pid_live}" \
+            AG_JSON_BRANCH="${_rec_branch:-}" \
+            AG_JSON_WORKTREE="${worktree_path}" \
+            AG_JSON_LAST_ACTIVITY="${_rec_last_activity:-}" \
+            AG_JSON_DRIFT="${_rec_drift:-}" \
+            AG_JSON_WT_EXISTS="${wt_exists}" \
+            AG_JSON_IDENTITIES_FILE="${identities_file}" \
+            AG_JSON_SESSIONS_FILE="${sessions_file}" \
+            AG_JSON_WORKTREES_FILE="${worktrees_file}" \
+            "${AG_PYTHON}" - <<'PY'
+import json, os
+
+def env(name):
+    return os.environ.get(name, "")
+
+identity_obj = {
+    "identity": env("AG_JSON_IDENTITY"),
+    "prefix": env("AG_JSON_PREFIX"),
+    "slot_index": int(env("AG_JSON_SLOT") or 0),
+}
+
+session_status = env("AG_JSON_STATUS")
+session_health = env("AG_JSON_HEALTH")
+# Only emit a session record if there is actual session state or drift.
+if session_status != "free" or session_health not in ("", "-"):
+    pid = env("AG_JSON_PID")
+    session_obj = {
+        "identity": env("AG_JSON_IDENTITY"),
+        "status": session_status,
+        "health": session_health,
+        "role": env("AG_JSON_ROLE"),
+        "pid": int(pid) if pid.isdigit() else None,
+        "pid_live": env("AG_JSON_PID_LIVE") == "true",
+        "branch": env("AG_JSON_BRANCH"),
+        "worktree_path": env("AG_JSON_WORKTREE"),
+        "last_activity": env("AG_JSON_LAST_ACTIVITY"),
+        "drift": env("AG_JSON_DRIFT"),
+    }
+    with open(env("AG_JSON_SESSIONS_FILE"), "a", encoding="utf-8") as f:
+        f.write(json.dumps(session_obj, ensure_ascii=False) + "\n")
+
+worktree_obj = {
+    "path": env("AG_JSON_WORKTREE"),
+    "exists": env("AG_JSON_WT_EXISTS") == "true",
+    "identity": env("AG_JSON_IDENTITY"),
+    "branch": env("AG_JSON_BRANCH"),
+}
+
+with open(env("AG_JSON_IDENTITIES_FILE"), "a", encoding="utf-8") as f:
+    f.write(json.dumps(identity_obj, ensure_ascii=False) + "\n")
+with open(env("AG_JSON_WORKTREES_FILE"), "a", encoding="utf-8") as f:
+    f.write(json.dumps(worktree_obj, ensure_ascii=False) + "\n")
+PY
+        done
+    done
+
+    local generated_at
+    generated_at="$(date -Iseconds)"
+
+    # Python monta o JSON final a partir dos arquivos JSONL.
+    "${AG_PYTHON}" - <<PY
+import json, sys, os
+
+def load_jsonl(path):
+    out = []
+    if os.path.exists(path):
+        with open(path, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if line:
+                    out.append(json.loads(line))
+    return out
+
+try:
+    identities = load_jsonl("${identities_file}")
+    sessions = load_jsonl("${sessions_file}")
+    worktrees = load_jsonl("${worktrees_file}")
+    output = {
+        "schema_version": 2,
+        "generated_at": "${generated_at}",
+        "repository": {
+            "root": "${repo_root}",
+            "default_branch": "${default_branch}"
+        },
+        "identities": identities,
+        "sessions": sessions,
+        "worktrees": worktrees
+    }
+    print(json.dumps(output, indent=2, ensure_ascii=False))
+except Exception as e:
+    json.dump({"schema_version": 2, "error": str(e), "error_code": "INTERNAL_ERROR"}, sys.stdout)
+PY
+
+    rm -rf "${tmp_dir}"
+}
+
+if [[ "${MODE}" == "status" && "${STATUS_JSON}" == "true" ]]; then
+    _emit_status_json
+    return 0 2>/dev/null || exit 0
+fi
+
+# ---------------------------------------------------------------------------
+# 8. --status mode (human-readable)
 # ---------------------------------------------------------------------------
 if [[ "${MODE}" == "status" ]]; then
     echo ""
@@ -3137,6 +3466,9 @@ if [[ "${MODE}" == "attach" ]]; then
     _set_git_author "${IDENTITY_FROM_BRANCH}" "${WORKTREE_PATH}"
     _export_session_env "${WORKTREE_PATH}" "${ATTACH_BRANCH}" "${IMPACT_PLUGINS}"
 
+    # Force Superpowers to re-discover project skills if the local skill tree changed.
+    _ensure_superpowers_skill_discovery "${WORKTREE_PATH}"
+
     _configure_hooks_path "${WORKTREE_PATH}"
     _ensure_hooks_installed "${WORKTREE_PATH}"
     _anti_stale_check "${WORKTREE_PATH}"
@@ -3146,9 +3478,13 @@ if [[ "${MODE}" == "attach" ]]; then
     _save_session "${IDENTITY_FROM_BRANCH}" "active" "${ROLE}" "${ATTACH_BRANCH}" "$(_ag_session_pid "${WORKTREE_PATH}")" "${WORKTREE_PATH}" "${impact_json}"
 
     # Persist boot cache so subsequent compacted sessions can skip redundant layers.
-    local _boot_artifacts="${WORKTREE_PATH}/ALERTAS.md ${WORKTREE_PATH}/ALERTAS-RECENT.md"
+    # Camada 0 (mínima): lease + token-economy + todo + ALERTAS-RECENT (ADR-0052).
+    local _boot_layers
+    local _boot_artifacts
+    _boot_layers="$(_boot_state_layers_for_consciousness 0 2>/dev/null || echo 'lease token-economy todo')"
+    _boot_artifacts="$(_boot_state_artifacts_for_consciousness 0 "${WORKTREE_PATH}" 2>/dev/null || echo "${WORKTREE_PATH}/ALERTAS-RECENT.md")"
     if command -v _boot_state_save >/dev/null 2>&1; then
-        _boot_state_save "${IDENTITY_FROM_BRANCH}" "${WORKTREE_PATH}" "${ATTACH_BRANCH}" "lease token-economy todo" "${_boot_artifacts}" >/dev/null 2>&1 || true
+        _boot_state_save "${IDENTITY_FROM_BRANCH}" "${WORKTREE_PATH}" "${ATTACH_BRANCH}" "${_boot_layers}" "${_boot_artifacts}" >/dev/null 2>&1 || true
     fi
 
     # Keep the slot task note aligned with the current branch/topic.
@@ -3312,6 +3648,9 @@ if [[ "${MODE}" == "adopt" ]]; then
     _set_git_author "${ADOPT_IDENTITY}" "${WORKTREE_PATH}"
     _export_session_env "${WORKTREE_PATH}" "${ADOPT_BRANCH}" "${IMPACT_PLUGINS}"
 
+    # Force Superpowers to re-discover project skills if the local skill tree changed.
+    _ensure_superpowers_skill_discovery "${WORKTREE_PATH}"
+
     _configure_hooks_path "${WORKTREE_PATH}"
     _ensure_hooks_installed "${WORKTREE_PATH}"
     _anti_stale_check "${WORKTREE_PATH}"
@@ -3321,9 +3660,13 @@ if [[ "${MODE}" == "adopt" ]]; then
     _save_session "${ADOPT_IDENTITY}" "active" "${ROLE}" "${ADOPT_BRANCH}" "$(_ag_session_pid "${WORKTREE_PATH}")" "${WORKTREE_PATH}" "${impact_json}"
 
     # Persist boot cache so subsequent compacted sessions can skip redundant layers.
-    local _boot_artifacts="${WORKTREE_PATH}/ALERTAS.md ${WORKTREE_PATH}/ALERTAS-RECENT.md"
+    # Camada 0 (mínima): lease + token-economy + todo + ALERTAS-RECENT (ADR-0052).
+    local _boot_layers
+    local _boot_artifacts
+    _boot_layers="$(_boot_state_layers_for_consciousness 0 2>/dev/null || echo 'lease token-economy todo')"
+    _boot_artifacts="$(_boot_state_artifacts_for_consciousness 0 "${WORKTREE_PATH}" 2>/dev/null || echo "${WORKTREE_PATH}/ALERTAS-RECENT.md")"
     if command -v _boot_state_save >/dev/null 2>&1; then
-        _boot_state_save "${ADOPT_IDENTITY}" "${WORKTREE_PATH}" "${ADOPT_BRANCH}" "lease token-economy todo" "${_boot_artifacts}" >/dev/null 2>&1 || true
+        _boot_state_save "${ADOPT_IDENTITY}" "${WORKTREE_PATH}" "${ADOPT_BRANCH}" "${_boot_layers}" "${_boot_artifacts}" >/dev/null 2>&1 || true
     fi
 
     # Expanded slots (beyond the base count) must have a retomada note.
@@ -3380,7 +3723,48 @@ if git -C "${CURRENT_DIR}" rev-parse --show-toplevel >/dev/null 2>&1; then
 fi
 
 # ---------------------------------------------------------------------------
-# 11.1. Try to load boot cache early (ADR-0051)
+# 11.1. Safety: never operate from the main repository on an agent branch
+# ---------------------------------------------------------------------------
+# The main repository must always remain on a neutral branch (develop, main,
+# release/*, etc.). If it is currently on an ia-<identity>/* branch, it means a
+# session was opened directly in the main repo instead of the isolated worktree
+# — either by accident or because the agent wrapper failed to redirect. This is
+# the root cause of the double-lease incident of slot kimi3: two concurrent
+# sessions believed they owned the same identity because one of them was running
+# in the main repo on the agent's branch.
+if [[ "${CURRENT_WORKTREE}" == "${MAIN_REPO}" && "${CURRENT_BRANCH}" == ia-* ]]; then
+    RT_MAIN_REPO_IDENTITY=""
+    if [[ "${CURRENT_BRANCH}" =~ ^ia-([a-z]+[0-9]+)/ ]]; then
+        RT_MAIN_REPO_IDENTITY="${BASH_REMATCH[1]}"
+    fi
+
+    echo "" >&2
+    echo "❌❌❌ ERROR: CANNOT RESUME SESSION FROM MAIN REPOSITORY ❌❌❌" >&2
+    echo "" >&2
+    echo "   You are trying to resume identity '${RT_MAIN_REPO_IDENTITY:-<unknown>}' from the main repository:" >&2
+    echo "     ${MAIN_REPO}" >&2
+    echo "" >&2
+    echo "   AI agents must NEVER operate on or resume sessions from the main repo." >&2
+    echo "   Possible causes:" >&2
+    echo "     - A session was opened directly in the main repo instead of the worktree." >&2
+    echo "     - The Kimi wrapper was bypassed or failed to redirect to the worktree." >&2
+    echo "" >&2
+    echo "   Resolution:" >&2
+    if [[ -n "${RT_MAIN_REPO_IDENTITY}" ]]; then
+        echo "     1. Close this session and open the agent from its worktree:" >&2
+        echo "        /home/hmvip-dev/hmvip-ia-${RT_MAIN_REPO_IDENTITY}" >&2
+    else
+        echo "     1. Close this session and open the agent from its own worktree." >&2
+    fi
+    echo "     2. Or switch the main repo back to a neutral branch and acquire a fresh session:" >&2
+    echo "        cd ${MAIN_REPO}" >&2
+    echo "        git checkout develop" >&2
+    echo "" >&2
+    return 1 2>/dev/null || exit 1
+fi
+
+# ---------------------------------------------------------------------------
+# 11.2. Try to load boot cache early (ADR-0051)
 # ---------------------------------------------------------------------------
 # This is safe even with AGENT_GUARD_FUNCTIONS_ONLY=1: it only reads a local
 # JSON file and exports environment variables. Skills can consult
@@ -3393,6 +3777,7 @@ fi
 
 # Early-out for callers that only need helper functions loaded (e.g. prune).
 if [[ "${AGENT_GUARD_FUNCTIONS_ONLY:-}" == "1" ]]; then
+    _ag_init_restore_shell_flags
     return 0 2>/dev/null || exit 0
 fi
 
@@ -3486,6 +3871,9 @@ elif [[ -n "${CURRENT_IDENTITY}" && -n "${CURRENT_BRANCH}" && "${CURRENT_BRANCH}
     _set_git_author "${CURRENT_IDENTITY}" "${CURRENT_WORKTREE}"
     _export_session_env "${CURRENT_WORKTREE}" "${CURRENT_BRANCH}" "${IMPACT_PLUGINS}"
 
+    # Force Superpowers to re-discover project skills if the local skill tree changed.
+    _ensure_superpowers_skill_discovery "${CURRENT_WORKTREE}"
+
     _configure_hooks_path "${CURRENT_WORKTREE}"
     _ensure_hooks_installed "${CURRENT_WORKTREE}"
     _anti_stale_check "${CURRENT_WORKTREE}"
@@ -3496,9 +3884,13 @@ elif [[ -n "${CURRENT_IDENTITY}" && -n "${CURRENT_BRANCH}" && "${CURRENT_BRANCH}
     _save_session "${CURRENT_IDENTITY}" "active" "${ROLE}" "${CURRENT_BRANCH}" "$(_ag_session_pid "${CURRENT_WORKTREE}")" "${CURRENT_WORKTREE}" "${impact_json}"
 
     # Persist boot cache so subsequent compacted sessions can skip redundant layers.
-    local _boot_artifacts="${CURRENT_WORKTREE}/ALERTAS.md ${CURRENT_WORKTREE}/ALERTAS-RECENT.md"
+    # Camada 0 (mínima): lease + token-economy + todo + ALERTAS-RECENT (ADR-0052).
+    local _boot_layers
+    local _boot_artifacts
+    _boot_layers="$(_boot_state_layers_for_consciousness 0 2>/dev/null || echo 'lease token-economy todo')"
+    _boot_artifacts="$(_boot_state_artifacts_for_consciousness 0 "${CURRENT_WORKTREE}" 2>/dev/null || echo "${CURRENT_WORKTREE}/ALERTAS-RECENT.md")"
     if command -v _boot_state_save >/dev/null 2>&1; then
-        _boot_state_save "${CURRENT_IDENTITY}" "${CURRENT_WORKTREE}" "${CURRENT_BRANCH}" "lease token-economy todo" "${_boot_artifacts}" >/dev/null 2>&1 || true
+        _boot_state_save "${CURRENT_IDENTITY}" "${CURRENT_WORKTREE}" "${CURRENT_BRANCH}" "${_boot_layers}" "${_boot_artifacts}" >/dev/null 2>&1 || true
     fi
 
     # Keep the slot task note aligned with the current branch/topic.
@@ -3608,13 +4000,20 @@ fi
 _set_git_author "${IDENTITY}" "${WORKTREE_PATH}"
 _export_session_env "${WORKTREE_PATH}" "${BRANCH_NAME}" "${IMPACT_PLUGINS}"
 
+# Force Superpowers to re-discover project skills if the local skill tree changed.
+_ensure_superpowers_skill_discovery "${WORKTREE_PATH}"
+
 impact_json="$(echo "${IMPACT_PLUGINS}" | ${AG_PYTHON} -c "import sys,json; print(json.dumps([p.strip() for p in sys.stdin.read().split(',') if p.strip()]))" 2>/dev/null || echo "[]")"
 _save_session "${IDENTITY}" "active" "${ROLE}" "${BRANCH_NAME}" "$(_ag_session_pid "${WORKTREE_PATH}")" "${WORKTREE_PATH}" "${impact_json}"
 
 # Persist boot cache so subsequent compacted sessions can skip redundant layers.
-local _boot_artifacts="${WORKTREE_PATH}/ALERTAS.md ${WORKTREE_PATH}/ALERTAS-RECENT.md"
+# Camada 0 (mínima): lease + token-economy + todo + ALERTAS-RECENT (ADR-0052).
+local _boot_layers
+local _boot_artifacts
+_boot_layers="$(_boot_state_layers_for_consciousness 0 2>/dev/null || echo 'lease token-economy todo')"
+_boot_artifacts="$(_boot_state_artifacts_for_consciousness 0 "${WORKTREE_PATH}" 2>/dev/null || echo "${WORKTREE_PATH}/ALERTAS-RECENT.md")"
 if command -v _boot_state_save >/dev/null 2>&1; then
-    _boot_state_save "${IDENTITY}" "${WORKTREE_PATH}" "${BRANCH_NAME}" "lease token-economy todo" "${_boot_artifacts}" >/dev/null 2>&1 || true
+    _boot_state_save "${IDENTITY}" "${WORKTREE_PATH}" "${BRANCH_NAME}" "${_boot_layers}" "${_boot_artifacts}" >/dev/null 2>&1 || true
 fi
 
 # Expanded slots (beyond the base count) must have a retomada note.

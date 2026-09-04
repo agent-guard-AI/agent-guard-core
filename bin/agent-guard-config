@@ -29,13 +29,17 @@ AG_PYTHON="$(bash "${SCRIPT_DIR}/bin/agent-guard-python" 2>/dev/null || echo "py
 export AG_PYTHON
 
 _detect_repo_root() {
-    if [[ -n "${AGENT_GUARD_REPO_ROOT:-}" ]]; then
+    # 1. Explicit repo root from the caller is the canonical source (used by
+    #    scripts that pass --repo-root or export AGENT_GUARD_REPO_ROOT).
+    # 2. Current git checkout is the automatic fallback.
+    # 3. Last resort: the current working directory.
+    if [[ -n "${AGENT_GUARD_REPO_ROOT:-}" && -f "${AGENT_GUARD_REPO_ROOT}/agent-guard.yaml" ]]; then
         echo "${AGENT_GUARD_REPO_ROOT}"
         return 0
     fi
     local git_root
     git_root="$(git rev-parse --show-toplevel 2>/dev/null || true)"
-    if [[ -n "${git_root}" ]]; then
+    if [[ -n "${git_root}" && -f "${git_root}/agent-guard.yaml" ]]; then
         echo "${git_root}"
         return 0
     fi

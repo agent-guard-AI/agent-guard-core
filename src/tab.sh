@@ -364,11 +364,12 @@ function _hmvip_tab_list() {
     return 0
 }
 
-# Instala/renova os hooks do hmvip-tab no ambiente local.
-# Idempotente: pode rodar quantas vezes quiser. Copia agent-guard-tab.sh e
-# summarize-prompt.py para ~/.kimi-code/hooks/, reescreve o bloco marcado no
-# config.toml apontando para o hook novo, e garante source unico do tab.sh e
-# grid.sh do agent-guard-core no ~/.bashrc.
+# Instala/renova os hooks do hmvip-tab e do dispatcher unificado no ambiente local.
+# Idempotente: pode rodar quantas vezes quiser. Copia agent-guard-tab.sh,
+# summarize-prompt.py, agent-guard-heartbeat.sh, agent-guard-session-end.sh,
+# session-tattoo-hook.sh e hmvip-hook-dispatcher.sh para ~/.kimi-code/hooks/,
+# reescreve o bloco marcado no config.toml apontando para o dispatcher (ADR-0052),
+# e garante source unico do tab.sh e grid.sh do agent-guard-core no ~/.bashrc.
 function _hmvip_tab_install() {
     local core_dir hooks_dir config_toml bashrc
     core_dir="${HMVIP_AGENT_GUARD_CORE_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." >/dev/null 2>&1 && pwd)}"
@@ -384,64 +385,67 @@ function _hmvip_tab_install() {
     mkdir -p "${hooks_dir}"
     install -m 0755 "${core_dir}/wrappers/kimi/hooks/agent-guard-tab.sh" "${hooks_dir}/agent-guard-tab.sh"
     install -m 0755 "${core_dir}/wrappers/kimi/hooks/summarize-prompt.py" "${hooks_dir}/summarize-prompt.py"
+    install -m 0755 "${core_dir}/wrappers/kimi/hooks/agent-guard-heartbeat.sh" "${hooks_dir}/agent-guard-heartbeat.sh"
+    install -m 0755 "${core_dir}/wrappers/kimi/hooks/agent-guard-session-end.sh" "${hooks_dir}/agent-guard-session-end.sh"
+    install -m 0755 "${core_dir}/wrappers/kimi/hooks/session-tattoo-hook.sh" "${hooks_dir}/session-tattoo-hook.sh"
+    install -m 0755 "${core_dir}/wrappers/kimi/hooks/hmvip-hook-dispatcher.sh" "${hooks_dir}/hmvip-hook-dispatcher.sh"
     echo "✔ hooks instalados em ${hooks_dir}"
 
-    local mark_begin mark_end hook_path block
+    local mark_begin mark_end dispatcher_path block
     mark_begin="# >>> hmvip-tab-hooks >>>"
     mark_end="# <<< hmvip-tab-hooks <<<"
-    hook_path="${hooks_dir}/agent-guard-tab.sh"
+    dispatcher_path="${hooks_dir}/hmvip-hook-dispatcher.sh"
 
     read -r -d '' block <<EOF || true
 ${mark_begin}
+# ADR-0052: dispatcher unificado de hooks do Kimi Code.
+# Substitui agent-guard-heartbeat, agent-guard-tab, agent-guard-session-end e
+# session-tattoo-hook para reduzir forks duplicados por evento.
 [[hooks]]
 event = "UserPromptSubmit"
-command = "${hook_path} working"
+command = "${dispatcher_path}"
 timeout = 5
 
-# Nota: PreToolUse e SubagentStart foram removidos propositalmente no ADR-0051
-# para reduzir invocacoes de hook (~2-3 por turno em media) sem perder status visual.
-# O evento UserPromptSubmit ja atualiza o titulo no inicio de cada turno.
+[[hooks]]
+event = "SessionStart"
+command = "${dispatcher_path}"
+timeout = 5
 
 [[hooks]]
 event = "PermissionRequest"
-command = "${hook_path} attention"
+command = "${dispatcher_path}"
 timeout = 5
 
 [[hooks]]
 event = "PermissionResult"
-command = "${hook_path} working"
+command = "${dispatcher_path}"
 timeout = 5
 
 [[hooks]]
 event = "Stop"
-command = "${hook_path} attention"
+command = "${dispatcher_path}"
 timeout = 5
 
 [[hooks]]
 event = "StopFailure"
-command = "${hook_path} error"
+command = "${dispatcher_path}"
 timeout = 5
 
 [[hooks]]
 event = "Interrupt"
-command = "${hook_path} attention"
+command = "${dispatcher_path}"
 timeout = 5
 
 [[hooks]]
 event = "Notification"
 matcher = "task\\\\."
-command = "${hook_path} notification"
-timeout = 5
-
-[[hooks]]
-event = "SessionStart"
-command = "${hook_path} session-start"
+command = "${dispatcher_path}"
 timeout = 5
 
 [[hooks]]
 event = "SessionEnd"
-command = "${hook_path} session-end"
-timeout = 5
+command = "${dispatcher_path}"
+timeout = 30
 ${mark_end}
 EOF
 
@@ -475,7 +479,13 @@ while i < len(lines):
         while i < len(lines) and not lines[i].strip().startswith("["):
             chunk.append(lines[i])
             i += 1
-        if any("kimi-status-hook.sh" in c or "kimi-tab-hook.sh" in c for c in chunk):
+        if any(
+            legacy in c for legacy in [
+                "kimi-status-hook.sh", "kimi-tab-hook.sh",
+                "agent-guard-heartbeat.sh", "agent-guard-session-end.sh",
+                "agent-guard-tab.sh", "session-tattoo-hook.sh"
+            ] for c in chunk
+        ):
             removed_legacy += 1
             continue
         out.extend(chunk)

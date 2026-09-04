@@ -60,13 +60,22 @@ fi
 
 # Load Agent Guard configuration from agent-guard.yaml.
 PACKAGE_ROOT="packages/agent-guard-core"
-CODEWHALE_BIN_DIR="${AG_CODEWHALE_BIN_DIR:-${AG_CODEWHALE_BIN_DIR:-${HOME}/.npm-global/bin}}"
 
 export AGENT_GUARD_REPO_ROOT="${REPO_ROOT}"
 AGENT_GUARD_CONFIG="${REPO_ROOT}/${PACKAGE_ROOT}/bin/agent-guard-config"
 if [[ -f "${AGENT_GUARD_CONFIG}" ]]; then
     PACKAGE_ROOT="$(bash "${AGENT_GUARD_CONFIG}" get paths.package_root 'packages/agent-guard-core' 2>/dev/null || echo 'packages/agent-guard-core')"
-    CODEWHALE_BIN_DIR="$(bash "${AGENT_GUARD_CONFIG}" get wrappers.codewhale.bin_dir "${CODEWHALE_BIN_DIR}" 2>/dev/null || echo "${CODEWHALE_BIN_DIR}")"
+fi
+
+# An explicit AG_CODEWHALE_BIN_DIR from the caller/test takes precedence over
+# the configured bin_dir so tests can use a temporary npm tree without being
+# overridden by the global installation.
+if [[ -n "${AG_CODEWHALE_BIN_DIR:-}" ]]; then
+    CODEWHALE_BIN_DIR="${AG_CODEWHALE_BIN_DIR}"
+elif [[ -f "${AGENT_GUARD_CONFIG}" ]]; then
+    CODEWHALE_BIN_DIR="$(bash "${AGENT_GUARD_CONFIG}" get wrappers.codewhale.bin_dir "${HOME}/.npm-global/bin" 2>/dev/null || echo "${HOME}/.npm-global/bin")"
+else
+    CODEWHALE_BIN_DIR="${HOME}/.npm-global/bin"
 fi
 
 WRAPPER_SRC="${REPO_ROOT}/${PACKAGE_ROOT}/wrappers/codewhale/wrapper.sh"
