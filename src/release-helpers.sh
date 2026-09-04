@@ -103,12 +103,16 @@ _auto_commit_task_notes_if_only_drift() {
         return 0
     fi
 
-    # Collect modified or untracked task notes.  Status porcelain format:
-    #   " M .agent-guard/tasks/kimi1.md"
-    #   "?? .agent-guard/tasks/kimi3.md"
+    # Collect dirty task notes.  Status porcelain format examples:
+    #   " M .agent-guard/tasks/kimi1.md"  (working tree modified)
+    #   "M  .agent-guard/tasks/kimi1.md"  (staged modified)
+    #   "MM .agent-guard/tasks/kimi1.md"  (staged + working tree modified)
+    #   "A  .agent-guard/tasks/kimi3.md"  (staged added)
+    #   "AM .agent-guard/tasks/kimi3.md"  (staged added + working tree modified)
+    #   "?? .agent-guard/tasks/kimi3.md"  (untracked)
     local task_notes
     task_notes="$(git -C "${worktree_path}" status --porcelain -- .agent-guard/tasks/*.md 2>/dev/null \
-        | grep -E '^( M|\?\?) \.agent-guard/tasks/[^/]+\.md$' \
+        | grep -E '^( M|M |MM|A |AM|\?\?) \.agent-guard/tasks/[^/]+\.md$' \
         || true)"
     if [[ -z "${task_notes}" ]]; then
         return 0

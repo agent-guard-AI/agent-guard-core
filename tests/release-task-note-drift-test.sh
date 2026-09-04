@@ -86,6 +86,55 @@ if [[ "${last_msg}" != "chore(agent-guard): [IA-kimi1] auto-commit task notes be
 fi
 pass "auto-commits task note when it is the only drift"
 
+# Test 1b: staged-only task note (M ) is auto-committed when alone.
+_reset_clean
+mkdir -p "${FAKE_WORKTREE}/.agent-guard/tasks"
+echo "# Task note" > "${FAKE_WORKTREE}/.agent-guard/tasks/kimi1.md"
+git -C "${FAKE_WORKTREE}" add .agent-guard/tasks/kimi1.md
+git -C "${FAKE_WORKTREE}" commit -q -m "add task note"
+
+# Stage a content change but leave working tree matching the index.
+echo "" >> "${FAKE_WORKTREE}/.agent-guard/tasks/kimi1.md"
+git -C "${FAKE_WORKTREE}" add .agent-guard/tasks/kimi1.md
+
+if [[ "$(git -C "${FAKE_WORKTREE}" status --porcelain .agent-guard/tasks/kimi1.md)" != "M  .agent-guard/tasks/kimi1.md" ]]; then
+    fail "test setup failed: expected staged-only status (M )"
+fi
+
+if ! _auto_commit_task_notes_if_only_drift "${FAKE_WORKTREE}" >/dev/null 2>&1; then
+    fail "auto-commit should succeed for staged-only task note"
+fi
+
+if git -C "${FAKE_WORKTREE}" status --porcelain 2>/dev/null | grep -q .; then
+    fail "worktree should be clean after auto-committing staged-only note"
+fi
+pass "auto-commits staged-only (M ) task note"
+
+# Test 1c: staged + working tree modified (MM) is auto-committed when alone.
+_reset_clean
+mkdir -p "${FAKE_WORKTREE}/.agent-guard/tasks"
+echo "# Task note" > "${FAKE_WORKTREE}/.agent-guard/tasks/kimi1.md"
+git -C "${FAKE_WORKTREE}" add .agent-guard/tasks/kimi1.md
+git -C "${FAKE_WORKTREE}" commit -q -m "add task note"
+
+# Stage one change, then modify again (produces MM in porcelain).
+echo "staged line" >> "${FAKE_WORKTREE}/.agent-guard/tasks/kimi1.md"
+git -C "${FAKE_WORKTREE}" add .agent-guard/tasks/kimi1.md
+echo "working tree line" >> "${FAKE_WORKTREE}/.agent-guard/tasks/kimi1.md"
+
+if [[ "$(git -C "${FAKE_WORKTREE}" status --porcelain .agent-guard/tasks/kimi1.md)" != "MM .agent-guard/tasks/kimi1.md" ]]; then
+    fail "test setup failed: expected MM status"
+fi
+
+if ! _auto_commit_task_notes_if_only_drift "${FAKE_WORKTREE}" >/dev/null 2>&1; then
+    fail "auto-commit should succeed for MM task note"
+fi
+
+if git -C "${FAKE_WORKTREE}" status --porcelain 2>/dev/null | grep -q .; then
+    fail "worktree should be clean after auto-committing MM note"
+fi
+pass "auto-commits staged + working tree modified (MM) task note"
+
 # Test 2: task note drift is NOT auto-committed when other files are dirty.
 _reset_clean
 mkdir -p "${FAKE_WORKTREE}/.agent-guard/tasks"
