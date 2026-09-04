@@ -1,5 +1,34 @@
 # Changelog — agent-guard-core
 
+## Unreleased — Session Shadow / Liveness API (SPEC F4)
+
+Adiciona o Session Shadow: snapshot leve e read-only de liveness por slot,
+consumível por Agent Ops / AOL para decisões de cleanup.
+
+- `packages/agent-guard-core/src/shadow.sh` (novo):
+  - `_shadow_compute` — snapshot on-demand reutilizando as primitivas de
+    liveness existentes (nenhuma detecção duplicada). Campos: `health`,
+    `pid_live`, `agent_in_tree` (null quando PID morto), `shell_pinned`,
+    `stale`, `branch`, `worktree_path`, `last_activity`, `drift`,
+    `snapshot_at`, `source`.
+  - `agent-guard shadow [--identity <id>] [--refresh]` — default read-only
+    (não cria diretório, não muta lease/session); `--refresh` persiste
+    atomicamente em `.agent-guard/session/shadow/<id>.json` no repo principal
+    e remove snapshots obsoletos. Destinado à camada AOL (ex: hook de
+    heartbeat); o kernel nunca dispara refresh sozinho (F4.4).
+  - `_shadow_read <identity>` — leitura barata do snapshot persistido.
+- Machine API v3: `status --json` ganha a seção aditiva `shadows[]`
+  (`schema_version` 3; nenhum campo removido do v2).
+- `src/init.sh`:
+  - `_status_reconcile_session` exporta `_rec_stale_flag` / `_rec_shell_pinned`
+    (flags que já calculava).
+  - `_lease_is_shell_pinned` exporta `_lease_agent_in_tree` (side effect) para
+    evitar segundo scan de /proc.
+  - Carrega `shadow.sh` (§1.6.4).
+- `bin/agent-guard`: novo comando `shadow (sh)`.
+- Testes: `tests/shadow-test.sh` (14 checks herméticos) no `run-all.sh`;
+  `status-json-test.sh` atualizado para schema v3.
+
 ## 0.10.10 — Local Checkpoint Retention Hardening
 
 Reduz o consumo ilimitado de disco por checkpoints locais de sessão,

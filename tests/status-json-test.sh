@@ -99,13 +99,13 @@ run_status_human() {
 }
 
 # ---------------------------------------------------------------------------
-# 1. Zero sessions: all identities free and schema_version == 1
+# 1. Zero sessions: all identities free and schema_version == 3
 # ---------------------------------------------------------------------------
 output="$(run_status_json)"
-if echo "${output}" | python3 -c "import sys,json; d=json.load(sys.stdin); sys.exit(0 if d.get('schema_version')==2 else 1)"; then
-    ok "schema_version is 2"
+if echo "${output}" | python3 -c "import sys,json; d=json.load(sys.stdin); sys.exit(0 if d.get('schema_version')==3 else 1)"; then
+    ok "schema_version is 3"
 else
-    bad "schema_version is 2" "${output}"
+    bad "schema_version is 3" "${output}"
 fi
 
 if echo "${output}" | python3 -c "import sys,json; d=json.load(sys.stdin); sys.exit(0 if len(d.get('identities',[]))==3 else 1)"; then
@@ -118,6 +118,13 @@ if echo "${output}" | python3 -c "import sys,json; d=json.load(sys.stdin); sys.e
     ok "zero sessions with zero session files"
 else
     bad "zero sessions with zero session files" "${output}"
+fi
+
+# v3 adds a shadows array (F4); with zero sessions it must be empty.
+if echo "${output}" | python3 -c "import sys,json; d=json.load(sys.stdin); sys.exit(0 if d.get('shadows')==[] else 1)"; then
+    ok "shadows is an empty array with zero sessions"
+else
+    bad "shadows is an empty array with zero sessions" "${output}"
 fi
 
 # identities[] must NOT carry session fields (separation of concerns).
@@ -166,6 +173,13 @@ if echo "${output}" | python3 -c "import sys,json; d=json.load(sys.stdin); s=[x 
     ok "dead session reported in sessions[]"
 else
     bad "dead session reported in sessions[]" "${output}"
+fi
+
+# F4 shadow for the same dead session: agent_in_tree must be null (no live tree).
+if echo "${output}" | python3 -c "import sys,json; d=json.load(sys.stdin); s=[x for x in d.get('shadows',[]) if x['identity']=='kimi2'][0]; sys.exit(0 if s['health']=='dead' and s['agent_in_tree'] is None and s['shell_pinned'] is False else 1)"; then
+    ok "dead session shadow has agent_in_tree null"
+else
+    bad "dead session shadow has agent_in_tree null" "${output}"
 fi
 
 # ---------------------------------------------------------------------------

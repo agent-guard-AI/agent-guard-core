@@ -268,9 +268,21 @@ function _agent_guard_main() {
             source "${SCRIPT_DIR}/src/safe-squash.sh" "$@"
             return $?
             ;;
+        shadow|sh)
+            # Shadow é read-only; usa functions-only igual ao prune.
+            AGENT_GUARD_FUNCTIONS_ONLY=1
+            source "${INIT_SCRIPT}"
+            unset AGENT_GUARD_FUNCTIONS_ONLY
+            if command -v _shadow_cmd >/dev/null 2>&1; then
+                _shadow_cmd "$@"
+                return $?
+            fi
+            echo "❌ shadow module not available." >&2
+            return 1
+            ;;
         *)
             echo "❌ Unknown command or identity: ${COMMAND}" >&2
-            echo "   Commands: init, status (s), release (r), switch (sw), attach (a), adopt (ad), triage, journal (j), resume (res), checkpoint (cp), session (sess), prune, cleanup-stale (cs), orphan-sweep (os), tab, tabs, grid, task (t), safe-squash (sq)" >&2
+            echo "   Commands: init, status (s), release (r), switch (sw), attach (a), adopt (ad), triage, journal (j), resume (res), checkpoint (cp), session (sess), prune, cleanup-stale (cs), orphan-sweep (os), tab, tabs, grid, task (t), safe-squash (sq), shadow (sh)" >&2
             echo "   Identities are loaded from agent-guard.yaml." >&2
             return 1
             ;;
