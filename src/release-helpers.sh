@@ -84,6 +84,75 @@ _note_slot_event() {
 }
 
 # ---------------------------------------------------------------------------
+# Helper: auto-commit slot task notes if they are the only remaining drift.
+#
+# Task notes (.agent-guard/tasks/*.md) are tracked in git but can be modified
+# by runtime events (filemode changes, appended notes). They are excluded from
+# the generic dirty check, so release used to leave them behind as "drift".
+# This helper commits them safely before the worktree moves to _released/<id>.
+#
+# Returns 0 when:
+#   - no task notes are dirty;
+#   - task notes were the only dirty files and were auto-committed;
+# Returns 1 only when task notes need committing but the commit failed.
+# ---------------------------------------------------------------------------
+_auto_commit_task_notes_if_only_drift() {
+    local worktree_path="$1"
+
+    if [[ -z "${worktree_path}" || ! -e "${worktree_path}/.git" ]]; then
+        return 0
+    fi
+
+    # Collect modified or untracked task notes.  Status porcelain format:
+    #   " M .agent-guard/tasks/kimi1.md"
+    #   "?? .agent-guard/tasks/kimi3.md"
+    local task_notes
+    task_notes="$(git -C "${worktree_path}" status --porcelain -- .agent-guard/tasks/*.md 2>/dev/null \
+        | grep -E '^( M|\?\?) \.agent-guard/tasks/[^/]+\.md$' \
+        || true)"
+    if [[ -z "${task_notes}" ]]; then
+        return 0
+    fi
+
+    # Safety: only auto-commit if task notes are the ONLY dirty files.
+    # Other changes (code, specs, non-note runtime files) must be handled
+    # explicitly by the agent and continue to block release.
+    local all_dirty_count task_note_count
+    all_dirty_count="$(git -C "${worktree_path}" status --porcelain 2>/dev/null | grep -c . || true)"
+    task_note_count="$(printf '%s\n' "${task_notes}" | grep -c . || true)"
+    if [[ "${all_dirty_count}" -gt "${task_note_count}" ]]; then
+        return 0
+    fi
+
+    # Extract the file paths (skip the two-letter status + space prefix).
+    local note_files=()
+    while IFS= read -r line; do
+        [[ -n "${line}" ]] || continue
+        local file_path
+        file_path="$(printf '%s' "${line}" | sed 's/^...//')"
+        note_files+=("${file_path}")
+    done <<< "${task_notes}"
+
+    if ! git -C "${worktree_path}" add -- "${note_files[@]}" >/dev/null 2>&1; then
+        echo "❌ Failed to stage task notes for auto-commit. Resolve manually before release." >&2
+        return 1
+    fi
+
+    local wt_name identity
+    wt_name="$(basename "${worktree_path}")"
+    identity="$(_detect_identity_from_worktree_name "${wt_name}" | awk '{print $1 $2}')"
+    local commit_msg="chore(agent-guard): [IA-${identity:-unknown}] auto-commit task notes before release"
+
+    if git -C "${worktree_path}" commit -m "${commit_msg}" >/dev/null 2>&1; then
+        echo "📝 Auto-committed ${task_note_count} task note(s) before release." >&2
+        return 0
+    fi
+
+    echo "❌ Failed to auto-commit task notes. Resolve manually before release." >&2
+    return 1
+}
+
+# ---------------------------------------------------------------------------
 # Helper: check whether blocked-release notifications are enabled.
 # ---------------------------------------------------------------------------
 _blocked_event_notifications_enabled() {
@@ -396,6 +465,13 @@ _validate_worktree_release_ready() {
         return 1
     fi
 
+    # Task notes are excluded from the dirty check above, but an uncommitted
+    # task note becomes "drift" after the worktree moves to _released/<id>.
+    # Auto-commit it now when it is the only remaining change.
+    if ! _auto_commit_task_notes_if_only_drift "${worktree_path}"; then
+        return 1
+    fi
+
     local stash_count
     # Stashes sao globais ao repo: so bloqueiam o release os que pertencem
     # a ESTA identidade (criados em branch ia-<identity>/... ou na branch
@@ -594,6 +670,13 @@ print(json.dumps({'reason': '${reason}', 'blockers': lines, 'worktree': '${workt
                 "Ação sugerida: resolver os bloqueios acima e rodar \`source ${AGENT_GUARD_INIT_NAME:-.agent-guard-init} --release\`"
         fi
 
+        return 1
+    fi
+
+    # Task notes are excluded from the blocker check above, but an uncommitted
+    # task note becomes "drift" after the worktree moves to _released/<id>.
+    # Auto-commit it now when it is the only remaining change.
+    if ! _auto_commit_task_notes_if_only_drift "${worktree_path}"; then
         return 1
     fi
 

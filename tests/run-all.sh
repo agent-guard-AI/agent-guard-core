@@ -31,6 +31,7 @@ run_test() {
 run_test "${SCRIPT_DIR}/agent-guard-cli-test.sh" "CLI smoke tests"
 run_test "${SCRIPT_DIR}/hook-provenance-test.sh" "Hook provenance tests"
 run_test "${SCRIPT_DIR}/safe-squash-test.sh" "safe-squash functional tests"
+run_test "${SCRIPT_DIR}/release-task-note-drift-test.sh" "Release task-note drift auto-commit tests"
 run_test "${SCRIPT_DIR}/task-lifecycle-parser-test.sh" "Task lifecycle parser tests"
 run_test "${SCRIPT_DIR}/task-cli-test.sh" "Task lifecycle CLI tests"
 run_test "${SCRIPT_DIR}/task-lifecycle-gates-test.sh" "Task lifecycle gate tests"
