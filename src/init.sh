@@ -182,6 +182,16 @@ if [[ -f "${BOOT_CACHE_SCRIPT}" ]]; then
 fi
 
 # ---------------------------------------------------------------------------
+# 1.6.4 Load session shadow / liveness API (SPEC F4)
+# ---------------------------------------------------------------------------
+# Read-only snapshot layer consumed by Agent Ops / AOL. Loaded before the
+# functions-only guard so both full init and hook paths can compute shadows.
+SHADOW_SCRIPT="${SCRIPT_DIR}/shadow.sh"
+if [[ -f "${SHADOW_SCRIPT}" ]]; then
+    source "${SHADOW_SCRIPT}"
+fi
+
+# ---------------------------------------------------------------------------
 # 1.5. Ensure Kimi CLI wrapper is in place
 # ---------------------------------------------------------------------------
 # The wrapper is the entrypoint that redirects sessions to isolated worktrees.
@@ -493,6 +503,10 @@ _status_reconcile_session() {
     _rec_tab_updated="$(_load_session_field "${identity}" "tab_updated")"
     _rec_health="-"
     _rec_drift=""
+    # F4 shadow exports: liveness flags consumed by _shadow_compute. Empty
+    # means "not evaluated" (e.g. pinned check skipped for stale sessions).
+    _rec_stale_flag="false"
+    _rec_shell_pinned=""
 
     local expected_worktree
     expected_worktree="$(_get_worktree_path "${identity}")"
@@ -564,9 +578,15 @@ _status_reconcile_session() {
     local stale_marker="" pinned_marker=""
     if [[ "${pid_health}" == "live" ]] && _is_session_stale "${identity}"; then
         stale_marker="stale"
+        _rec_stale_flag="true"
     fi
-    if [[ "${pid_health}" == "live" && -z "${stale_marker}" ]] && _lease_is_shell_pinned "${identity}"; then
-        pinned_marker="pinned"
+    if [[ "${pid_health}" == "live" && -z "${stale_marker}" ]]; then
+        if _lease_is_shell_pinned "${identity}"; then
+            pinned_marker="pinned"
+            _rec_shell_pinned="true"
+        else
+            _rec_shell_pinned="false"
+        fi
     fi
 
     if [[ "${pid_health}" == "dead" ]]; then
@@ -943,6 +963,10 @@ _pid_tree_has_agent_process() {
 _lease_is_shell_pinned() {
     local identity="$1"
     local session_file sess_status sess_pid worktree last_activity grace now
+    # F4 shadow export: whether the recorded PID tree contains an agent
+    # process. Set as a side effect so callers (status/shadow) can reuse the
+    # result without a second /proc scan. "" = not evaluated.
+    _lease_agent_in_tree=""
     session_file="$(_get_session_file "${identity}")"
     [[ -f "${session_file}" ]] || return 1
 
@@ -955,8 +979,10 @@ _lease_is_shell_pinned() {
     # The recorded PID itself (or any descendant) being an agent means a real
     # session is alive — never auto-clear.
     if _pid_tree_has_agent_process "${sess_pid}"; then
+        _lease_agent_in_tree="true"
         return 1
     fi
+    _lease_agent_in_tree="false"
 
     # Secondary guard: another live agent inside the worktree means real work.
     worktree="$(_get_worktree_path "${identity}")"
@@ -3023,7 +3049,7 @@ fi
 # 8. --status mode
 # ---------------------------------------------------------------------------
 
-# Emite status no formato JSON (Machine API v2).
+# Emite status no formato JSON (Machine API v3, com shadows F4).
 # Read-only: nunca escreve em session files. Usa _status_inspect_session.
 _emit_status_json() {
     # Resolve o repositório principal (não o worktree atual) via git common-dir.
@@ -3045,7 +3071,8 @@ _emit_status_json() {
     local identities_file="${tmp_dir}/identities.jsonl"
     local sessions_file="${tmp_dir}/sessions.jsonl"
     local worktrees_file="${tmp_dir}/worktrees.jsonl"
-    touch "${identities_file}" "${sessions_file}" "${worktrees_file}"
+    local shadows_file="${tmp_dir}/shadows.jsonl"
+    touch "${identities_file}" "${sessions_file}" "${worktrees_file}" "${shadows_file}"
 
     identity_list="$(bash "${AGENT_GUARD_CONFIG_BIN}" keys identities)"
     for prefix in ${identity_list}; do
@@ -3128,6 +3155,14 @@ with open(env("AG_JSON_IDENTITIES_FILE"), "a", encoding="utf-8") as f:
 with open(env("AG_JSON_WORKTREES_FILE"), "a", encoding="utf-8") as f:
     f.write(json.dumps(worktree_obj, ensure_ascii=False) + "\n")
 PY
+
+            # F4 shadow: snapshot read-only reutilizando o reconcile acima.
+            if command -v _shadow_compute >/dev/null 2>&1; then
+                _shadow_compute "${identity}" "on_demand"
+                if [[ "${_sh_emit}" == "true" ]]; then
+                    _shadow_append_jsonl "${shadows_file}"
+                fi
+            fi
         done
     done
 
@@ -3152,8 +3187,9 @@ try:
     identities = load_jsonl("${identities_file}")
     sessions = load_jsonl("${sessions_file}")
     worktrees = load_jsonl("${worktrees_file}")
+    shadows = load_jsonl("${shadows_file}")
     output = {
-        "schema_version": 2,
+        "schema_version": 3,
         "generated_at": "${generated_at}",
         "repository": {
             "root": "${repo_root}",
@@ -3161,11 +3197,12 @@ try:
         },
         "identities": identities,
         "sessions": sessions,
-        "worktrees": worktrees
+        "worktrees": worktrees,
+        "shadows": shadows
     }
     print(json.dumps(output, indent=2, ensure_ascii=False))
 except Exception as e:
-    json.dump({"schema_version": 2, "error": str(e), "error_code": "INTERNAL_ERROR"}, sys.stdout)
+    json.dump({"schema_version": 3, "error": str(e), "error_code": "INTERNAL_ERROR"}, sys.stdout)
 PY
 
     rm -rf "${tmp_dir}"
