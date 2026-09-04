@@ -34,6 +34,17 @@ function _hmvip_continue_all_ensure_helpers() {
             unset AGENT_GUARD_FUNCTIONS_ONLY
         fi
     fi
+    # Load task lifecycle helpers for structured notes.
+    # task-lifecycle.sh enables strict mode; restore caller flags after sourcing.
+    if ! declare -F _task_read_frontmatter >/dev/null 2>&1; then
+        if [[ -f "${_HMVIP_CONTINUE_ALL_CORE_DIR}/src/task-lifecycle.sh" ]]; then
+            local _old_flags
+            _old_flags="$(set +o)"
+            # shellcheck disable=SC1091
+            source "${_HMVIP_CONTINUE_ALL_CORE_DIR}/src/task-lifecycle.sh" || true
+            eval "${_old_flags}" 2>/dev/null || true
+        fi
+    fi
 }
 
 # Le um campo do lease JSON do slot. Usa o session_dir configuravel para
@@ -70,6 +81,30 @@ function _hmvip_continue_all_next_step_from_note() {
     fi
     # Remove o prefixo e espacos.
     printf '%s' "${line#*:}" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//'
+}
+
+# Le task metadata estruturada da nota do slot (YAML frontmatter).
+# Retorna JSON com topic, next_step, state ou vazio se não houver frontmatter.
+function _hmvip_continue_all_task_from_note() {
+    local identity="$1"
+    local note="${_HMVIP_CONTINUE_ALL_REPO_ROOT}/.agent-guard/tasks/${identity}.md"
+    if [[ ! -f "${note}" ]]; then
+        return 1
+    fi
+    if ! declare -F _task_read_frontmatter >/dev/null 2>&1; then
+        return 1
+    fi
+    local json
+    json="$(_task_read_frontmatter "${note}" 2>/dev/null || true)"
+    if [[ -z "${json}" ]]; then
+        return 1
+    fi
+    local state
+    state="$(echo "${json}" | python3 -c 'import sys,json; print(json.load(sys.stdin).get("state","legacy"))' 2>/dev/null || echo "legacy")"
+    if [[ "${state}" == "legacy" ]]; then
+        return 1
+    fi
+    echo "${json}"
 }
 
 # Lista todas as identidades configuradas em agent-guard.yaml.
@@ -151,14 +186,23 @@ function _hmvip_continue_all_should_include() {
     fi
 
     # Camada B: titulo declarado na nota do slot.
-    local title reason_b=""
-    title="$(_hmvip_continue_all_next_step_from_note "${identity}" 2>/dev/null || true)"
-    if [[ -n "${title}" ]]; then
-        reason_b="note"
-    elif [[ -n "${tab_title}" && "${tab_title}" != "null" ]]; then
+    # Prioriza YAML frontmatter; fallback para grep legado se nao houver.
+    local title="" reason_b=""
+    local task_json=""
+    task_json="$(_hmvip_continue_all_task_from_note "${identity}" 2>/dev/null || true)"
+    if [[ -n "${task_json}" ]]; then
+        title="$(echo "${task_json}" | python3 -c 'import sys,json; print(json.load(sys.stdin).get("next_step","") or json.load(sys.stdin).get("topic",""))' 2>/dev/null || true)"
+        [[ -n "${title}" ]] && reason_b="note"
+    fi
+    if [[ -z "${title}" ]]; then
+        title="$(_hmvip_continue_all_next_step_from_note "${identity}" 2>/dev/null || true)"
+        [[ -n "${title}" ]] && reason_b="note"
+    fi
+    if [[ -z "${title}" && -n "${tab_title}" && "${tab_title}" != "null" ]]; then
         title="${tab_title}"
         reason_b="tab_title"
-    else
+    fi
+    if [[ -z "${title}" ]]; then
         title="trabalho pendente"
         reason_b="fallback"
     fi

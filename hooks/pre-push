@@ -8,7 +8,21 @@
 
 set -e
 
-REPO_ROOT="$(git rev-parse --show-toplevel)"
+WORKTREE_PATH="$(git rev-parse --show-toplevel 2>/dev/null || echo "")"
+if [[ -z "${WORKTREE_PATH}" ]]; then
+    echo "❌ Not inside a git repository." >&2
+    exit 1
+fi
+
+# Resolve the main repository root (where .agent-guard/tasks lives), even when
+# running inside a linked git worktree.
+git_common_dir="$(git -C "${WORKTREE_PATH}" rev-parse --git-common-dir 2>/dev/null || echo ".git")"
+if [[ "${git_common_dir}" = /* ]]; then
+    REPO_ROOT="$(cd "$(dirname "${git_common_dir}")" 2>/dev/null && pwd || echo "${WORKTREE_PATH}")"
+else
+    REPO_ROOT="$(cd "${WORKTREE_PATH}/${git_common_dir}/.." 2>/dev/null && pwd || echo "${WORKTREE_PATH}")"
+fi
+
 AGENT_GUARD_BIN="${REPO_ROOT}/packages/agent-guard-core/bin/agent-guard-config"
 
 if [[ ! -f "${AGENT_GUARD_BIN}" ]]; then
@@ -322,6 +336,42 @@ if [[ -n "${IDENTITY}" ]]; then
     fi
 else
     git push origin "${NOTES_REF}" --no-verify >/dev/null 2>&1 || true
+fi
+
+# -------------------------------------------------------------------------
+# Task lifecycle: push de branch de task move state coding -> review
+# e atualiza a lista de PRs na nota do slot.
+# -------------------------------------------------------------------------
+if [[ -n "${IDENTITY}" ]]; then
+    TASK_LIFECYCLE_SCRIPT="${REPO_ROOT}/packages/agent-guard-core/src/task-lifecycle.sh"
+    if [[ -f "${TASK_LIFECYCLE_SCRIPT}" ]]; then
+        # shellcheck source=/dev/null
+        source "${TASK_LIFECYCLE_SCRIPT}"
+        NOTE_PATH="${REPO_ROOT}/.agent-guard/tasks/${IDENTITY}.md"
+        if [[ -f "${NOTE_PATH}" ]]; then
+            CURRENT_STATE="$(_task_get_field "${NOTE_PATH}" "state" 2>/dev/null || true)"
+            if [[ "${CURRENT_STATE}" == "coding" || "${CURRENT_STATE}" == "planning" || "${CURRENT_STATE}" == "blocked" ]]; then
+                # Busca PRs abertos para esta branch/identidade.
+                PR_LINES="$(_task_open_prs_for_identity "${IDENTITY}" "${REPO_ROOT}" 2>/dev/null || true)"
+                if [[ -n "${PR_LINES}" ]]; then
+                    # Atualiza lista de PRs na nota.
+                    PR_NUMBERS="$(printf '%s\n' "${PR_LINES}" | awk -F'\t' '{print $1}' | sort -u | python3 -c 'import sys,json; print(json.dumps([int(x.strip()) for x in sys.stdin if x.strip().isdigit()]))' 2>/dev/null || echo "[]")"
+                    NOTE_JSON="$(_task_read_frontmatter "${NOTE_PATH}" 2>/dev/null || true)"
+                    if [[ -n "${NOTE_JSON}" ]]; then
+                        UPDATED="$(_task_update_metadata "${NOTE_JSON}" "prs" "${PR_NUMBERS}" 2>/dev/null || true)"
+                        UPDATED="$(_task_update_metadata "${UPDATED}" "updated_at" "$(date -Iseconds)" 2>/dev/null || true)"
+                        BODY="$(_task_get_field "${NOTE_PATH}" "body" 2>/dev/null || true)"
+                        _task_write_note "${NOTE_PATH}" "${UPDATED}" "${BODY}" 2>/dev/null || true
+                    fi
+                    if _task_set_state "${NOTE_PATH}" "review" "push com PR aberto" "${IDENTITY}" "${REPO_ROOT}" 2>/dev/null; then
+                        if command -v _journal_task_state_changed >/dev/null 2>&1; then
+                            _journal_task_state_changed "${IDENTITY}" "" "${CURRENT_STATE}" "review" "push com PR aberto"
+                        fi
+                    fi
+                fi
+            fi
+        fi
+    fi
 fi
 
 exit 0

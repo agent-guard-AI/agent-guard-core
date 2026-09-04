@@ -144,6 +144,21 @@ else
     fail "Test 10: boot-cache functions should be loadable"
 fi
 
+# ---------------------------------------------------------------------------
+# Test 11: layer-0 helper includes ALERTAS-RECENT (init.sh default)
+# ---------------------------------------------------------------------------
+unset HMVIP_BOOT_CACHE_VALID HMVIP_BOOT_CACHE_LAYERS HMVIP_BOOT_CACHE_TIMESTAMP
+rm -f "${TMP_WORKTREE}/.agent-guard/session/boot-state.json"
+printf 'P0 alert content\n' > "${TMP_WORKTREE}/ALERTAS-RECENT.md"
+_layer0="$(_boot_state_layers_for_consciousness 0)"
+_artifacts0="$(_boot_state_artifacts_for_consciousness 0 "${TMP_WORKTREE}")"
+_boot_state_save "kimi7" "${TMP_WORKTREE}" "ia-kimi7/ia-a/task-test" "${_layer0}" "${_artifacts0}" >/dev/null 2>&1
+if _boot_state_load "kimi7" "${TMP_WORKTREE}" "lease token-economy todo alerts-recent" >/dev/null 2>&1; then
+    pass "Test 11: layer 0 cache satisfies alerts-recent layer"
+else
+    fail "Test 11: layer 0 cache should satisfy alerts-recent layer (got '${HMVIP_BOOT_CACHE_LAYERS:-}')"
+fi
+
 echo ""
 echo "Results: ${PASS} passed, ${FAIL} failed"
 

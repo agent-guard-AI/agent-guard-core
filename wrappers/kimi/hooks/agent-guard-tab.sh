@@ -427,6 +427,49 @@ else
     FINAL_TITLE="$(_dots) ${SLOT}${SEPARATOR}${TITLE_WORK}${AGE_SUFFIX}"
 fi
 
+# Throttle de notificacoes por slot. Padrao 300s (5 min) para evitar flood
+# de pop-ups quando o Kimi Code oscila entre working e attention a cada
+# tool call em modo auto permission. Sobrescrever: HMVIP_TAB_NOTIFY_THROTTLE_SECONDS=0
+# desliga o throttle; HMVIP_TAB_NOTIFY_PERMISSION_REQUEST=1 reativa notificacao
+# em PermissionRequest (geralmente transitório).
+_NOTIFY_THROTTLE_FILE="${TAB_DIR}/notify-throttle.json"
+_NOTIFY_THROTTLE_SECONDS="${HMVIP_TAB_NOTIFY_THROTTLE_SECONDS:-300}"
+
+_should_notify_attention() {
+    # PermissionRequest e' transitório em auto permission; notificar só se
+    # o usuário explicitamente quiser.
+    if [ "${EVENT}" = "PermissionRequest" ] && [ "${HMVIP_TAB_NOTIFY_PERMISSION_REQUEST:-0}" != "1" ]; then
+        return 1
+    fi
+
+    # Sem throttle configurado (0 ou vazio) => notifica normalmente.
+    [ "${_NOTIFY_THROTTLE_SECONDS}" -gt 0 ] 2>/dev/null || return 0
+
+    local _last _now
+    _now="$(date +%s 2>/dev/null || echo 0)"
+    _last=0
+    if [ -f "${_NOTIFY_THROTTLE_FILE}" ] && command -v jq >/dev/null 2>&1; then
+        _last="$(jq -r --arg slot "${SLOT}" '.[$slot] // 0' "${_NOTIFY_THROTTLE_FILE}" 2>/dev/null || echo 0)"
+    fi
+    [ -z "${_last}" ] && _last=0
+    if [ "$((_now - _last))" -le "${_NOTIFY_THROTTLE_SECONDS}" ]; then
+        return 1
+    fi
+    return 0
+}
+
+_record_notify_attention() {
+    [ "${_NOTIFY_THROTTLE_SECONDS}" -gt 0 ] 2>/dev/null || return 0
+    local _now _tmp
+    _now="$(date +%s 2>/dev/null || echo 0)"
+    _tmp="${_NOTIFY_THROTTLE_FILE}.tmp.$$"
+    if command -v jq >/dev/null 2>&1; then
+        ( [ -f "${_NOTIFY_THROTTLE_FILE}" ] && cat "${_NOTIFY_THROTTLE_FILE}" || echo '{}' ) \
+            | jq --arg slot "${SLOT}" --argjson ts "${_now}" '.[$slot] = $ts' >"${_tmp}" 2>/dev/null \
+            && mv "${_tmp}" "${_NOTIFY_THROTTLE_FILE}" 2>/dev/null || rm -f "${_tmp}"
+    fi
+}
+
 # Notificacao desktop ao ENTRAR em attention/error (so na transicao, para
 # nao duplicar a cada evento). Desligar: HMVIP_TAB_NOTIFY=0.
 _notify_attention() {
@@ -437,6 +480,8 @@ _notify_attention() {
     esac
     [ "${PREV_STATE}" != "${STATE}" ] || return 0
     [ "${ACTION}" != "render" ] || return 0
+    _should_notify_attention || return 0
+    _record_notify_attention
     if [ -n "${HMVIP_TAB_NOTIFY_OUT:-}" ]; then
         # Testes: captura a notificacao em arquivo.
         printf '%s\n' "${FINAL_TITLE}" >>"${HMVIP_TAB_NOTIFY_OUT}" 2>/dev/null || true
