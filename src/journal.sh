@@ -271,6 +271,82 @@ _journal_error() {
 }
 
 # -----------------------------------------------------------------------------
+# Task lifecycle event helpers
+# -----------------------------------------------------------------------------
+
+_journal_task_created() {
+    local identity="${1:-}"
+    local task_id="${2:-}"
+    local topic="${3:-}"
+    local branch="${4:-}"
+    local note_path="${5:-}"
+    local payload
+    payload="$(${AG_PYTHON} -c "
+import json, sys
+print(json.dumps({
+    'identity': sys.argv[1],
+    'task_id': sys.argv[2],
+    'topic': sys.argv[3],
+    'branch': sys.argv[4],
+    'note_path': sys.argv[5]
+}))
+" "${identity}" "${task_id}" "${topic}" "${branch}" "${note_path}" 2>/dev/null || echo "{}")"
+    _journal_write_event "task.created" "${payload}"
+}
+
+_journal_task_state_changed() {
+    local identity="${1:-}"
+    local task_id="${2:-}"
+    local old_state="${3:-}"
+    local new_state="${4:-}"
+    local reason="${5:-}"
+    local payload
+    payload="$(${AG_PYTHON} -c "
+import json, sys
+print(json.dumps({
+    'identity': sys.argv[1],
+    'task_id': sys.argv[2],
+    'old_state': sys.argv[3],
+    'new_state': sys.argv[4],
+    'reason': sys.argv[5]
+}))
+" "${identity}" "${task_id}" "${old_state}" "${new_state}" "${reason}" 2>/dev/null || echo "{}")"
+    _journal_write_event "task.state_changed" "${payload}"
+}
+
+_journal_task_completed() {
+    local identity="${1:-}"
+    local task_id="${2:-}"
+    local note_path="${3:-}"
+    local payload
+    payload="$(${AG_PYTHON} -c "
+import json, sys
+print(json.dumps({
+    'identity': sys.argv[1],
+    'task_id': sys.argv[2],
+    'note_path': sys.argv[3]
+}))
+" "${identity}" "${task_id}" "${note_path}" 2>/dev/null || echo "{}")"
+    _journal_write_event "task.completed" "${payload}"
+}
+
+_journal_task_blocked() {
+    local identity="${1:-}"
+    local task_id="${2:-}"
+    local reason="${3:-}"
+    local payload
+    payload="$(${AG_PYTHON} -c "
+import json, sys
+print(json.dumps({
+    'identity': sys.argv[1],
+    'task_id': sys.argv[2],
+    'reason': sys.argv[3]
+}))
+" "${identity}" "${task_id}" "${reason}" 2>/dev/null || echo "{}")"
+    _journal_write_event "task.blocked" "${payload}"
+}
+
+# -----------------------------------------------------------------------------
 # Leitura / Listagem
 # -----------------------------------------------------------------------------
 

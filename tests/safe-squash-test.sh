@@ -3,7 +3,7 @@
 # safe-squash functional test
 #
 # Verifies that agent-guard safe-squash preserves the worktree-origin git note
-# required by CI Worktree Origin Audit.
+# required by CI Worktree Origin Audit, and enforces F1 safety preconditions.
 
 set -euo pipefail
 
@@ -83,40 +83,133 @@ identity:test1
 branch:ia-test1/ia-a/task-safe-squash" HEAD
 done
 
-# Verify the three commits have notes.
-NOTE_COUNT_BEFORE="$(git -C "${FAKE_WORKTREE}" notes --ref=refs/notes/hmvip-worktree list | wc -l | tr -d ' ')"
-if [[ "${NOTE_COUNT_BEFORE}" -eq 3 ]]; then
-    pass "all pre-squash commits have worktree notes"
+_run_safe_squash() {
+    (
+        cd "${FAKE_WORKTREE}"
+        source "${FAKE_WORKTREE}/packages/agent-guard-core/bin/agent-guard" safe-squash "$@"
+    )
+}
+
+_note_at_head() {
+    git -C "${FAKE_WORKTREE}" notes --ref=refs/notes/hmvip-worktree show HEAD 2>/dev/null || true
+}
+
+# Test 1: basic count squash preserves note.
+_run_safe_squash 1 -m "squash-one"
+NOTE_CONTENT="$(_note_at_head)"
+if [[ -n "${NOTE_CONTENT}" ]]; then
+    pass "squash count=1 preserves worktree note"
 else
-    fail "expected 3 pre-squash notes, got ${NOTE_COUNT_BEFORE}"
+    fail "squash count=1 missing worktree note"
 fi
 
-# Run safe-squash from inside the fake worktree.
+# Test 2: --base explicit squash preserves note.
+BASE_REF="$(git -C "${FAKE_WORKTREE}" rev-parse HEAD~2)"
+_run_safe_squash --base "${BASE_REF}" -m "squash-base"
+NOTE_CONTENT="$(_note_at_head)"
+if echo "${NOTE_CONTENT}" | grep -q "identity:test1"; then
+    pass "squash --base preserves identity in note"
+else
+    fail "squash --base missing identity in note"
+fi
+
+# Test 3: dirty working tree (unstaged) is blocked.
+git -C "${FAKE_WORKTREE}" checkout -q -b ia-test1/ia-a/dirty-test
+echo "dirty" >> "${FAKE_WORKTREE}/file.txt"
+if _run_safe_squash 1 -m "dirty" 2>/dev/null; then
+    fail "dirty unstaged working tree should be blocked"
+else
+    pass "dirty unstaged working tree blocked"
+fi
+git -C "${FAKE_WORKTREE}" checkout -- file.txt
+
+# Test 4: staged change is blocked.
+echo "staged" >> "${FAKE_WORKTREE}/file.txt"
+git -C "${FAKE_WORKTREE}" add file.txt
+if _run_safe_squash 1 -m "staged" 2>/dev/null; then
+    fail "staged index should be blocked"
+else
+    pass "staged index blocked"
+fi
+git -C "${FAKE_WORKTREE}" reset HEAD file.txt
+git -C "${FAKE_WORKTREE}" checkout -- file.txt
+
+# Test 5: untracked file is blocked.
+echo "untracked" > "${FAKE_WORKTREE}/untracked.txt"
+if _run_safe_squash 1 -m "untracked" 2>/dev/null; then
+    fail "untracked file should be blocked"
+else
+    pass "untracked file blocked"
+fi
+rm "${FAKE_WORKTREE}/untracked.txt"
+
+# Test 6: stacked branch protection.
+# parent-branch has a commit not in current branch; origin/develop points to parent.
+git -C "${FAKE_WORKTREE}" checkout -q ia-test1/ia-a/task-safe-squash
+git -C "${FAKE_WORKTREE}" checkout -q -b ia-test1/ia-a/parent-test
+echo "parent" > "${FAKE_WORKTREE}/parent.txt"
+git -C "${FAKE_WORKTREE}" add parent.txt
+git -C "${FAKE_WORKTREE}" commit -q -m "parent commit"
+git -C "${FAKE_WORKTREE}" checkout -q -b ia-test1/ia-a/child-test
+echo "child" > "${FAKE_WORKTREE}/child.txt"
+git -C "${FAKE_WORKTREE}" add child.txt
+git -C "${FAKE_WORKTREE}" commit -q -m "child commit"
+git -C "${FAKE_WORKTREE}" update-ref refs/remotes/origin/develop ia-test1/ia-a/parent-test
+if _run_safe_squash --all -m "stacked" 2>/dev/null; then
+    fail "--all should be rejected (removed option)"
+else
+    pass "--all rejected"
+fi
+# --base below merge-base should also be rejected.
+MERGE_BASE="$(git -C "${FAKE_WORKTREE}" merge-base HEAD origin/develop)"
+if _run_safe_squash --base "${MERGE_BASE}" -m "stacked-below" 2>/dev/null; then
+    fail "squash at or below merge-base should be blocked"
+else
+    pass "squash at or below merge-base blocked"
+fi
+git -C "${FAKE_WORKTREE}" update-ref -d refs/remotes/origin/develop
+
+# Test 7: rollback on note failure.
+git -C "${FAKE_WORKTREE}" checkout -q ia-test1/ia-a/task-safe-squash
+ORIGINAL_HEAD="$(git -C "${FAKE_WORKTREE}" rev-parse HEAD)"
+mkdir -p "${FAKE_WORKTREE}/fakebin"
+cat > "${FAKE_WORKTREE}/fakebin/git" <<'FAKE'
+#!/bin/bash
+if [[ "$*" == *"notes"*"add"* ]]; then
+  echo "FAKE GIT NOTES FAILURE" >&2
+  exit 1
+fi
+/usr/bin/git "$@"
+FAKE
+chmod +x "${FAKE_WORKTREE}/fakebin/git"
 (
     cd "${FAKE_WORKTREE}"
-    source "${FAKE_WORKTREE}/packages/agent-guard-core/bin/agent-guard" safe-squash 3 -m "squashed"
+    PATH="${FAKE_WORKTREE}/fakebin:${PATH}"
+    source "${FAKE_WORKTREE}/packages/agent-guard-core/bin/agent-guard" safe-squash 1 -m "should-rollback" 2>/dev/null || true
 )
-
-# After squash the new HEAD must have a worktree-origin note.
-NOTE_CONTENT="$(git -C "${FAKE_WORKTREE}" notes --ref=refs/notes/hmvip-worktree show HEAD 2>/dev/null || true)"
-if [[ -n "${NOTE_CONTENT}" ]]; then
-    pass "squashed commit HEAD has a worktree note"
+CURRENT_HEAD="$(git -C "${FAKE_WORKTREE}" rev-parse HEAD)"
+if [[ "${CURRENT_HEAD}" == "${ORIGINAL_HEAD}" ]]; then
+    pass "rollback restores original HEAD on note failure"
 else
-    fail "post-squash HEAD is missing worktree note"
+    fail "rollback did not restore original HEAD"
 fi
+rm -rf "${FAKE_WORKTREE}/fakebin"
 
-# Verify the note content.
-if echo "${NOTE_CONTENT}" | grep -q "identity:test1"; then
-    pass "post-squash note contains expected identity"
+# Test 8: --no-verify opt-in runs without pre-commit.
+git -C "${FAKE_WORKTREE}" checkout -q ia-test1/ia-a/task-safe-squash
+mkdir -p "${FAKE_WORKTREE}/.git/hooks"
+cat > "${FAKE_WORKTREE}/.git/hooks/pre-commit" <<'HOOK'
+#!/bin/bash
+echo "[pre-commit] blocking" >&2
+exit 1
+HOOK
+chmod +x "${FAKE_WORKTREE}/.git/hooks/pre-commit"
+if _run_safe_squash 1 -m "no-verify" --no-verify 2>/dev/null; then
+    pass "--no-verify opt-in skips blocking pre-commit"
 else
-    fail "post-squash note missing expected identity"
+    fail "--no-verify opt-in should allow squash"
 fi
-
-if echo "${NOTE_CONTENT}" | grep -q "worktree:${FAKE_WORKTREE}"; then
-    pass "post-squash note contains expected worktree"
-else
-    fail "post-squash note missing expected worktree"
-fi
+rm "${FAKE_WORKTREE}/.git/hooks/pre-commit"
 
 if [[ ${ERRORS} -gt 0 ]]; then
     echo ""

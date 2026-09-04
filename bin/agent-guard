@@ -57,7 +57,13 @@ function _agent_guard_main() {
         source "${SESSION_TRACE_SCRIPT}"
     fi
 
-    KNOWN_IDENTITIES="kimi claude gemini grok amp kilo codewhale"
+    # Read known identities from the YAML SSOT instead of a hardcoded list so
+    # new identities (e.g. luna) are recognized as soon as they are added to
+    # agent-guard.yaml without touching the CLI parser.
+    KNOWN_IDENTITIES="$(bash "${SCRIPT_DIR}/bin/agent-guard-config" keys identities 2>/dev/null || true)"
+    if [[ -z "${KNOWN_IDENTITIES}" ]]; then
+        KNOWN_IDENTITIES="kimi claude gemini grok amp kilo codewhale"
+    fi
     FIRST_ARG="${1:-}"
 
     if [[ -z "${FIRST_ARG}" ]]; then
@@ -85,7 +91,12 @@ function _agent_guard_main() {
             return $?
             ;;
         status|s)
-            source "${INIT_SCRIPT}" --status
+            if [[ "${1:-}" == "--tasks" || "${1:-}" == "-t" ]]; then
+                source "${SCRIPT_DIR}/src/task-cli.sh"
+                _task_cli_status
+                return $?
+            fi
+            source "${INIT_SCRIPT}" --status "$@"
             return $?
             ;;
         release|r)
@@ -112,7 +123,7 @@ function _agent_guard_main() {
             source "${INIT_SCRIPT}" --adopt "$@"
             return $?
             ;;
-        triage|t)
+        triage)
             if [[ $# -lt 1 ]]; then
                 echo "❌ triage requires a prefix." >&2
                 return 1
@@ -248,14 +259,19 @@ function _agent_guard_main() {
             _hmvip_continue_all_cmd "$@"
             return $?
             ;;
+        task|t)
+            source "${SCRIPT_DIR}/src/task-cli.sh"
+            _task_cli_main "$@"
+            return $?
+            ;;
         safe-squash|sq)
             source "${SCRIPT_DIR}/src/safe-squash.sh" "$@"
             return $?
             ;;
         *)
             echo "❌ Unknown command or identity: ${COMMAND}" >&2
-            echo "   Commands: init, status, release, attach, triage, journal, resume, checkpoint, session, prune, cleanup-stale, orphan-sweep, tab, tabs, grid, safe-squash" >&2
-            echo "   Legacy:   <kimi|claude|gemini|grok> <role>" >&2
+            echo "   Commands: init, status (s), release (r), switch (sw), attach (a), adopt (ad), triage, journal (j), resume (res), checkpoint (cp), session (sess), prune, cleanup-stale (cs), orphan-sweep (os), tab, tabs, grid, task (t), safe-squash (sq)" >&2
+            echo "   Identities are loaded from agent-guard.yaml." >&2
             return 1
             ;;
     esac

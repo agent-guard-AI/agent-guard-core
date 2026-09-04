@@ -197,6 +197,81 @@ print(json.dumps(out, indent=2, ensure_ascii=False))
 }
 
 # ---------------------------------------------------------------------------
+# Classifica a tarefa em camada de boot cache (0/1/2).
+#
+# Camada 0 (Mínima): lease + token-economy + todo + ALERTAS-RECENT.
+#   Use para tarefas K2.7 rotineiras, localizadas, sem P0, não cross-domain.
+# Camada 1 (Padrão): + council digest + guardian + incident-log.
+#   Use para tarefas K2.7 com risco médio ou alarme aberto.
+# Camada 2 (Completa): + contrato + discovery + skill de domínio.
+#   Use para K3, P0, cross-domain, feature nova, bug sistêmico.
+# ---------------------------------------------------------------------------
+_boot_state_classify_task() {
+    local task_description="${1:-}"
+    local mode="${2:-}"
+
+    # Sempre camada 2 para K3 ou modo desconhecido.
+    case "${mode}" in
+        k3|K3|k3-max|K3-MAX|k3-high|K3-HIGH)
+            printf '2'
+            return 0
+            ;;
+    esac
+
+    # Palavras-chave que forçam camada 2.
+    local force_layer2_keywords=("P0" "seguranca" "LGPD" "vazamento" "dinheiro" "pagamento" "ledger" "withdraw" "chargeback" "deploy" "infra" "cross-plugin" "refator" "architecture" "spec" "ADR")
+    local kw
+    for kw in "${force_layer2_keywords[@]}"; do
+        if [[ "${task_description}" =~ ${kw} ]]; then
+            printf '2'
+            return 0
+        fi
+    done
+
+    # Palavras-chave que forçam camada 1.
+    local force_layer1_keywords=("bug" "fix" "incidente" "alarme" "guardian" "council" "cross-domain")
+    for kw in "${force_layer1_keywords[@]}"; do
+        if [[ "${task_description}" =~ ${kw} ]]; then
+            printf '1'
+            return 0
+        fi
+    done
+
+    # K2.7 rotineiro: camada 0.
+    printf '0'
+    return 0
+}
+
+# ---------------------------------------------------------------------------
+# Retorna as camadas necessárias para uma camada de consciência (0/1/2).
+# ---------------------------------------------------------------------------
+_boot_state_layers_for_consciousness() {
+    local layer="$1"
+    case "${layer}" in
+        0) printf 'lease token-economy todo alerts-recent' ;;
+        1) printf 'lease token-economy todo alerts-recent council guardian incident-log' ;;
+        2) printf 'lease token-economy todo alerts-recent council guardian incident-log contract discovery domain-skill' ;;
+        *) printf 'lease token-economy todo' ;;
+    esac
+}
+
+# ---------------------------------------------------------------------------
+# Retorna os artefatos a observar para uma camada de consciência.
+# ---------------------------------------------------------------------------
+_boot_state_artifacts_for_consciousness() {
+    local layer="$1"
+    local worktree_path="${2:-$(pwd)}"
+    local artifacts="${worktree_path}/ALERTAS-RECENT.md"
+    case "${layer}" in
+        1|2)
+            artifacts="${artifacts} ${worktree_path}/.agent-guard/council-digest.md"
+            artifacts="${artifacts} ${worktree_path}/.kiro/agents/incident-log.md"
+            ;;
+    esac
+    printf '%s' "${artifacts}"
+}
+
+# ---------------------------------------------------------------------------
 # Invalida o boot cache (útil em mudanças críticas ou release)
 # ---------------------------------------------------------------------------
 _boot_state_invalidate() {

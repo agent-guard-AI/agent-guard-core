@@ -144,22 +144,31 @@ echo "== selo de espera + notificacao desktop =="
 
 export HMVIP_TAB_NOTIFY=1
 export HMVIP_TAB_NOTIFY_OUT="${SANDBOX}/notify.log"
+# Desliga throttle nesta secao para isolar o comportamento por evento.
+export HMVIP_TAB_NOTIFY_THROTTLE_SECONDS=0
 
 SID="session_espera"
 fire working ',"prompt":"espera e notificacao"' UserPromptSubmit
-fire attention "" PermissionRequest
+fire attention "" Stop
 T7="$(last_title)"
 [[ "${T7}" == *"⏳"* && "${T7}" =~ [0-9]{2}:[0-9]{2} ]] \
     && ok "attention => selo 'esperando desde HH:MM' no titulo" \
     || bad "selo de espera" "${T7}"
 [[ "$(wc -l < "${HMVIP_TAB_NOTIFY_OUT}" 2>/dev/null || echo 0)" == "1" ]] \
-    && ok "transicao working=>attention notifica 1x" \
+    && ok "transicao working=>attention (Stop) notifica 1x" \
     || bad "notifica 1x" "$(cat "${HMVIP_TAB_NOTIFY_OUT}" 2>/dev/null)"
 
 fire attention "" Stop
 [[ "$(wc -l < "${HMVIP_TAB_NOTIFY_OUT}")" == "1" ]] \
     && ok "attention repetido (sem transicao) NAO re-notifica" \
     || bad "sem re-notificacao" "$(wc -l < "${HMVIP_TAB_NOTIFY_OUT}")"
+
+# PermissionRequest e' transitório em auto permission e não deve notificar.
+fire working "" PermissionResult
+fire attention "" PermissionRequest
+[[ "$(wc -l < "${HMVIP_TAB_NOTIFY_OUT}")" == "1" ]] \
+    && ok "PermissionRequest NAO notifica" \
+    || bad "PermissionRequest silencioso" "$(wc -l < "${HMVIP_TAB_NOTIFY_OUT}")"
 
 fire working "" PermissionResult
 fire error "" StopFailure
@@ -176,8 +185,29 @@ fire working "" UserPromptSubmit
     && ok "working remove o selo de espera" \
     || bad "working sem selo" "$(last_title)"
 
+export HMVIP_TAB_NOTIFY_THROTTLE_SECONDS=2
+
+# Com throttle ativo, a primeira notificacao grava o timestamp; uma segunda
+# transicao working=>attention dentro da janela deve ser suprimida.
+fire working "" UserPromptSubmit
+fire attention "" Interrupt
+fire working "" UserPromptSubmit
+fire attention "" Interrupt
+[[ "$(wc -l < "${HMVIP_TAB_NOTIFY_OUT}")" == "3" ]] \
+    && ok "throttle suprime notificacao dentro da janela" \
+    || bad "throttle dentro da janela" "$(wc -l < "${HMVIP_TAB_NOTIFY_OUT}")"
+
+sleep 3
+fire working "" UserPromptSubmit
+fire attention "" Interrupt
+[[ "$(wc -l < "${HMVIP_TAB_NOTIFY_OUT}")" == "4" ]] \
+    && ok "throttle libera apos expirar" \
+    || bad "throttle expirado" "$(wc -l < "${HMVIP_TAB_NOTIFY_OUT}")"
+
 export HMVIP_TAB_NOTIFY=0
 unset HMVIP_TAB_NOTIFY_OUT
+unset HMVIP_TAB_NOTIFY_THROTTLE_SECONDS
+SID="session_teste_123"
 SID="session_teste_123"
 
 echo "== session-end =="

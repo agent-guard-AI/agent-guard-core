@@ -3,24 +3,24 @@
 # safe-squash.sh — Squash commits preserving agent-guard worktree metadata.
 #
 # Usage (sourced from bin/agent-guard):
-#   source agent-guard safe-squash <count|--all|--base <ref>> [--message|-m <msg>]
+#   source agent-guard safe-squash <count|--base <ref>> [--message|-m <msg>]
 #
 # Problem it solves:
-#   Plain `git reset --soft <base> && git commit` creates a new HEAD that never
-#   runs the post-commit hook, so the worktree-origin git note required by CI
-#   (`refs/notes/hmvip-worktree`) is missing. The next push is then blocked or
-#   fails the CI Worktree Origin Audit.
+#   Plain `git reset --soft <base> && git commit` may lose the worktree-origin
+#   git note required by CI (`refs/notes/hmvip-worktree`) if the post-commit
+#   hook fails or is skipped. This command deterministically attaches the note.
 #
 # This command:
-#   1. Determines the squash base.
-#   2. Soft-resets to it.
-#   3. Commits with the supplied or auto-generated message.
-#   4. Explicitly adds the worktree-origin note to the new HEAD.
+#   1. Validates the working tree and index are clean.
+#   2. Validates the squash base is safe (owned branch, not below merge-base).
+#   3. Soft-resets to the base.
+#   4. Commits with the supplied or auto-generated message.
+#   5. Explicitly adds the worktree-origin note to the new HEAD.
+#   6. Rolls back atomically if the note cannot be attached.
 #
 # Save the caller's shell flags BEFORE enabling strict mode so we can restore
 # the original state before returning. Without this, strict mode leaks into the
-# user's interactive shell and may kill the terminal on the next failing command
-# (see hmvip-shell-safety, L222).
+# user's interactive shell and may kill the terminal on the next failing command.
 _AG_SAFE_SQUASH_OLD_FLAGS="$(set +o)"
 _ag_safe_squash_restore_shell_flags() {
     eval "${_AG_SAFE_SQUASH_OLD_FLAGS}" 2>/dev/null || true
@@ -34,14 +34,10 @@ function _safe_squash_main() {
     local count=""
     local base=""
     local message=""
-    local auto_message=0
+    local no_verify=0
 
     while [[ $# -gt 0 ]]; do
         case "$1" in
-            --all)
-                base="origin/develop"
-                shift
-                ;;
             --base)
                 base="${2:-}"
                 if [[ -z "${base}" ]]; then
@@ -58,14 +54,22 @@ function _safe_squash_main() {
                 fi
                 shift 2
                 ;;
+            --no-verify)
+                no_verify=1
+                shift
+                ;;
+            -h|--help)
+                _safe_squash_usage
+                return 0
+                ;;
             -*)
                 echo "❌ safe-squash: unknown option $1" >&2
-                echo "   Usage: source agent-guard safe-squash <count|--all|--base <ref>> [-m <message>]" >&2
+                _safe_squash_usage >&2
                 return 1
                 ;;
             *)
                 if [[ -n "${count}" || -n "${base}" ]]; then
-                    echo "❌ safe-squash: provide either a count, --all or --base." >&2
+                    echo "❌ safe-squash: provide either a count or --base." >&2
                     return 1
                 fi
                 count="$1"
@@ -75,7 +79,8 @@ function _safe_squash_main() {
     done
 
     if [[ -z "${count}" && -z "${base}" ]]; then
-        echo "❌ safe-squash: inform how many commits to squash (e.g. 3), --all, or --base <ref>." >&2
+        echo "❌ safe-squash: inform how many commits to squash (e.g. 3) or --base <ref>." >&2
+        _safe_squash_usage >&2
         return 1
     fi
 
@@ -156,7 +161,26 @@ function _safe_squash_main() {
         fi
     fi
 
-    if [[ "${auto_message}" -eq 0 && -z "${message}" ]]; then
+    # F1 safety: require a clean working tree and index.
+    if ! _safe_squash_worktree_is_clean; then
+        return 1
+    fi
+
+    # F1 safety: stacked-branch protection.
+    # Do not allow squashing below the merge-base with origin/develop unless
+    # the user explicitly passes --base with a ref inside the branch's own history.
+    local merge_base_with_develop
+    merge_base_with_develop="$(git merge-base HEAD origin/develop 2>/dev/null || true)"
+    if [[ -n "${merge_base_with_develop}" ]]; then
+        if git merge-base --is-ancestor "${base_ref}" "${merge_base_with_develop}" 2>/dev/null; then
+            echo "❌ safe-squash: base '${base:-HEAD~${count}}' is at or below the merge-base with origin/develop." >&2
+            echo "   Squashing here would absorb commits from the parent branch." >&2
+            echo "   If you really intend this, pass an explicit --base <ref> inside your branch history." >&2
+            return 1
+        fi
+    fi
+
+    if [[ -z "${message}" ]]; then
         # Build a default message from the squashed commits.
         local squashed_messages
         squashed_messages="$(git log --format='%s' "${base_ref}..HEAD" 2>/dev/null || true)"
@@ -177,34 +201,105 @@ ${body}"
         message="squash: consolidate commits on ${BRANCH}"
     fi
 
-    echo "🛡️  safe-squash: squashing $(git rev-list --count "${base_ref}..HEAD") commit(s) on '${BRANCH}'..." >&2
+    local commit_count
+    commit_count="$(git rev-list --count "${base_ref}..HEAD" 2>/dev/null || echo "0")"
+    if [[ "${commit_count}" -eq 0 ]]; then
+        echo "❌ safe-squash: no commits to squash in the requested range." >&2
+        return 1
+    fi
+
+    echo "🛡️  safe-squash: squashing ${commit_count} commit(s) on '${BRANCH}'..." >&2
 
     local original_head
     original_head="$(git rev-parse HEAD)"
 
+    # Stash any unexpected changes to preserve them through rollback.
+    # Because we already verified the worktree is clean, this should be empty,
+    # but it acts as a fail-safe against races or hook side-effects.
+    local stash_ref=""
+    if git diff --quiet HEAD && git diff --cached --quiet HEAD; then
+        : # clean
+    else
+        stash_ref="$(git stash push -m "safe-squash auto-stash ${original_head}" 2>/dev/null || true)"
+    fi
+
+    local rollback_needed=0
+
     git reset --soft "${base_ref}"
 
-    # Commit without running hooks (we will attach the note ourselves).
-    git commit --no-verify -m "${message}"
+    local commit_flags=()
+    if [[ "${no_verify}" -eq 1 ]]; then
+        commit_flags+=("--no-verify")
+    fi
 
-    local new_head
-    new_head="$(git rev-parse HEAD)"
+    if ! git commit "${commit_flags[@]}" -m "${message}"; then
+        echo "⚠️  [AGENT GUARD] Commit failed during squash; reverting..." >&2
+        rollback_needed=1
+    else
+        local new_head
+        new_head="$(git rev-parse HEAD)"
 
-    local NOTE_CONTENT="worktree:${WORKTREE_PATH}
+        local NOTE_CONTENT="worktree:${WORKTREE_PATH}
 identity:${IDENTITY}
 branch:${BRANCH}"
 
-    if ! git notes --ref="${NOTES_REF}" add -f -m "${NOTE_CONTENT}" "${new_head}" >/dev/null 2>&1; then
-        echo "⚠️  [AGENT GUARD] Failed to add worktree origin note to squashed commit." >&2
-        echo "   Reverting squash..." >&2
+        if ! git notes --ref="${NOTES_REF}" add -f -m "${NOTE_CONTENT}" "${new_head}" >/dev/null 2>&1; then
+            echo "⚠️  [AGENT GUARD] Failed to add worktree origin note to squashed commit." >&2
+            rollback_needed=1
+        else
+            # Verify the note is readable.
+            if ! git notes --ref="${NOTES_REF}" show "${new_head}" >/dev/null 2>&1; then
+                echo "⚠️  [AGENT GUARD] Note not readable after add; reverting..." >&2
+                rollback_needed=1
+            fi
+        fi
+    fi
+
+    if [[ "${rollback_needed}" -eq 1 ]]; then
         git reset --hard "${original_head}"
+        if [[ -n "${stash_ref}" && "${stash_ref}" != "No local changes to save" ]]; then
+            git stash pop >/dev/null 2>&1 || true
+        fi
+        echo "❌ safe-squash: aborted and restored original HEAD ${original_head::12}." >&2
         return 1
     fi
 
-    echo "✅ safe-squash: created ${new_head::12} with worktree note preserved." >&2
+    if [[ -n "${stash_ref}" && "${stash_ref}" != "No local changes to save" ]]; then
+        git stash drop >/dev/null 2>&1 || true
+    fi
+
+    local final_head
+    final_head="$(git rev-parse HEAD)"
+    echo "✅ safe-squash: created ${final_head::12} with worktree note preserved." >&2
     echo "   Push the note ref together with the branch:" >&2
     echo "     git push origin ${BRANCH}" >&2
     echo "     git push origin ${NOTES_REF}" >&2
+}
+
+function _safe_squash_usage() {
+    echo "Usage: source agent-guard safe-squash <count|--base <ref>> [-m <message>] [--no-verify]" >&2
+    echo "  count       number of commits to squash from HEAD" >&2
+    echo "  --base      explicit merge-base ref (safer for stacked branches)" >&2
+    echo "  -m          commit message" >&2
+    echo "  --no-verify skip pre-commit/commit-msg hooks (use with care)" >&2
+}
+
+function _safe_squash_worktree_is_clean() {
+    if ! git diff --quiet HEAD; then
+        echo "❌ safe-squash: working tree has unstaged changes. Commit or stash them first." >&2
+        return 1
+    fi
+    if ! git diff --cached --quiet HEAD; then
+        echo "❌ safe-squash: index has staged changes. Commit or stash them first." >&2
+        return 1
+    fi
+    local untracked
+    untracked="$(git ls-files --others --exclude-standard 2>/dev/null | wc -l | tr -d ' ')"
+    if [[ "${untracked}" -gt 0 ]]; then
+        echo "❌ safe-squash: working tree has ${untracked} untracked file(s). Commit or remove them first." >&2
+        return 1
+    fi
+    return 0
 }
 
 _safe_squash_main "$@" || {
