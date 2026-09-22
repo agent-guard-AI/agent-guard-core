@@ -6,6 +6,10 @@
 
 set -euo pipefail
 
+# Hermeticidade: variáveis de autor de ambiente (ex.: shell de um slot alugado)
+# teriam precedência sobre git config e contaminariam os autores do fixture.
+unset GIT_AUTHOR_EMAIL GIT_AUTHOR_NAME GIT_COMMITTER_EMAIL GIT_COMMITTER_NAME || true
+
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
 
@@ -76,12 +80,18 @@ git commit -m "initial" >/dev/null 2>&1 || true
 ORIGIN="${SANDBOX}/origin.git"
 git init --bare "${ORIGIN}" >/dev/null 2>&1
 git remote add origin "${ORIGIN}" >/dev/null 2>&1
+# Base configurada (base_branch: develop) precisa existir no origin — é o
+# trusted base de first push/rewrite na primitiva de transição.
+git branch develop >/dev/null 2>&1 || true
 git push origin develop >/dev/null 2>&1 || true
 
 # Cria worktree vinculado com nome reconhecido pelo hook.
 worktree="${REPO}/hmvip-ia-kimi2"
 git worktree add "${worktree}" -b ia-kimi2/ia-a/hook-test >/dev/null 2>&1 || true
 git -C "${worktree}" remote add origin "${ORIGIN}" >/dev/null 2>&1 || true
+# Garante o remote-tracking da base configurada (espelha worktrees reais,
+# onde o init sempre fetcha a base; push sozinho não cria refs/remotes/*).
+git -C "${worktree}" fetch --no-tags origin develop >/dev/null 2>&1 || true
 git -C "${worktree}" config user.email "agent-kimi2@hmvip.dev" >/dev/null 2>&1
 git -C "${worktree}" config user.name "Agent kimi2" >/dev/null 2>&1
 
@@ -147,9 +157,12 @@ EOF
 chmod +x "${FAKE_BIN}/gh"
 export PATH="${FAKE_BIN}:${PATH}"
 
-# Simula stdin do hook pre-push: origin develop..HEAD.
-AGENT_GUARD_REPO_ROOT="${REPO}" bash "${REPO}/packages/agent-guard-core/hooks/pre-push" origin develop <<'EOF' >/dev/null || true
-develop 0000000000000000000000000000000000000000 0000000000000000000000000000000000000000
+# Simula stdin do protocolo pre-push: first push da branch de task
+# (remote_sha zero), com a tupla bem-formada <local-ref> <local-sha>
+# <remote-ref> <remote-sha>.
+HEAD_SHA="$(git rev-parse HEAD)"
+AGENT_GUARD_REPO_ROOT="${REPO}" bash "${REPO}/packages/agent-guard-core/hooks/pre-push" origin develop <<EOF >/dev/null || true
+refs/heads/ia-kimi2/ia-a/hook-test ${HEAD_SHA} refs/heads/ia-kimi2/ia-a/hook-test 0000000000000000000000000000000000000000
 EOF
 
 state="$(_task_get_field "${note_path}" "state")"

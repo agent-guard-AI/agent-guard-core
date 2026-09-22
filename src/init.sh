@@ -154,6 +154,17 @@ if [[ -f "${TASK_LIFECYCLE_SCRIPT}" ]]; then
 fi
 
 # ---------------------------------------------------------------------------
+# 1.6.0b Load F0-F S2 claim lifecycle (depende do task lifecycle)
+# ---------------------------------------------------------------------------
+CLAIM_SCRIPT="${SCRIPT_DIR}/claim.sh"
+if [[ -f "${CLAIM_SCRIPT}" ]]; then
+    _AG_INIT_OLD_FLAGS_TMP="$(set +o)"
+    source "${CLAIM_SCRIPT}"
+    eval "${_AG_INIT_OLD_FLAGS_TMP}" 2>/dev/null || true
+    unset _AG_INIT_OLD_FLAGS_TMP
+fi
+
+# ---------------------------------------------------------------------------
 # 1.6.1 Load release helpers (global scope)
 # ---------------------------------------------------------------------------
 # These functions must be available even when AGENT_GUARD_FUNCTIONS_ONLY=1,
@@ -161,6 +172,17 @@ fi
 RELEASE_HELPERS_SCRIPT="${SCRIPT_DIR}/release-helpers.sh"
 if [[ -f "${RELEASE_HELPERS_SCRIPT}" ]]; then
     source "${RELEASE_HELPERS_SCRIPT}"
+fi
+
+# ---------------------------------------------------------------------------
+# F6B3A: release-safety SHADOW adapter (SHADOW MODE, default OFF — flag
+# AGENT_GUARD_RELEASE_SAFETY_SHADOW=1). Compute-only: o legado abaixo
+# permanece 100% authoritative; o adapter só observa/compara/diagnostica em
+# stderr quando a flag está ligada. Sem schema/storage/journal.
+# ---------------------------------------------------------------------------
+RELEASE_SAFETY_SHADOW_SCRIPT="${SCRIPT_DIR}/release-safety-shadow.sh"
+if [[ -f "${RELEASE_SAFETY_SHADOW_SCRIPT}" ]]; then
+    source "${RELEASE_SAFETY_SHADOW_SCRIPT}"
 fi
 
 # ---------------------------------------------------------------------------
@@ -641,6 +663,14 @@ _AG_OTHER_AGENT_CACHE_TS=""
 _AG_OTHER_AGENT_CACHE_WORKTREE=""
 _AG_OTHER_AGENT_CACHE_RESULT=""
 
+# Agent-name satellites: helper daemons that carry an agent name (browser
+# bridge, LSP, telemetry) but are NOT agent sessions. They must never count
+# as live occupants of a worktree — after an aggressive terminal crash they
+# survive orphaned with cwd inside a worktree and would block adopt forever
+# (incident 2026-09-21: idle kimi-webbridge pinned the kimi3 worktree).
+# Space-separated exact `comm` names; extend as new satellites appear.
+_AG_AGENT_SATELLITE_COMMS="kimi-webbridge"
+
 # Walk the cached PPID map and return the top-most (root) agent process that
 # owns this process tree. We keep walking instead of stopping at the first
 # agent because args-based detection can flag the current shell/wrapper itself
@@ -701,13 +731,20 @@ _worktree_has_other_live_agent() {
     # awk pass. We then compute the transitive descendant set of all agent
     # processes; shell only reads cwd for those candidates.
     local candidates
-    candidates="$(printf '%s' "${ps_output}" | awk '
+    candidates="$(printf '%s' "${ps_output}" | awk -v satellites="${_AG_AGENT_SATELLITE_COMMS}" '
     {
         pid=$1; ppid=$2; comm=$3;
         args=""; for (i=4; i<=NF; i++) args = args $i " ";
         children[ppid] = children[ppid] " " pid;
         ppid_map[pid] = ppid;
-        if (comm == "kimi-code" || comm == "claude" || comm == "gemini" || comm == "grok" || comm == "cursor" || comm == "antigravity" || comm == "kiro" || comm == "kimi" || args ~ /(^|[^[:alnum:]_])(kimi-code|claude|gemini|grok|cursor|antigravity|kiro|kimi)([^[:alnum:]_]|$)/) {
+        # Satellites share the agent name but are not agent sessions; they
+        # must never mark a worktree as occupied.
+        is_satellite = 0;
+        nsat = split(satellites, sat_list, " ");
+        for (s = 1; s <= nsat; s++) {
+            if (comm == sat_list[s]) { is_satellite = 1; break; }
+        }
+        if (!is_satellite && (comm == "kimi-code" || comm == "claude" || comm == "gemini" || comm == "grok" || comm == "cursor" || comm == "antigravity" || comm == "kiro" || comm == "kimi" || args ~ /(^|[^[:alnum:]_])(kimi-code|claude|gemini|grok|cursor|antigravity|kiro|kimi)([^[:alnum:]_]|$)/)) {
             agents[pid] = 1;
         }
     }
@@ -1093,8 +1130,13 @@ for k in ('task_id','task_state','task_topic'):
     v = os.environ.get(f'_AG_S_{k.upper()}')
     if v:
         data[k] = v
-with open(os.environ['_AG_S_SESSION_FILE'], 'w') as f:
+# Atomic publish: a crash mid-write must never leave a truncated session
+# file (2026-09-21: non-atomic write left kimi3.json at 0 bytes after an
+# aggressive terminal crash, degrading status/adopt to "unknown").
+_tmp_path = os.environ['_AG_S_SESSION_FILE'] + '.tmp.' + str(os.getpid())
+with open(_tmp_path, 'w') as f:
     json.dump(data, f, indent=2)
+os.replace(_tmp_path, os.environ['_AG_S_SESSION_FILE'])
 " >/dev/null 2>&1
     local py_exit=$?
     unset _AG_S_IDENTITY _AG_S_STATUS _AG_S_ROLE _AG_S_BRANCH _AG_S_PID _AG_S_WORKTREE _AG_S_IMPACT _AG_S_TASK_ID _AG_S_TASK_STATE _AG_S_TASK_TOPIC _AG_S_SESSION_FILE
@@ -1107,12 +1149,19 @@ _clear_session() {
     session_file="$(_get_session_file "${identity}")"
     if [[ -f "${session_file}" ]]; then
         ${AG_PYTHON} -c "
-import json
-with open('${session_file}') as f:
-    d = json.load(f)
+import json, os
+try:
+    with open('${session_file}') as f:
+        d = json.load(f)
+except (ValueError, OSError):
+    # Truncated/corrupt storage (crash mid-write) still clears: release must
+    # be fail-safe even when the previous record cannot be read.
+    d = {}
 d.update({'status':'free','role':None,'branch':'','pid':None,'timestamp':None,'worktree_path':'','impact_plugins':[],'released_at':__import__('time').time()})
-with open('${session_file}', 'w') as f:
+_tmp_path = '${session_file}' + '.tmp.' + str(os.getpid())
+with open(_tmp_path, 'w') as f:
     json.dump(d, f, indent=2)
+os.replace(_tmp_path, '${session_file}')
 " >/dev/null 2>&1
     fi
 }
@@ -2953,6 +3002,12 @@ if [[ "${MODE}" == "release" ]]; then
         CURRENT_IDENTITY="$(_detect_identity_from_worktree_name "${wt_name}" | awk '{print $1 $2}')"
     fi
 
+    # F6B3A shadow: captura PRE-SHIM/PRE-gate da candidata (no-op quando a
+    # flag AGENT_GUARD_RELEASE_SAFETY_SHADOW está OFF).
+    if command -v _ag_rshadow_begin >/dev/null 2>&1; then
+        _ag_rshadow_begin "manual" "${CURRENT_WORKTREE}" "${CURRENT_IDENTITY}" "${MAIN_REPO}"
+    fi
+
     if [[ "${CURRENT_WORKTREE}" == "${MAIN_REPO}" ]]; then
         echo "❌❌❌ ERROR: RELEASE BLOCKED ON MAIN REPOSITORY ❌❌❌" >&2
         echo "" >&2
@@ -2969,11 +3024,17 @@ if [[ "${MODE}" == "release" ]]; then
         echo "     git checkout develop" >&2
         echo "     git pull origin develop" >&2
         echo "" >&2
+        if command -v _ag_rshadow_report >/dev/null 2>&1; then
+            _ag_rshadow_report BLOCK MAIN_REPO caller
+        fi
         return 1 2>/dev/null || exit 1
     fi
 
     if [[ -z "${CURRENT_IDENTITY}" ]]; then
         echo "❌ Cannot determine identity. Run from an agent worktree." >&2
+        if command -v _ag_rshadow_report >/dev/null 2>&1; then
+            _ag_rshadow_report BLOCK IDENTITY_UNKNOWN_CALLER caller
+        fi
         return 1 2>/dev/null || exit 1
     fi
 
@@ -2986,6 +3047,9 @@ if [[ "${MODE}" == "release" ]]; then
 
     if ! _validate_worktree_release_ready "${CURRENT_WORKTREE}"; then
         echo "🔒 Session NOT released. Resolve the issues above and run --release again." >&2
+        if command -v _ag_rshadow_report >/dev/null 2>&1; then
+            _ag_rshadow_report BLOCK SAFETY_VALIDATE_FAILED safety
+        fi
         return 1 2>/dev/null || exit 1
     fi
 
@@ -2993,6 +3057,11 @@ if [[ "${MODE}" == "release" ]]; then
     # da identidade — exige confirmação do usuário (TTY) ou --force explícito.
     if ! _release_pending_work_guard "${CURRENT_IDENTITY}" "${CURRENT_WORKTREE}" "${FORCE_RELEASE}"; then
         echo "🔒 Session NOT released. Apresente os PRs ao usuário; com autorização, use --release --force." >&2
+        if command -v _ag_rshadow_report >/dev/null 2>&1; then
+            # domain=policy: legacy_decision=ALLOW é a decisão SAFETY subjacente
+            # (a policy bloqueou, não a safety — F6B3A §5).
+            _ag_rshadow_report ALLOW NONE policy note=policy_block
+        fi
         return 1 2>/dev/null || exit 1
     fi
 
@@ -3042,6 +3111,9 @@ print(json.dumps({'reason': 'release', 'blockers': ['neutral_branch_failed'], 'w
     fi
 
     echo "🔓 Released session for ${CURRENT_IDENTITY}"
+    if command -v _ag_rshadow_report >/dev/null 2>&1; then
+        _ag_rshadow_report ALLOW NONE safety
+    fi
     return 0 2>/dev/null || exit 0
 fi
 
@@ -3221,7 +3293,7 @@ if [[ "${MODE}" == "status" ]]; then
     echo "=========================================================="
     echo "🛡️  Agent Guard — Session Status"
     echo "=========================================================="
-    printf "%-12s | %-8s | %-6s | %-10s | %-6s | %-8s | %-18s | %-40s\n" "Agent" "Status" "Role" "PID" "WT" "Health" "Tab" "Branch"
+    printf "%-12s | %-8s | %-6s | %-10s | %-6s | %-8s | %-18s | %-14s | %-40s\n" "Agent" "Status" "Role" "PID" "WT" "Health" "Tab" "TASK" "Branch"
     echo "------------------------------------------------------------------"
 
     _rec_status="" _rec_role="" _rec_pid="" _rec_branch="" _rec_worktree="" _rec_health="" _rec_drift=""
@@ -3257,9 +3329,35 @@ if [[ "${MODE}" == "status" ]]; then
             # Keep the tab column narrow; emoji are wide, so truncate conservatively.
             _tab_text="$(${AG_PYTHON} -c "import sys; s=sys.argv[1]; print(s[:17]+'…' if len(s)>18 else s)" "${_tab_text}" 2>/dev/null || printf '%s' "${_tab_text}")"
 
-            printf "%-12s | %-8s | %-6s | %-10s | %-6s | %-8s | %-18s | %-40s\n" \
+            # F0-F S2: TASK/run corrente a partir da nota do slot (referência,
+            # não cópia — estado canônico continua em .kiro/runs/). A nota vive
+            # no WORKTREE do claimant, não no repo principal: resolvemos o
+            # worktree real pela session/lease do slot (_rec_worktree), com
+            # fallback para o worktree convencional e, por último, para o
+            # repo principal (legado). Sem duplicar estado canônico; fail-soft.
+            _claim_disp=""
+            if command -v _task_get_field >/dev/null 2>&1; then
+                _claim_note_wt="${_rec_worktree:-}"
+                if [[ -z "${_claim_note_wt}" || ! -f "${_claim_note_wt}/.agent-guard/tasks/${identity}.md" ]]; then
+                    if [[ -f "${worktree_path}/.agent-guard/tasks/${identity}.md" ]]; then
+                        _claim_note_wt="${worktree_path}"
+                    else
+                        _claim_note_wt="${_AG_REPO_ROOT:-${MAIN_REPO}}"
+                    fi
+                fi
+                _claim_note="${_claim_note_wt}/.agent-guard/tasks/${identity}.md"
+                _claim_task_id="$(_task_get_field "${_claim_note}" "task_id" 2>/dev/null || true)"
+                _claim_run_seq="$(_task_get_field "${_claim_note}" "run_seq" 2>/dev/null || true)"
+                if [[ -n "${_claim_task_id}" ]]; then
+                    _claim_disp="${_claim_task_id}"
+                    [[ -n "${_claim_run_seq}" ]] && _claim_disp="${_claim_disp}#${_claim_run_seq}"
+                    _claim_disp="$(${AG_PYTHON} -c "import sys; s=sys.argv[1]; print(s[:13]+'…' if len(s)>14 else s)" "${_claim_disp}" 2>/dev/null || printf '%s' "${_claim_disp}")"
+                fi
+            fi
+
+            printf "%-12s | %-8s | %-6s | %-10s | %-6s | %-8s | %-18s | %-14s | %-40s\n" \
                 "${identity}" "${_rec_status:-free}" "${_rec_role:-}" \
-                "${pid_col:-}" "${wt_ok}" "${_rec_health:-}" "${_tab_text}" "${_rec_branch:-}"
+                "${pid_col:-}" "${wt_ok}" "${_rec_health:-}" "${_tab_text}" "${_claim_disp:-—}" "${_rec_branch:-}"
 
             if [[ "${_rec_health}" != "-" && "${_rec_health}" != "live" ]]; then
                 any_drift="${any_drift}\n  ${_rec_drift:-drift}: ${identity} -> ${_rec_branch:-<no branch>}"

@@ -145,9 +145,10 @@ ACTION="${1:-}"
 case "${ACTION}" in
     working)
         STATE="working"
-        # Titulo automatico: derivado no primeiro prompt, mas comandos slash
-        # (/new, /compact, /skill, /goal, /tab, /clear, /continue) podem
-        # renomear a qualquer momento.
+        # Titulo automatico: cada ordem significativa substitui o titulo
+        # anterior. Comandos slash (/new, /compact, /skill, /goal, /tab,
+        # /clear, /continue) e continuacoes curtas ("ok", "prossiga"...,
+        # flag keep do resumidor) tem tratamento proprio.
         if [ "${EVENT}" = "UserPromptSubmit" ]; then
             # O campo prompt pode vir como string (legado) ou como array de
             # blocos de conteudo [{"type":"text","text":"..."}, ...].
@@ -166,10 +167,15 @@ case "${ACTION}" in
                     _is_compact="$(printf '%s' "${SUMMARY_JSON}" | jq -r '.compact // false' 2>/dev/null)"
                     _is_manual="$(printf '%s' "${SUMMARY_JSON}" | jq -r '.manual // false' 2>/dev/null)"
                     _has_cmd="$(printf '%s' "${SUMMARY_JSON}" | jq -r '(.command != null)' 2>/dev/null)"
-                    _log "summary cmd=${_has_cmd} reset=${_is_reset} compact=${_is_compact} manual=${_is_manual} title=${_new_title}"
+                    _is_keep="$(printf '%s' "${SUMMARY_JSON}" | jq -r '.keep // false' 2>/dev/null)"
+                    _log "summary cmd=${_has_cmd} reset=${_is_reset} compact=${_is_compact} manual=${_is_manual} keep=${_is_keep} title=${_new_title}"
                     if [ "${_is_manual}" = "true" ]; then
                         # /tab <nome> => override manual rapido
                         printf '%s\n' "${_new_title}" >"${TITLE_FILE}"
+                    elif [ "${_is_keep}" = "true" ]; then
+                        # Continuacao ("ok", "prossiga"...) => mantem o titulo
+                        # atual E preserva o override manual, se houver.
+                        :
                     elif [ "${_is_reset}" = "true" ]; then
                         # /new, /clear, /skill, /goal, /deploy, /pr, /review ...
                         rm -f "${TITLE_FILE}"
@@ -178,8 +184,10 @@ case "${ACTION}" in
                         # /compact => resume e marca
                         rm -f "${TITLE_FILE}"
                         TITLE_AUTO="${_new_title}"
-                    elif [ -z "${TITLE_AUTO}" ] && [ ! -f "${TITLE_FILE}" ]; then
-                        # primeiro prompt sem comando slash
+                    elif [ -n "${_new_title}" ] && [ "${_new_title}" != "livre" ]; then
+                        # Nova ordem significativa substitui o titulo anterior.
+                        # O override /tab dura so ate a proxima ordem real.
+                        rm -f "${TITLE_FILE}"
                         TITLE_AUTO="${_new_title}"
                     fi
                 fi
@@ -269,29 +277,27 @@ done
 # Fallback de slot por lease (sessao sem wrapper / lease mid-session).
 # Sessao lancada sem o wrapper Agent Guard (ex: na janela entre self-update
 # do Kimi e o recovery) ou que adquiriu o slot depois do launch (ex: `source
-# .hmvip-agent-init` via tool) tem cwd fora do worktree — mas o lease em
-# .kiro/locks/agent-sessions/<id>.json carrega o PID do CLI. Casa o CLI_PID
-# com o pid do lease ativo e usa a identidade como slot.
+# .hmvip-agent-init` via tool) tem cwd fora do worktree — mas o lease ativo
+# carrega o PID do CLI. Casa o CLI_PID com o pid do slot ativo e usa a
+# identidade como slot. Leitura via facade publica agent-guard-slots
+# (helper agent-guard-slot-by-pid) — sem jq/cat direto no session storage.
 # ---------------------------------------------------------------------------
 case "$(basename "${CWD}" 2>/dev/null)" in
     hmvip-ia-*) : ;; # cwd ja identifica o slot
     *)
         _repo_root="$(git -C "${CWD}" rev-parse --show-toplevel 2>/dev/null || true)"
-        _locks_dir="${_repo_root}/.kiro/locks/agent-sessions"
-        if [ -n "${_repo_root}" ] && [ -d "${_locks_dir}" ] && command -v jq >/dev/null 2>&1; then
-            for _sf in "${_locks_dir}"/*.json; do
-                [ -f "${_sf}" ] || continue
-                _pair="$(jq -r 'select(.status=="active") | "\(.pid // 0) \(.identity // "")"' "${_sf}" 2>/dev/null || true)"
-                [ -n "${_pair}" ] || continue
-                if [ "${_pair%% *}" = "${CLI_PID}" ]; then
-                    _lease_identity="${_pair#* }"
-                    if [ -n "${_lease_identity}" ]; then
-                        SLOT="${_lease_identity}"
-                        _log "slot via lease fallback: ${SLOT} (pid ${CLI_PID})"
-                    fi
-                    break
-                fi
-            done
+        # Bin do proprio pacote do hook: o legado so exigia locks dir + jq no
+        # repo do CWD, nao a arvore de pacotes — fixtures hermeticas e repos
+        # enxutos sem packages/ continuam funcionando.
+        _hook_pkg_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../../../.." 2>/dev/null && pwd || true)"
+        _slot_by_pid_bin="${_hook_pkg_root}/packages/agent-guard-core/bin/agent-guard-slot-by-pid"
+        [ -x "${_slot_by_pid_bin}" ] || _slot_by_pid_bin="${_repo_root}/packages/agent-guard-core/bin/agent-guard-slot-by-pid"
+        if [ -n "${_repo_root}" ] && [ -x "${_slot_by_pid_bin}" ]; then
+            _lease_identity="$(AGENT_GUARD_REPO_ROOT="${_repo_root}" bash "${_slot_by_pid_bin}" "${CLI_PID}" 2>/dev/null || true)"
+            if [ -n "${_lease_identity}" ]; then
+                SLOT="${_lease_identity}"
+                _log "slot via lease fallback: ${SLOT} (pid ${CLI_PID})"
+            fi
         fi
         ;;
 esac
@@ -302,6 +308,22 @@ esac
 # de sessao da tab, para nao depender de ~/.kimi-code/tab-sessions/ estar
 # acessivel no worktree correto.
 # ---------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# Main repo efetivo do storage — mesma derivacao do kernel (_get_session_file
+# em init.sh): git-common-dir resolve o checkout principal mesmo quando o
+# hook roda dentro de um worktree. A facade precisa desse root para ler o
+# MESMO session storage que os writes kernel gravam.
+# ---------------------------------------------------------------------------
+_ag_tab_main_repo() {
+    local _gd
+    _gd="$(git -C "${CWD}" rev-parse --git-common-dir 2>/dev/null || echo ".git")"
+    if [[ "${_gd}" = /* ]]; then
+        dirname "${_gd}"
+    else
+        (cd "${CWD}/${_gd}/.." 2>/dev/null && pwd) || echo "${CWD}"
+    fi
+}
+
 _persist_tab_to_lease() {
     local _identity="$1"
     case "${_identity}" in
@@ -319,11 +341,23 @@ _persist_tab_to_lease() {
     # shellcheck source=/dev/null
     source "${_init_stub}" >/dev/null 2>&1 || return 0
 
-    local _session_file
-    _session_file="$(_get_session_file "${_identity}" 2>/dev/null || true)"
-    [ -f "${_session_file}" ] || return 0
+    # Decisao de "sessao ativa" via facade publica (F5C) — nao via
+    # _load_session_field/_get_session_file (READ proibido neste hook).
+    # Fail-open: facade indisponivel/ausente == sessao inexistente == sem
+    # persistencia, preservando o comportamento anterior.
+    local _slots_bin="${_repo_root}/packages/agent-guard-core/bin/agent-guard-slots"
+    [ -x "${_slots_bin}" ] || return 0
+    local _ag_py
+    _ag_py="$(bash "${_repo_root}/packages/agent-guard-core/bin/agent-guard-python" 2>/dev/null || echo "python3")"
     local _session_status
-    _session_status="$(_load_session_field "${_identity}" "status" 2>/dev/null || true)"
+    _session_status="$(AGENT_GUARD_REPO_ROOT="$(_ag_tab_main_repo)" bash "${_slots_bin}" --identity "${_identity}" 2>/dev/null | "${_ag_py}" -c '
+import json, sys
+try:
+    slots = json.load(sys.stdin).get("slots", [])
+except Exception:
+    slots = []
+print(slots[0].get("status", "") if slots else "")
+' 2>/dev/null || true)"
     [ "${_session_status}" = "active" ] || return 0
 
     _save_session_field "${_identity}" "tab_state" "${STATE}" >/dev/null 2>&1 || true
@@ -350,9 +384,22 @@ _clear_tab_lease_fields() {
     # shellcheck source=/dev/null
     source "${_init_stub}" >/dev/null 2>&1 || return 0
 
-    local _session_file
-    _session_file="$(_get_session_file "${_identity}" 2>/dev/null || true)"
-    [ -f "${_session_file}" ] || return 0
+    # Existencia da sessao via facade (F5C) — equivalente ao antigo
+    # [ -f "$(_get_session_file ...)" ]: so limpa quando a entrada existe,
+    # em qualquer status. Facade falhou/ausente == sem entrada == sem clear.
+    local _slots_bin="${_repo_root}/packages/agent-guard-core/bin/agent-guard-slots"
+    [ -x "${_slots_bin}" ] || return 0
+    local _ag_py
+    _ag_py="$(bash "${_repo_root}/packages/agent-guard-core/bin/agent-guard-python" 2>/dev/null || echo "python3")"
+    local _entry_count
+    _entry_count="$(AGENT_GUARD_REPO_ROOT="$(_ag_tab_main_repo)" bash "${_slots_bin}" --identity "${_identity}" 2>/dev/null | "${_ag_py}" -c '
+import json, sys
+try:
+    print(len(json.load(sys.stdin).get("slots", [])))
+except Exception:
+    print(0)
+' 2>/dev/null || echo "0")"
+    [ "${_entry_count:-0}" -ge 1 ] 2>/dev/null || return 0
 
     _save_session_field "${_identity}" "tab_state" "" >/dev/null 2>&1 || true
     _save_session_field "${_identity}" "tab_title" "" >/dev/null 2>&1 || true

@@ -1,10 +1,149 @@
 # Changelog — agent-guard-core
 
-## Unreleased — F5B Wave 1: decoupling de leitores externos (SPEC F5)
+## Unreleased
+
+(nada — próximo lote em acumulação)
+
+## 0.12.0 — 2026-09-21 (sync batch para upstream, ADR-0059)
+
+Lote consolidado desde o último sync (04/09, F5B #7419). Origem:
+hmvip-org/hmvip@develop → destino: agent-guard-AI/agent-guard-core main
+(branch `sync/from-hmvip-<sha>-<ts>`). Revisão humana obrigatória no merge
+upstream; sem auto-merge.
+
+### Crash recovery: satellites + atomic session storage (2026-09-21, #7903)
+- `_worktree_has_other_live_agent`: `_AG_AGENT_SATELLITE_COMMS` (match exato
+  de `comm`) exclui satélites com nome de agente (ex.: `kimi-webbridge`) do
+  conjunto de agentes — daemon órfão pós-crash nunca mais bloqueia adopt.
+- `_save_session` / `_clear_session`: publicação atômica (tmp + `os.replace`);
+  `_clear_session` tolera storage truncado e ainda libera (fail-safe).
+- Teste: `tests/adopt-satellite-comm-test.sh` (regressão + prova por mutação).
+
+### Release Safety F6B1–F6B3A (forense F6A concluída 2026-09-04, ADR-0058)
+- F6B1 release boundary seams (#7428); F6B2 release-safety shadow candidate +
+  differential parity + identity consistency fail-closed (#7430, #7431);
+  F6B3A caller shadow (#7433). `src/release-safety*.sh` permanecem em modo
+  **forense/observação — implementação F6B não autorizada**.
+
+### Control plane S2/S3
+- CLAIM operacional reconciliado (#7605); simplificação do control plane
+  (#7609); Verification Contract register (#7610); S3 residual closure (#7611).
+
+### Boot / token economy
+- ADR-0051 otimização de tokens no boot (#6933); ADR-0052 dispatcher e camadas
+  de boot cache (#6952); TL;DR do primeiro turno (#7072); persistência
+  automática de boot cache + correção de baseline (#7397, #7401).
+
+### Task lifecycle, identidades e wrappers
+- Task lifecycle + structured slot notes (#7174); identidade Prime + leash
+  (#7241, #7280); Luna identity/lembrete (#7126, #7129, #7194); arquitetura de
+  agents Kilo (#7031); hmvip-tab throttle (#7319); resume/boot guards (#6966,
+  #6969); dedup de alertas Slack (#6920); hotfix título de aba (#7475);
+  safe-squash (#7405); contracts e status machine (#7409); runtime forensics
+  (#7407); task note drift (#7411–#7416).
+
+### Sanitização para upstream público
+- Fixtures/comentários: e-mails e domínio de exemplo trocados para
+  `example.com` nos arquivos que estreiam no upstream (`claim-test.sh`,
+  `verify-test.sh`, `status-cross-worktree-test.sh`, comentário em
+  `push-transition.sh`). Sem credenciais no pacote (scan de conteúdo novo no
+  workflow de sync, ex.: AKIA/xoxb/PEM/JWT/webhook).
+
+### Pre-push transition SSOT — primitiva única de resolução de transição (2026-09-06, ADR-0060, contrato I10)
+
+- **P1 (governança):** `hooks/pre-push` não consumia o stdin do protocolo Git
+  (`<local-ref> <local-sha> <remote-ref> <remote-sha>`); identity audit e
+  notes eram avaliados contra `origin/$BRANCH`/`HEAD`, first push pulava o
+  audit e rewrites eram invisíveis. Agora a SSOT da operação são as tuplas do
+  stdin.
+- `hooks/push-transition.sh` (novo): classifica cada tupla (fast-forward /
+  first push / rewrite / delete / tag / notes-ref), deriva identidade e branch
+  das REFS ENVIADAS, audita identity + worktree notes no range candidato por
+  tipo de push e autoriza rewrites **apenas via rebase puro comprovado**.
+  Fail-closed em stdin vazio/malformado, trusted base ausente/ambíguo, remoção
+  real de commits (qualquer autor), deleção de branch/tag por agente, tag push
+  por agente e múltiplas refs com qualquer tupla inválida.
+- **Endurecimento arquitetural (2026-09-06/07, iterações da PR #7444):**
+  grants locais foram **removidos como boundary de autorização humana** — o
+  hook não consome grants: **remoção real de commits é BLOCK incondicional**
+  (inclusive do próprio slot); ação humana com acesso ao repositório (force
+  push direto) permanece o caminho fora do guard. Gap formal registrado no
+  ADR-0060: mecanismo futuro só será considerado autoridade verificável se
+  usar algo que a IA não consiga forjar (chave privada inacessível ao processo,
+  serviço externo de aprovação, separação real de usuário/permissão no SO ou
+  artefato autenticado equivalente) — escopo de decisão arquitetural separada
+  (alinhado à ADR-0061 GitHub-native first). Rebase puro é **comprovado**, não
+  presumido: cada commit remoto substituído exige patch equivalente (patch-id
+  estável), mesma autoria canônica, proveniência preservada (note
+  `identity:`/`branch:`), mapeamento inequívoco (zero ambiguidade) e nenhum
+  merge commit remoto removido (`rev-list --merges remote --not local` vazio).
+- **Proveniência não se fabrica no push (exigência 8):** worktree notes
+  ausentes no range candidato são **BLOCK** — o pre-push não auto-repara mais
+  notes. Uma note criada pelo próprio agente no momento do push (autor/data do
+  push, não do commit) não prova proveniência e seria autocertificação
+  circular, pois o purity check consome essas notes como prova. Notes válidas
+  são as criadas no worktree de origem (`post-commit` / `safe-squash`).
+- `hooks/pre-push`: consome a primitiva antes de qualquer lógica baseada em
+  `git branch --show-current`; validação de notes migrada para o range
+  candidato da primitiva; PAS realimentado com o stdin original; pre-flight
+  invocado com `HMVIP_PUSH_TRANSITION_AUDITED=1`.
+- HMVIP `.agent/scripts/hmvip-pre-flight-check.sh`: gates `G-AUTHOR-INTEGRITY`
+  e `G-IDENTITY-AUDIT` reconhecem `HMVIP_PUSH_TRANSITION_AUDITED=1` (auditoria
+  já feita sobre as refs reais do stdin); comportamento manual inalterado.
+- Testes: `tests/agent-guard/push-transition-test.sh` (novo, cenários A–M+O);
+  `pre-push-identity-test.sh` e `pre-push-notes-test.sh` passam a alimentar o
+  stdin do protocolo real e seedar `origin/develop`;
+  `tests/agent-guard/push-transition-grant-test.sh` (novo, reduzido: T1–T3 +
+  T5–T7 — autoridade local não autoriza, grant forjado ignorado, autoria
+  divergente, proveniência ausente, ambiguidade, merge remoto removido).
+- Sem bypass por env var na primitiva; `HMVIP_AGENT_GUARD_BYPASS=1` permanece
+  exclusivo do lease-owner-check.
+
+## 0.11.0 — Session Shadow (F4), Read decoupling F5B/C/D e Release Safety forensics (F6A)
+
+### F6A — Release Safety forensics (2026-09-04)
+
+Forense da fronteira de release (implementação **não** autorizada — F6B
+continua congelada). Materialização:
+
+- `packages/agent-guard-core/src/release-safety.sh` (novo): fronteira de
+  release definida pela forense.
+- `packages/agent-guard-core/src/release-safety-shadow.sh` (novo): shadow
+  observacional — registra decisões de release sem impor política nova.
+- Audit: `.kiro/specs/agent-guard-v1-kernel-refactor-20260903/audit/f6-release-boundary.md`.
+- Decisão: ADR-0058 (release safety policy boundary).
+
+### F5D — Lease-probe (2026-09-04, #7426)
+
+Fecha a última leitura direta externa do session storage no caminho de
+segurança:
+
+- `packages/agent-guard-core/bin/agent-guard-lease-probe` (novo): primitiva
+  pública de leitura de lease consumida por `hooks/lease-owner-check.sh`.
+- `hooks/lease-owner-check.sh` migrado do parse **sed-regex** no JSON (o parse
+  mais frágil do ecossistema) para o lease-probe. Comportamento fail-open por
+  design preservado.
+- Decisão: ADR-0057 (lease-owner-check read boundary).
+- Testes: `tests/agent-guard/lease-owner-check-test.sh` atualizado.
+
+### F5C — Tab read decoupling/shim (2026-09-04, #7423)
+
+- `packages/agent-guard-core/bin/agent-guard-slot-by-pid` (novo): resolve o
+  slot a partir de um PID para os hooks de tab, sem parse direto do session
+  storage (shim NEEDS_SHIM dos audits F5A/F5B migrado).
+- Fallback de `kimi-tab-hook.sh` e demais leituras de tab migrados para a
+  primitiva; writes `tab_*` seguem internals do kernel (sem facade de escrita).
+- Audit: `.kiro/specs/agent-guard-v1-kernel-refactor-20260903/audit/f5c-tab-decoupling-decision.md`.
+
+### F5B Wave 1 — decoupling de leitores externos (SPEC F5)
 
 Remove leituras diretas do session storage por consumidores externos. Nenhum
 write migrado; semântica de fail-open e comportamento por estado preservados.
 
+- **F5 CLOSED (2026-09-04) — 0 external direct readers** no session storage.
+  Com F5C (#7423) e F5D (#7426) merged, todas as primitivas públicas de
+  leitura (`slots`, `slot-by-pid`, `lease-probe`) estão no lugar; ver
+  `.kiro/specs/agent-guard-v1-kernel-refactor-20260903/audit/f5-consumer-map.md`.
 - `packages/agent-guard-core/bin/agent-guard-slots` (novo): facade pública
   leve e read-only sobre o session storage. `[--identity <id>]`, saída JSON
   `{"schema_version":3,"command":"slots",...}` com campos RAW (`status, role,
@@ -24,13 +163,14 @@ write migrado; semântica de fail-open e comportamento por estado preservados.
 - Testes: `tests/agent-guard/f5b-decoupling-test.sh` (15 checks herméticos:
   campos RAW, `--identity`, fail-open, equivalência de decisão direto-vs-facade
   e anti-regressão por grep).
-- NÃO tocados (conforme escopo F5B): `hooks/lease-owner-check.sh`
-  (DO_NOT_TOUCH), writes `tab_*` de `agent-guard-tab.sh`/`agent-guard-session-end.sh`,
-  fallback de `kimi-tab-hook.sh` (NEEDS_SHIM, F5C), bloco legado G8.2 em
-  `ci-core.yml` (path morto `agent-leases/`, remoção em PR separado).
+- Pendentes de rodadas separadas (fora do escopo F5): bloco legado G8.2 em
+  `ci-core.yml` (path morto `agent-leases/`, remoção em PR separado) e a
+  consolidação da segunda implementação de parse em `src/continue-all.sh`.
+  Os itens antes listados como "não tocados" (`hooks/lease-owner-check.sh`,
+  fallback de `kimi-tab-hook.sh`) foram migrados em F5D/F5C.
 - Audit: `.kiro/specs/agent-guard-v1-kernel-refactor-20260903/audit/f5b-wave1-decision.md`.
 
-## Unreleased — Session Shadow / Liveness API (SPEC F4)
+### F4 — Session Shadow / Liveness API
 
 Adiciona o Session Shadow: snapshot leve e read-only de liveness por slot,
 consumível por Agent Ops / AOL para decisões de cleanup.

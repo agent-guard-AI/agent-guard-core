@@ -21,7 +21,11 @@
 # Bypass manual (humano em recuperação consciente):
 #   HMVIP_AGENT_GUARD_BYPASS=1 git commit ...
 #
-# Override para testes: AGENT_GUARD_SESSION_DIR=<dir com JSONs de sessão>
+# Leitura: fronteira ADR-0057 — este hook NÃO lê nem parseia
+# .kiro/locks/agent-sessions/*.json. Toda leitura vai pela primitiva
+# pública read-only `bin/agent-guard-lease-probe` (bash puro, <=30 ms,
+# sem reconcile/network). Override de teste: AGENT_GUARD_SESSION_DIR
+# (honrado pela primitiva).
 
 # Caminha a cadeia de PPIDs procurando o PID do lease.
 _lease_is_ancestor() {
@@ -47,39 +51,31 @@ lease_owner_check() {
     worktree_root="$(git rev-parse --show-toplevel 2>/dev/null)" || return 0
     [[ -n "${worktree_root}" ]] || return 0
 
-    # Raiz do repo principal (worktrees compartilham o .git comum): os session
-    # files vivem no repo principal, não no worktree.
-    local common_dir main_root
-    common_dir="$(cd "$(git rev-parse --git-common-dir 2>/dev/null)" 2>/dev/null && pwd)" || return 0
-    main_root="$(dirname "${common_dir}")"
-
-    # Diretório de sessões: override de teste → config → default.
-    local session_dir="${AGENT_GUARD_SESSION_DIR:-}"
-    if [[ -z "${session_dir}" ]]; then
-        local cfg="${worktree_root}/packages/agent-guard-core/bin/agent-guard-config"
-        local rel=""
-        if [[ -f "${cfg}" ]]; then
-            rel="$(bash "${cfg}" get paths.session_storage '' 2>/dev/null)"
-        fi
-        session_dir="${main_root}/${rel:-.kiro/locks/agent-sessions}"
-    fi
-    [[ -d "${session_dir}" ]] || return 0
-
-    local files=()
-    if [[ -n "${identity}" ]]; then
-        [[ -f "${session_dir}/${identity}.json" ]] && files=("${session_dir}/${identity}.json")
-    else
-        files=("${session_dir}"/*.json)
+    # Primitiva pública read-only (ADR-0057) — mesma derivação de main repo e
+    # mesmo parse tolerante do legado, encapsuladas no kernel boundary.
+    # Sem source de init.sh, sem python/jq, sem reconcile, sem network.
+    local probe_bin
+    probe_bin="$(cd "$(dirname "${BASH_SOURCE[0]}")/../bin" 2>/dev/null && pwd)/agent-guard-lease-probe"
+    if [[ ! -x "${probe_bin}" ]]; then
+        # Fail-open aprovado pela ADR-0057 §4: primitiva ausente = sem leases.
+        echo "⚠️  [GUARD] agent-guard-lease-probe ausente; guard L186 sem efeito" >&2
+        return 0
     fi
 
-    local f status pid wt_path owner
-    for f in "${files[@]}"; do
-        [[ -f "${f}" ]] || continue
-        status="$(sed -n 's/.*"status": *"\([^"]*\)".*/\1/p' "${f}" | head -1)"
+    local probe_args=(--worktree "${worktree_root}")
+    [[ -n "${identity}" ]] && probe_args+=(--identity "${identity}")
+
+    local probe_out
+    probe_out="$(bash "${probe_bin}" "${probe_args[@]}" 2>/dev/null)" || probe_out=""
+
+    local owner status pid wt_path
+    # Mesma tabela de decisão do legado (suíte L186 é o contrato):
+    # bloqueio SOMENTE no quádruplo match — active + PID vivo +
+    # worktree_path == toplevel + processo atual não descendente do dono.
+    while IFS=$'\t' read -r owner status pid wt_path; do
+        [[ -n "${owner}" ]] || continue
         [[ "${status}" == "active" ]] || continue
-        wt_path="$(sed -n 's/.*"worktree_path": *"\([^"]*\)".*/\1/p' "${f}" | head -1)"
         [[ "${wt_path}" == "${worktree_root}" ]] || continue
-        pid="$(sed -n 's/.*"pid": *\([0-9][0-9]*\).*/\1/p' "${f}" | head -1)"
         [[ "${pid}" =~ ^[0-9]+$ ]] || continue
         # Lease morto (sessão fechou sem release): permite — fluxo adopt/recovery.
         kill -0 "${pid}" 2>/dev/null || continue
@@ -91,7 +87,6 @@ lease_owner_check() {
             return 0
         fi
 
-        owner="$(basename "${f}" .json)"
         cat >&2 <<EOF
 ❌❌❌ BLOQUEADO: WORKTREE ALUGADO POR OUTRA SESSÃO ❌❌❌
 
@@ -110,7 +105,7 @@ O que fazer:
   • Humano em recuperação consciente: HMVIP_AGENT_GUARD_BYPASS=1 <comando>
 EOF
         return 1
-    done
+    done <<< "${probe_out}"
 
     return 0
 }
