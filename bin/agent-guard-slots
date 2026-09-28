@@ -75,6 +75,13 @@ if [[ -z "${SESSION_STORAGE}" ]]; then
 fi
 SESSION_STORAGE="${SESSION_STORAGE:-.agent-guard/sessions}"
 SESSION_DIR="${REPO_ROOT}/${SESSION_STORAGE}"
+# Sem yaml, espelhar o glob legado dos tab hooks: o ecossistema HMVIP
+# historicamente usou .kiro/locks/agent-sessions. Repos sem yaml que ainda
+# carregam esse diretorio (ex: fixtures hermeticas) mantem a semantica do
+# leitor direto que a facade substitui. Repos com yaml seguem o yaml.
+if [[ ! -f "${REPO_ROOT}/agent-guard.yaml" && -d "${REPO_ROOT}/.kiro/locks/agent-sessions" ]]; then
+    SESSION_DIR="${REPO_ROOT}/.kiro/locks/agent-sessions"
+fi
 
 export _AG_SLOTS_DIR="${SESSION_DIR}"
 export _AG_SLOTS_IDENTITY_FILTER="${IDENTITY_FILTER}"

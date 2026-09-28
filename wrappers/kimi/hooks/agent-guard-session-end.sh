@@ -52,8 +52,33 @@ function _ag_session_end_main() {
         return 0
     fi
 
-    local session_status
-    session_status="$(_load_session_field "${identity}" "status" 2>/dev/null || true)"
+    # Decisao de "sessao ativa" via facade publica (F5C) — nao via
+    # _load_session_field (READ proibido neste hook). Fail-open: facade
+    # indisponivel/ausente == inativo == retorno silencioso, como antes.
+    # Root = mesma derivacao do kernel (git-common-dir): a facade le o MESMO
+    # storage que _get_session_file/_auto_release_if_safe usam.
+    local _se_main_repo _gd
+    _gd="$(git -C "${PWD}" rev-parse --git-common-dir 2>/dev/null || echo ".git")"
+    if [[ "${_gd}" = /* ]]; then
+        _se_main_repo="$(dirname "${_gd}")"
+    else
+        _se_main_repo="$(cd "${PWD}/${_gd}/.." 2>/dev/null && pwd || echo "${PWD}")"
+    fi
+    local _slots_bin="${_se_main_repo}/packages/agent-guard-core/bin/agent-guard-slots"
+    if [[ -x "${_slots_bin}" ]]; then
+        local _ag_py
+        _ag_py="$(bash "${_se_main_repo}/packages/agent-guard-core/bin/agent-guard-python" 2>/dev/null || echo "python3")"
+        session_status="$(AGENT_GUARD_REPO_ROOT="${_se_main_repo}" bash "${_slots_bin}" --identity "${identity}" 2>/dev/null | "${_ag_py}" -c '
+import json, sys
+try:
+    slots = json.load(sys.stdin).get("slots", [])
+except Exception:
+    slots = []
+print(slots[0].get("status", "") if slots else "")
+' 2>/dev/null || true)"
+    else
+        session_status=""
+    fi
     [[ "${session_status}" == "active" ]] || return 0
 
     local worktree_path

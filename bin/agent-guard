@@ -264,6 +264,18 @@ function _agent_guard_main() {
             _task_cli_main "$@"
             return $?
             ;;
+        claim|c)
+            # F0-F S2: CLAIM lifecycle (claim.sh carrega task-lifecycle.sh).
+            source "${SCRIPT_DIR}/src/claim.sh"
+            _claim_cli_main "$@"
+            return $?
+            ;;
+        verify|v)
+            # F0-F S3: VERIFICATION register (verify.sh carrega claim.sh).
+            source "${SCRIPT_DIR}/src/verify.sh"
+            _verify_cli_main "$@"
+            return $?
+            ;;
         safe-squash|sq)
             source "${SCRIPT_DIR}/src/safe-squash.sh" "$@"
             return $?
@@ -288,7 +300,7 @@ function _agent_guard_main() {
             ;;
         *)
             echo "❌ Unknown command or identity: ${COMMAND}" >&2
-            echo "   Commands: init, status (s), release (r), switch (sw), attach (a), adopt (ad), triage, journal (j), resume (res), checkpoint (cp), session (sess), prune, cleanup-stale (cs), orphan-sweep (os), tab, tabs, grid, task (t), safe-squash (sq), shadow (sh), slots" >&2
+            echo "   Commands: init, status (s), release (r), switch (sw), attach (a), adopt (ad), triage, journal (j), resume (res), checkpoint (cp), session (sess), prune, cleanup-stale (cs), orphan-sweep (os), tab, tabs, grid, task (t), claim (c), verify (v), safe-squash (sq), shadow (sh), slots" >&2
             echo "   Identities are loaded from agent-guard.yaml." >&2
             return 1
             ;;

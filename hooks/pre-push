@@ -63,6 +63,34 @@ PROTECTED_BRANCHES="$(_get_config git.protected_branches 'main master develop')"
 NOTES_REF="$(_get_config git.notes_ref 'refs/notes/agent-guard-worktree')"
 BASE_BRANCH="$(_get_config git.base_branch 'develop')"
 
+# -------------------------------------------------------------------------
+# SSOT de transição — consome as tuplas REAIS do protocolo Git (stdin):
+#   <local-ref> <local-sha> <remote-ref> <remote-sha>
+#
+# A primitiva (hooks/push-transition.sh) é a única fonte de verdade da
+# operação: classifica cada tupla (fast-forward / first push / rewrite /
+# delete / tag / notes), deriva identidade e branch das REFS ENVIADAS,
+# audita identity + worktree notes no range candidato e autoriza rewrites
+# (policy de commits próprios + grant escopado single-use). Fail-closed em
+# qualquer dúvida. Deve rodar ANTES de qualquer lógica baseada em
+# `git branch --show-current` ou `origin/$BRANCH`.
+# -------------------------------------------------------------------------
+TRANSITION_LIB="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/push-transition.sh"
+if [[ -f "${TRANSITION_LIB}" ]]; then
+    # shellcheck source=push-transition.sh
+    source "${TRANSITION_LIB}"
+    if ! push_transition_audit "${1:-origin}"; then
+        exit 1
+    fi
+    # A ref realmente enviada passa a ser a SSOT do restante do hook.
+    if [[ -n "${PT_BRANCH:-}" ]]; then
+        BRANCH="${PT_BRANCH}"
+    fi
+else
+    echo "❌ push-transition.sh não encontrado (${TRANSITION_LIB}). Falhando fechado." >&2
+    exit 1
+fi
+
 is_protected_branch() {
     local branch="$1"
     for protected in ${PROTECTED_BRANCHES}; do
@@ -74,7 +102,8 @@ is_protected_branch() {
 }
 
 # Resolve an author email to a configured agent identity (e.g. kimi7).
-# Prints the identity or an empty string for human/non-agent emails.
+# Kept for message display; the authoritative identity derivation for the
+# push operation lives in push-transition.sh (derived from the refs sent).
 _resolve_identity_from_email() {
     local email="$1"
     local domain=""
@@ -202,72 +231,13 @@ if [[ -z "${IDENTITY}" ]]; then
 fi
 
 # -------------------------------------------------------------------------
-# Worktree origin notes validation + auto-repair
+# Worktree origin notes validation
 # -------------------------------------------------------------------------
-_ensure_worktree_notes() {
-    if ! git rev-parse --verify --quiet "origin/${BASE_BRANCH}" >/dev/null 2>&1; then
-        return 0
-    fi
-
-    local range="origin/${BASE_BRANCH}..HEAD"
-    local missing=0
-    local hash subject email commit_identity
-
-    while IFS= read -r hash; do
-        [[ -z "${hash}" ]] && continue
-
-        subject="$(git log -1 --pretty=%s "${hash}" 2>/dev/null || echo "")"
-        email="$(git log -1 --pretty=%ae "${hash}" 2>/dev/null || echo "")"
-        commit_identity="$(_resolve_identity_from_email "${email}")"
-        [[ -z "${commit_identity}" ]] && continue
-
-        if git notes --ref="${NOTES_REF}" show "${hash}" >/dev/null 2>&1; then
-            continue
-        fi
-
-        # Auto-repair is safe only when the commit author matches the current
-        # worktree identity. Commits from other agents must be fixed manually.
-        if [[ -n "${IDENTITY}" && "${email}" == "${AUTHOR_EMAIL}" ]]; then
-            local note_content
-            note_content="worktree:${REPO_ROOT}
-identity:${IDENTITY}
-branch:${BRANCH}"
-            if git notes --ref="${NOTES_REF}" add -f -m "${note_content}" "${hash}" >/dev/null 2>&1; then
-                echo "   🔧 Auto-repaired worktree note for ${hash:0:8} (${subject})" >&2
-                continue
-            fi
-        fi
-
-        echo "   ❌ Commit ${hash:0:8} (${subject}) is missing a worktree origin note." >&2
-        echo "      Author: ${email}" >&2
-        if [[ -n "${IDENTITY}" ]]; then
-            echo "      Fix (run from this worktree):" >&2
-            echo "        git notes --ref=${NOTES_REF} add -m 'worktree:${REPO_ROOT}" >&2
-            echo "identity:${IDENTITY}" >&2
-            echo "branch:${BRANCH}' ${hash}" >&2
-        else
-            echo "      Fix: add a worktree note on the correct AI worktree." >&2
-        fi
-        missing=$((missing + 1))
-    done < <(git log "${range}" --no-merges --pretty=%H 2>/dev/null)
-
-    if [[ "${missing}" -gt 0 ]]; then
-        echo "" >&2
-        echo "❌❌❌ PUSH BLOCKED: MISSING WORKTREE NOTES ❌❌❌" >&2
-        echo "" >&2
-        echo "${missing} AI commit(s) lack the required worktree origin note." >&2
-        echo "This usually happens when a commit is created without the post-commit" >&2
-        echo "hook (e.g. recovery, bypass, or a corrupted hook)." >&2
-        echo "" >&2
-        echo "Run the suggested 'git notes' command for each commit above, then push again." >&2
-        echo "" >&2
-        exit 1
-    fi
-}
-
-if [[ -n "${IDENTITY}" ]]; then
-    _ensure_worktree_notes
-fi
+# NOTA: a validação de notes no range candidato agora vive na primitiva de
+# transição (push-transition.sh → _pt_audit_notes), que audita o range REAL da
+# tupla enviada (fast-forward: remote..local; first push e rewrite:
+# trusted_base..local). Notes ausentes são BLOCK — sem auto-repair no push.
+# Nada aqui embaixo duplica essa lógica.
 
 # -------------------------------------------------------------------------
 # Invalidate the open-PR cache for this identity after a push, so the next
@@ -291,7 +261,8 @@ fi
 # -------------------------------------------------------------------------
 PAS_SCAN="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/pas-sensitive-scan.sh"
 if [[ -f "${PAS_SCAN}" ]]; then
-    bash "${PAS_SCAN}" || true
+    # Realimenta o stdin original das tuplas (a primitiva já o consumiu).
+    printf '%s\n' "${PT_STDIN_LINES[@]}" | bash "${PAS_SCAN}" || true
 fi
 
 # -------------------------------------------------------------------------
@@ -305,7 +276,11 @@ fi
 PRE_FLIGHT="${REPO_ROOT}/.agent/scripts/hmvip-pre-flight-check.sh"
 if [[ -f "${PRE_FLIGHT}" ]]; then
     echo "🔍 [GUARD] Running local pre-flight quality gates..."
-    if ! bash "${PRE_FLIGHT}"; then
+    # A primitiva de transição já audiou identity + author-integrity sobre as
+    # refs REAIS do stdin (ranges por tipo de push). Os gates G-AUTHOR-INTEGRITY
+    # e G-IDENTITY-AUDIT do pre-flight reconhecem essa flag e pulam a
+    # re-auditoria legada (HEAD/origin-$BRANCH), que veria refs erradas.
+    if ! HMVIP_PUSH_TRANSITION_AUDITED=1 bash "${PRE_FLIGHT}"; then
         echo ""
         echo "❌ [GUARD] Pre-flight local failed. Fix before pushing."
         echo "   Run manually: bash ${PRE_FLIGHT}"

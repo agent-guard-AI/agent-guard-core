@@ -1,0 +1,291 @@
+#!/usr/bin/env bash
+# agent-guard-resume — seleção + aquisição atômica de sessão resumível
+# (Wave C, ADR-0064, SPEC-AGENT-GUARD-SEMANTICS-KERNEL).
+#
+# Substitui o padrão legado "ler journal → cd → source init" (TOCTOU entre a
+# leitura e a aquisição — cenário S3) por UMA transição atômica sob flock:
+# seleção do candidato E aquisição do lease acontecem dentro da mesma região
+# crítica, com CAS no session JSON (só adquire se livre/claimable) e lease
+# contendo session_token uuid4 (reclaim/release compare-and-clear por token,
+# invariante 9 da skill agent-guard-critical-change).
+#
+# Uso:
+#   agent-guard resume --prefix <prefix> [--print-env] [--shadow] [--repo <path>]
+#
+# Saída:
+#   default/--print-env: após adquirir, imprime VAR=valor (quoted) para eval
+#     pelo wrapper. Sem candidato ou falha: nada em stdout, exit != 0.
+#   --shadow: NÃO adquire nem grava nada; imprime o worktree que ESCOLHERIA
+#     na primeira linha (vazio se nenhum). Modo observação (ADR-0058) —
+#     usado para ganhar confiança antes do GO do owner virar default.
+#
+# Fail-closed: lock não obtido, storage ilegível ou CAS negado => exit != 0
+# e ZERO estado ativo novo (crash/falha nunca deixa claim fantasma —
+# invariante 6: a gravação do lease é a ÚLTIMA etapa, atômica).
+
+set -euo pipefail
+
+PREFIX=""
+PRINT_ENV=0
+SHADOW=0
+REPO_ROOT="${AGENT_GUARD_REPO_ROOT:-}"
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        resume) shift ;;
+        --prefix) PREFIX="${2:-}"; shift 2 ;;
+        --print-env) PRINT_ENV=1; shift ;;
+        --shadow) SHADOW=1; shift ;;
+        --repo) REPO_ROOT="${2:-}"; shift 2 ;;
+        -h|--help) sed -n '2,20p' "${BASH_SOURCE[0]}"; exit 0 ;;
+        *) echo "❌ argumento desconhecido: $1" >&2; exit 2 ;;
+    esac
+done
+
+if [[ -z "${PREFIX}" ]]; then
+    echo "❌ --prefix é obrigatório (ex: kiro)" >&2
+    exit 2
+fi
+if [[ -z "${REPO_ROOT}" ]]; then
+    REPO_ROOT="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
+fi
+
+PKG="${REPO_ROOT}/packages/agent-guard-core"
+LIB="${PKG}/src/guard-semantics.sh"
+if [[ -r "${LIB}" ]]; then
+    # shellcheck disable=SC1090
+    . "${LIB}"
+fi
+
+STORAGE="${REPO_ROOT}/.kiro/locks/agent-sessions"
+mkdir -p "${STORAGE}" 2>/dev/null || true
+LOCK_FILE="${STORAGE}/.resume-${PREFIX}.lock"
+JOURNAL_REL="$("${PKG}/bin/agent-guard-config" get journal.path ".agent-guard/journal/agent-guard.jsonl" 2>/dev/null || echo ".agent-guard/journal/agent-guard.jsonl")"
+JOURNAL="${REPO_ROOT}/${JOURNAL_REL}"
+
+export RESUME_PREFIX="${PREFIX}" RESUME_REPO="${REPO_ROOT}" RESUME_JOURNAL="${JOURNAL}" \
+       RESUME_STORAGE="${STORAGE}" RESUME_SHADOW="${SHADOW}" RESUME_PID="${PPID}"
+
+# ---------------------------------------------------------------------------
+# Região crítica: flock exclusivo por até 30s. Todo o resto roda dentro.
+# ---------------------------------------------------------------------------
+(
+    flock -x -w 30 9 || exit 71
+
+    python3 - <<'PY'
+import json, os, re, subprocess, sys, time, uuid
+
+prefix = os.environ["RESUME_PREFIX"]
+repo = os.environ["RESUME_REPO"]
+journal_path = os.environ["RESUME_JOURNAL"]
+storage = os.environ["RESUME_STORAGE"]
+shadow = os.environ.get("RESUME_SHADOW") == "1"
+caller_pid = int(os.environ.get("RESUME_PID", "0") or 0)
+
+ident_re = re.compile(rf"^{re.escape(prefix)}\d+$")
+
+def boot_id():
+    try:
+        with open("/proc/sys/kernel/random/boot_id") as fh:
+            return fh.read().strip()
+    except Exception:
+        return None
+
+def proc_starttime(pid):
+    try:
+        with open(f"/proc/{int(pid)}/stat") as fh:
+            return int(fh.read().rsplit(")", 1)[1].split()[19])
+    except Exception:
+        return None
+
+def run_git(wt, *args):
+    try:
+        p = subprocess.run(["git", "-C", wt, *args], capture_output=True, text=True, timeout=30)
+        # rstrip apenas quebras de linha: NUNCA strip geral — o porcelain v1
+        # usa leading space como status (" M file") e strip() comeria o
+        # prefixo e corromperia o path extraído.
+        return p.returncode, p.stdout.rstrip("\r\n")
+    except Exception:
+        return 1, ""
+
+def worktree_state(wt, identity):
+    """Replica ag_worktree_state (clean/dirty_residue ok; resto skip)."""
+    rc, _ = run_git(wt, "rev-parse", "--is-inside-work-tree")
+    if rc != 0:
+        return "unverifiable"
+    rc, gitdir = run_git(wt, "rev-parse", "--absolute-git-dir")
+    if rc != 0 or not gitdir:
+        return "unverifiable"
+    for op in ("rebase-merge", "rebase-apply", "MERGE_HEAD",
+               "CHERRY_PICK_HEAD", "REVERT_HEAD", "sequencer"):
+        if os.path.exists(os.path.join(gitdir, op)):
+            return "mid_operation"
+    rc, out = run_git(wt, "status", "--porcelain=v1")
+    if rc != 0:
+        return "unverifiable"
+    residue = (
+        f".agent-guard/tasks/{identity}.md",
+        ".agent-guard/journal",
+        ".agent-guard/session",
+    )
+    for line in out.splitlines():
+        if not line:
+            continue
+        path = line[3:]
+        path = path.strip('"')
+        if any(path == r or path.startswith(r + "/") or r.startswith(path + "/")
+               for r in residue):
+            continue
+        return "dirty_work"
+    return "ok"
+
+def session_file(identity):
+    return os.path.join(storage, f"{identity}.json")
+
+def lease_claimable(identity):
+    """Replica ag_lease_claimable (0 claimable / 1 held / 2 indeterminate)."""
+    path = session_file(identity)
+    if not os.path.exists(path):
+        return 0
+    try:
+        with open(path, encoding="utf-8", errors="replace") as fh:
+            d = json.load(fh)
+    except Exception:
+        return 2
+    if d.get("status") != "active":
+        return 0
+    pid = d.get("pid")
+    if not pid:
+        return 0
+    sess_boot = d.get("boot_id")
+    cur_boot = boot_id()
+    if sess_boot and cur_boot and sess_boot != cur_boot:
+        return 0
+    try:
+        os.kill(int(pid), 0)
+    except Exception:
+        return 0
+    try:
+        with open(f"/proc/{int(pid)}/stat") as fh:
+            state = fh.read().rsplit(")", 1)[1].split()[0]
+        if state in ("Z", "X", "x", "T"):
+            return 0
+    except Exception:
+        pass
+    sess_st = d.get("pid_starttime")
+    if sess_st is not None:
+        cur_st = proc_starttime(pid)
+        if cur_st is not None and int(sess_st) != cur_st:
+            return 0
+    return 1
+
+def select_candidate():
+    """Último evento init/attach do prefixo cujo worktree é resumível."""
+    if not os.path.isfile(journal_path):
+        return None
+    try:
+        with open(journal_path, encoding="utf-8", errors="replace") as fh:
+            lines = fh.readlines()[-2000:]
+    except Exception:
+        return None
+    events = []
+    for line in reversed(lines):
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            e = json.loads(line)
+        except Exception:
+            continue
+        if e.get("action") not in ("init", "attach"):
+            continue
+        ident = e.get("identity", "")
+        if not ident_re.match(ident):
+            continue
+        events.append(e)
+    for e in events:
+        wt = e.get("worktree", "")
+        branch = e.get("branch", "")
+        identity = e.get("identity", "")
+        if not wt or not branch or not os.path.isdir(wt):
+            continue
+        if os.path.isdir(os.path.join(wt, ".git")) is False and \
+           os.path.isfile(os.path.join(wt, ".git")) is False:
+            continue
+        rc, cur = run_git(wt, "branch", "--show-current")
+        if rc != 0 or not cur or cur.startswith("_released/") or cur in ("develop", "HEAD"):
+            continue
+        rc, _ = run_git(wt, "show-ref", "--verify", "--quiet", f"refs/heads/{branch}")
+        if rc != 0:
+            continue
+        claim = lease_claimable(identity)
+        if claim != 0:
+            continue
+        if worktree_state(wt, identity) != "ok":
+            continue
+        return {"identity": identity, "worktree": wt, "branch": branch}
+    return None
+
+candidate = select_candidate()
+if candidate is None:
+    sys.exit(72)  # nenhum candidato — wrapper cai no legado/free-slot
+
+if shadow:
+    log_path = os.path.join(repo, ".agent-guard", "journal", "resume-shadow.jsonl")
+    try:
+        os.makedirs(os.path.dirname(log_path), exist_ok=True)
+        rec = {"ts": time.time(), "selector": "tx",
+               "pick": candidate["worktree"] if candidate else None}
+        with open(log_path, "a", encoding="utf-8") as fh:
+            fh.write(json.dumps(rec) + "\n")
+    except Exception:
+        pass
+    print(candidate["worktree"] if candidate else "")
+    sys.exit(0)
+
+# --- CAS: reler lease sob lock e adquirir só se ainda claimable -----------
+claim = lease_claimable(candidate["identity"])
+if claim != 0:
+    sys.exit(73)  # perdido a corrida dentro do lock (outro claimant venceu)
+
+token = str(uuid.uuid4())
+boot = boot_id()
+now_mono = time.monotonic()
+now_epoch = time.time()
+session = {
+    "identity": candidate["identity"],
+    "status": "active",
+    "role": "",
+    "branch": candidate["branch"],
+    "pid": caller_pid,
+    "pid_starttime": proc_starttime(caller_pid),
+    "boot_id": boot,
+    "timestamp": now_epoch,
+    "last_activity": now_epoch,
+    "last_activity_mono": now_mono,
+    "activity_boot_id": boot,
+    "lease_schema": 2,
+    "session_token": token,
+    "worktree_path": candidate["worktree"],
+    "impact_plugins": [],
+    "resumed_via": "agent-guard-resume",
+}
+path = session_file(candidate["identity"])
+tmp = path + ".tmp.resume"
+try:
+    with open(tmp, "w", encoding="utf-8") as fh:
+        json.dump(session, fh, indent=2)
+    os.replace(tmp, path)
+except Exception:
+    sys.exit(74)  # falha de escrita: sem claim fantasma (nada foi publicado)
+
+print(f"AGENT_GUARD_WORKTREE_PATH={json.dumps(candidate['worktree'])}")
+print(f"AGENT_GUARD_IDENTITY={json.dumps(candidate['identity'])}")
+print(f"AG_BRANCH={json.dumps(candidate['branch'])}")
+print(f"AG_SESSION_TOKEN={json.dumps(token)}")
+PY
+) 9>"${LOCK_FILE}"
+rc=$?
+
+# exit 72/73/74 e falhas: nada em stdout, wrapper segue caminho legado.
+exit "${rc}"

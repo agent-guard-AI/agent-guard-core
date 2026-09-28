@@ -57,6 +57,20 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 AG_PYTHON="$(bash "${SCRIPT_DIR}/../bin/agent-guard-python" 2>/dev/null || echo "python3")"
 export AG_PYTHON
 
+# Guard Semantics Kernel (ADR-0064): canonical tri-state predicates, lease
+# identity helpers (starttime/boot_id/monotonic) and staleness — shared with
+# the wrappers. Fail-open on purpose: init keeps working if the lib is absent.
+_AG_SEMANTICS_LIB="${SCRIPT_DIR}/guard-semantics.sh"
+if [[ -r "${_AG_SEMANTICS_LIB}" ]]; then
+    # shellcheck disable=SC1090
+    . "${_AG_SEMANTICS_LIB}"
+fi
+_AG_DECISIONS_LIB="${SCRIPT_DIR}/guard-decisions.sh"
+if [[ -r "${_AG_DECISIONS_LIB}" ]]; then
+    # shellcheck disable=SC1090
+    . "${_AG_DECISIONS_LIB}"
+fi
+
 # The guard config lives at the repository root. The init script is shipped
 # inside packages/agent-guard-core/src, so we walk up from SCRIPT_DIR until we
 # find a git repository that owns agent-guard.yaml.
@@ -154,6 +168,17 @@ if [[ -f "${TASK_LIFECYCLE_SCRIPT}" ]]; then
 fi
 
 # ---------------------------------------------------------------------------
+# 1.6.0b Load F0-F S2 claim lifecycle (depende do task lifecycle)
+# ---------------------------------------------------------------------------
+CLAIM_SCRIPT="${SCRIPT_DIR}/claim.sh"
+if [[ -f "${CLAIM_SCRIPT}" ]]; then
+    _AG_INIT_OLD_FLAGS_TMP="$(set +o)"
+    source "${CLAIM_SCRIPT}"
+    eval "${_AG_INIT_OLD_FLAGS_TMP}" 2>/dev/null || true
+    unset _AG_INIT_OLD_FLAGS_TMP
+fi
+
+# ---------------------------------------------------------------------------
 # 1.6.1 Load release helpers (global scope)
 # ---------------------------------------------------------------------------
 # These functions must be available even when AGENT_GUARD_FUNCTIONS_ONLY=1,
@@ -161,6 +186,17 @@ fi
 RELEASE_HELPERS_SCRIPT="${SCRIPT_DIR}/release-helpers.sh"
 if [[ -f "${RELEASE_HELPERS_SCRIPT}" ]]; then
     source "${RELEASE_HELPERS_SCRIPT}"
+fi
+
+# ---------------------------------------------------------------------------
+# F6B3A: release-safety SHADOW adapter (SHADOW MODE, default OFF — flag
+# AGENT_GUARD_RELEASE_SAFETY_SHADOW=1). Compute-only: o legado abaixo
+# permanece 100% authoritative; o adapter só observa/compara/diagnostica em
+# stderr quando a flag está ligada. Sem schema/storage/journal.
+# ---------------------------------------------------------------------------
+RELEASE_SAFETY_SHADOW_SCRIPT="${SCRIPT_DIR}/release-safety-shadow.sh"
+if [[ -f "${RELEASE_SAFETY_SHADOW_SCRIPT}" ]]; then
+    source "${RELEASE_SAFETY_SHADOW_SCRIPT}"
 fi
 
 # ---------------------------------------------------------------------------
@@ -641,6 +677,14 @@ _AG_OTHER_AGENT_CACHE_TS=""
 _AG_OTHER_AGENT_CACHE_WORKTREE=""
 _AG_OTHER_AGENT_CACHE_RESULT=""
 
+# Agent-name satellites: helper daemons that carry an agent name (browser
+# bridge, LSP, telemetry) but are NOT agent sessions. They must never count
+# as live occupants of a worktree — after an aggressive terminal crash they
+# survive orphaned with cwd inside a worktree and would block adopt forever
+# (incident 2026-09-21: idle kimi-webbridge pinned the kimi3 worktree).
+# Space-separated exact `comm` names; extend as new satellites appear.
+_AG_AGENT_SATELLITE_COMMS="kimi-webbridge"
+
 # Walk the cached PPID map and return the top-most (root) agent process that
 # owns this process tree. We keep walking instead of stopping at the first
 # agent because args-based detection can flag the current shell/wrapper itself
@@ -701,13 +745,20 @@ _worktree_has_other_live_agent() {
     # awk pass. We then compute the transitive descendant set of all agent
     # processes; shell only reads cwd for those candidates.
     local candidates
-    candidates="$(printf '%s' "${ps_output}" | awk '
+    candidates="$(printf '%s' "${ps_output}" | awk -v satellites="${_AG_AGENT_SATELLITE_COMMS}" '
     {
         pid=$1; ppid=$2; comm=$3;
         args=""; for (i=4; i<=NF; i++) args = args $i " ";
         children[ppid] = children[ppid] " " pid;
         ppid_map[pid] = ppid;
-        if (comm == "kimi-code" || comm == "claude" || comm == "gemini" || comm == "grok" || comm == "cursor" || comm == "antigravity" || comm == "kiro" || comm == "kimi" || args ~ /(^|[^[:alnum:]_])(kimi-code|claude|gemini|grok|cursor|antigravity|kiro|kimi)([^[:alnum:]_]|$)/) {
+        # Satellites share the agent name but are not agent sessions; they
+        # must never mark a worktree as occupied.
+        is_satellite = 0;
+        nsat = split(satellites, sat_list, " ");
+        for (s = 1; s <= nsat; s++) {
+            if (comm == sat_list[s]) { is_satellite = 1; break; }
+        }
+        if (!is_satellite && (comm == "kimi-code" || comm == "claude" || comm == "gemini" || comm == "grok" || comm == "cursor" || comm == "antigravity" || comm == "kiro" || comm == "kimi" || args ~ /(^|[^[:alnum:]_])(kimi-code|claude|gemini|grok|cursor|antigravity|kiro|kimi)([^[:alnum:]_]|$)/)) {
             agents[pid] = 1;
         }
     }
@@ -835,6 +886,13 @@ with open('${session_file}') as f:
 if d.get('status') != 'active':
     raise SystemExit(1)
 d['last_activity'] = time.time()
+# Wave B (ADR-0064): monotonic pair — staleness immune to NTP steps. Additive.
+try:
+    with open('/proc/sys/kernel/random/boot_id') as _bf:
+        d['activity_boot_id'] = _bf.read().strip()
+except Exception:
+    pass
+d['last_activity_mono'] = time.monotonic()
 with open('${session_file}', 'w') as f:
     json.dump(d, f, indent=2)
 " >/dev/null 2>&1
@@ -879,10 +937,23 @@ _is_session_stale() {
     session_file="$(_get_session_file "${identity}")"
     [[ -f "${session_file}" ]] || return 1
 
-    local last_activity threshold now
+    local threshold
+    threshold="$(_stale_threshold_seconds)"
+
+    if [[ -n "${AGS_SEMANTICS_VERSION:-}" ]]; then
+        # Guard Semantics Kernel (ADR-0064): monotonic + boot_id when the
+        # lease carries them; legacy epoch fallback inside the predicate.
+        # exit 2 (indeterminate) is deliberately treated as NOT stale: never
+        # auto-release a slot on unreadable storage (fail-safe).
+        ags_session_stale "${session_file}" "${threshold}"
+        local _ag_rc=$?
+        [[ "${_ag_rc}" -eq 0 ]]
+        return
+    fi
+
+    local last_activity now
     last_activity="$(_load_last_activity "${identity}")"
     [[ -n "${last_activity}" ]] || return 1
-    threshold="$(_stale_threshold_seconds)"
     now="$(date +%s)"
 
     if [[ $((now - ${last_activity%.*})) -gt ${threshold} ]]; then
@@ -1088,13 +1159,39 @@ data = {
     'worktree_path': os.environ['_AG_S_WORKTREE'],
     'impact_plugins': json.loads(os.environ.get('_AG_S_IMPACT','[]'))
 }
+# Lease identity hardening (Wave B, ADR-0064): starttime + boot_id make the
+# lease immune to PID recycling and reboots; the monotonic pair makes
+# staleness immune to NTP steps. All additive — F5B/F5C consumers unchanged.
+def _proc_starttime(pid):
+    try:
+        with open('/proc/%d/stat' % pid) as fh:
+            return int(fh.read().rsplit(')', 1)[1].split()[19])
+    except Exception:
+        return None
+def _boot_id():
+    try:
+        with open('/proc/sys/kernel/random/boot_id') as fh:
+            return fh.read().strip()
+    except Exception:
+        return None
+_boot = _boot_id()
+data['pid_starttime'] = _proc_starttime(data['pid'])
+data['boot_id'] = _boot
+data['last_activity_mono'] = time.monotonic()
+data['activity_boot_id'] = _boot
+data['lease_schema'] = 2
 # Task metadata cache (note remains SSOT).
 for k in ('task_id','task_state','task_topic'):
     v = os.environ.get(f'_AG_S_{k.upper()}')
     if v:
         data[k] = v
-with open(os.environ['_AG_S_SESSION_FILE'], 'w') as f:
+# Atomic publish: a crash mid-write must never leave a truncated session
+# file (2026-09-21: non-atomic write left kimi3.json at 0 bytes after an
+# aggressive terminal crash, degrading status/adopt to "unknown").
+_tmp_path = os.environ['_AG_S_SESSION_FILE'] + '.tmp.' + str(os.getpid())
+with open(_tmp_path, 'w') as f:
     json.dump(data, f, indent=2)
+os.replace(_tmp_path, os.environ['_AG_S_SESSION_FILE'])
 " >/dev/null 2>&1
     local py_exit=$?
     unset _AG_S_IDENTITY _AG_S_STATUS _AG_S_ROLE _AG_S_BRANCH _AG_S_PID _AG_S_WORKTREE _AG_S_IMPACT _AG_S_TASK_ID _AG_S_TASK_STATE _AG_S_TASK_TOPIC _AG_S_SESSION_FILE
@@ -1107,12 +1204,19 @@ _clear_session() {
     session_file="$(_get_session_file "${identity}")"
     if [[ -f "${session_file}" ]]; then
         ${AG_PYTHON} -c "
-import json
-with open('${session_file}') as f:
-    d = json.load(f)
+import json, os
+try:
+    with open('${session_file}') as f:
+        d = json.load(f)
+except (ValueError, OSError):
+    # Truncated/corrupt storage (crash mid-write) still clears: release must
+    # be fail-safe even when the previous record cannot be read.
+    d = {}
 d.update({'status':'free','role':None,'branch':'','pid':None,'timestamp':None,'worktree_path':'','impact_plugins':[],'released_at':__import__('time').time()})
-with open('${session_file}', 'w') as f:
+_tmp_path = '${session_file}' + '.tmp.' + str(os.getpid())
+with open(_tmp_path, 'w') as f:
     json.dump(d, f, indent=2)
+os.replace(_tmp_path, '${session_file}')
 " >/dev/null 2>&1
     fi
 }
@@ -1831,6 +1935,29 @@ _ag_rescue_restore_note() {
     return 0
 }
 
+# Run git with bounded retry (backoff 0.2s/1s between attempts). Same spirit
+# as _ags_git in guard-semantics.sh, kept local on purpose in this wave to
+# minimize sourcing surface in user shells (ADR-0064). stdout = output of the
+# last attempt; returns the final rc (non-zero = git still failing after
+# retries) so callers can stay fail-closed instead of collapsing to "clean".
+_ag_git_retry() {
+    local _agr_attempt=1 _agr_rc=1 _agr_out=""
+    while [[ "${_agr_attempt}" -le 3 ]]; do
+        _agr_out="$(git "$@" 2>/dev/null)"
+        _agr_rc=$?
+        if [[ "${_agr_rc}" -eq 0 ]]; then
+            printf '%s' "${_agr_out}"
+            return 0
+        fi
+        case "${_agr_attempt}" in
+            1) sleep 0.2 ;;
+            2) sleep 1 ;;
+        esac
+        _agr_attempt=$((_agr_attempt + 1))
+    done
+    return "${_agr_rc}"
+}
+
 _ag_auto_rescue_dirty_worktree() {
     local identity="$1"
     local worktree_path="$2"
@@ -1847,7 +1974,13 @@ _ag_auto_rescue_dirty_worktree() {
     fi
 
     local dirty_files
-    dirty_files="$(git -C "${worktree_path}" status --porcelain 2>/dev/null || true)"
+    if ! dirty_files="$(_ag_git_retry -C "${worktree_path}" status --porcelain)"; then
+        # Fail-closed (ADR-0064): a persistent git failure must never collapse
+        # to "clean" — abort the adopt and ask the human to resolve.
+        echo "⚠️  Cannot auto-rescue: could not VERIFY worktree ${worktree_path} (git failed after retries)." >&2
+        echo "   Resolve manually: check disk/.git health, then run 'git -C \"${worktree_path}\" status'." >&2
+        return 1
+    fi
     if [[ -z "${dirty_files}" ]]; then
         return 0
     fi
@@ -2953,6 +3086,12 @@ if [[ "${MODE}" == "release" ]]; then
         CURRENT_IDENTITY="$(_detect_identity_from_worktree_name "${wt_name}" | awk '{print $1 $2}')"
     fi
 
+    # F6B3A shadow: captura PRE-SHIM/PRE-gate da candidata (no-op quando a
+    # flag AGENT_GUARD_RELEASE_SAFETY_SHADOW está OFF).
+    if command -v _ag_rshadow_begin >/dev/null 2>&1; then
+        _ag_rshadow_begin "manual" "${CURRENT_WORKTREE}" "${CURRENT_IDENTITY}" "${MAIN_REPO}"
+    fi
+
     if [[ "${CURRENT_WORKTREE}" == "${MAIN_REPO}" ]]; then
         echo "❌❌❌ ERROR: RELEASE BLOCKED ON MAIN REPOSITORY ❌❌❌" >&2
         echo "" >&2
@@ -2969,11 +3108,17 @@ if [[ "${MODE}" == "release" ]]; then
         echo "     git checkout develop" >&2
         echo "     git pull origin develop" >&2
         echo "" >&2
+        if command -v _ag_rshadow_report >/dev/null 2>&1; then
+            _ag_rshadow_report BLOCK MAIN_REPO caller
+        fi
         return 1 2>/dev/null || exit 1
     fi
 
     if [[ -z "${CURRENT_IDENTITY}" ]]; then
         echo "❌ Cannot determine identity. Run from an agent worktree." >&2
+        if command -v _ag_rshadow_report >/dev/null 2>&1; then
+            _ag_rshadow_report BLOCK IDENTITY_UNKNOWN_CALLER caller
+        fi
         return 1 2>/dev/null || exit 1
     fi
 
@@ -2986,6 +3131,9 @@ if [[ "${MODE}" == "release" ]]; then
 
     if ! _validate_worktree_release_ready "${CURRENT_WORKTREE}"; then
         echo "🔒 Session NOT released. Resolve the issues above and run --release again." >&2
+        if command -v _ag_rshadow_report >/dev/null 2>&1; then
+            _ag_rshadow_report BLOCK SAFETY_VALIDATE_FAILED safety
+        fi
         return 1 2>/dev/null || exit 1
     fi
 
@@ -2993,6 +3141,11 @@ if [[ "${MODE}" == "release" ]]; then
     # da identidade — exige confirmação do usuário (TTY) ou --force explícito.
     if ! _release_pending_work_guard "${CURRENT_IDENTITY}" "${CURRENT_WORKTREE}" "${FORCE_RELEASE}"; then
         echo "🔒 Session NOT released. Apresente os PRs ao usuário; com autorização, use --release --force." >&2
+        if command -v _ag_rshadow_report >/dev/null 2>&1; then
+            # domain=policy: legacy_decision=ALLOW é a decisão SAFETY subjacente
+            # (a policy bloqueou, não a safety — F6B3A §5).
+            _ag_rshadow_report ALLOW NONE policy note=policy_block
+        fi
         return 1 2>/dev/null || exit 1
     fi
 
@@ -3042,6 +3195,9 @@ print(json.dumps({'reason': 'release', 'blockers': ['neutral_branch_failed'], 'w
     fi
 
     echo "🔓 Released session for ${CURRENT_IDENTITY}"
+    if command -v _ag_rshadow_report >/dev/null 2>&1; then
+        _ag_rshadow_report ALLOW NONE safety
+    fi
     return 0 2>/dev/null || exit 0
 fi
 
@@ -3221,7 +3377,7 @@ if [[ "${MODE}" == "status" ]]; then
     echo "=========================================================="
     echo "🛡️  Agent Guard — Session Status"
     echo "=========================================================="
-    printf "%-12s | %-8s | %-6s | %-10s | %-6s | %-8s | %-18s | %-40s\n" "Agent" "Status" "Role" "PID" "WT" "Health" "Tab" "Branch"
+    printf "%-12s | %-8s | %-6s | %-10s | %-6s | %-8s | %-18s | %-14s | %-40s\n" "Agent" "Status" "Role" "PID" "WT" "Health" "Tab" "TASK" "Branch"
     echo "------------------------------------------------------------------"
 
     _rec_status="" _rec_role="" _rec_pid="" _rec_branch="" _rec_worktree="" _rec_health="" _rec_drift=""
@@ -3257,9 +3413,35 @@ if [[ "${MODE}" == "status" ]]; then
             # Keep the tab column narrow; emoji are wide, so truncate conservatively.
             _tab_text="$(${AG_PYTHON} -c "import sys; s=sys.argv[1]; print(s[:17]+'…' if len(s)>18 else s)" "${_tab_text}" 2>/dev/null || printf '%s' "${_tab_text}")"
 
-            printf "%-12s | %-8s | %-6s | %-10s | %-6s | %-8s | %-18s | %-40s\n" \
+            # F0-F S2: TASK/run corrente a partir da nota do slot (referência,
+            # não cópia — estado canônico continua em .kiro/runs/). A nota vive
+            # no WORKTREE do claimant, não no repo principal: resolvemos o
+            # worktree real pela session/lease do slot (_rec_worktree), com
+            # fallback para o worktree convencional e, por último, para o
+            # repo principal (legado). Sem duplicar estado canônico; fail-soft.
+            _claim_disp=""
+            if command -v _task_get_field >/dev/null 2>&1; then
+                _claim_note_wt="${_rec_worktree:-}"
+                if [[ -z "${_claim_note_wt}" || ! -f "${_claim_note_wt}/.agent-guard/tasks/${identity}.md" ]]; then
+                    if [[ -f "${worktree_path}/.agent-guard/tasks/${identity}.md" ]]; then
+                        _claim_note_wt="${worktree_path}"
+                    else
+                        _claim_note_wt="${_AG_REPO_ROOT:-${MAIN_REPO}}"
+                    fi
+                fi
+                _claim_note="${_claim_note_wt}/.agent-guard/tasks/${identity}.md"
+                _claim_task_id="$(_task_get_field "${_claim_note}" "task_id" 2>/dev/null || true)"
+                _claim_run_seq="$(_task_get_field "${_claim_note}" "run_seq" 2>/dev/null || true)"
+                if [[ -n "${_claim_task_id}" ]]; then
+                    _claim_disp="${_claim_task_id}"
+                    [[ -n "${_claim_run_seq}" ]] && _claim_disp="${_claim_disp}#${_claim_run_seq}"
+                    _claim_disp="$(${AG_PYTHON} -c "import sys; s=sys.argv[1]; print(s[:13]+'…' if len(s)>14 else s)" "${_claim_disp}" 2>/dev/null || printf '%s' "${_claim_disp}")"
+                fi
+            fi
+
+            printf "%-12s | %-8s | %-6s | %-10s | %-6s | %-8s | %-18s | %-14s | %-40s\n" \
                 "${identity}" "${_rec_status:-free}" "${_rec_role:-}" \
-                "${pid_col:-}" "${wt_ok}" "${_rec_health:-}" "${_tab_text}" "${_rec_branch:-}"
+                "${pid_col:-}" "${wt_ok}" "${_rec_health:-}" "${_tab_text}" "${_claim_disp:-—}" "${_rec_branch:-}"
 
             if [[ "${_rec_health}" != "-" && "${_rec_health}" != "live" ]]; then
                 any_drift="${any_drift}\n  ${_rec_drift:-drift}: ${identity} -> ${_rec_branch:-<no branch>}"
@@ -3592,13 +3774,59 @@ if [[ "${MODE}" == "adopt" ]]; then
                 echo "🧹 Lease for ${ADOPT_IDENTITY} pinned to stray non-agent process (PID ${adopt_sess_pid}); auto-clearing." >&2
                 _clear_session "${ADOPT_IDENTITY}"
             else
-                echo "" >&2
-                echo "❌❌❌ ERROR: SLOT STILL IN USE ❌❌❌" >&2
-                echo "" >&2
-                echo "   Identity '${ADOPT_IDENTITY}' is held by live PID ${adopt_sess_pid}." >&2
-                echo "   Adopt only works on slots whose previous session is dead." >&2
-                echo "" >&2
-                return 1 2>/dev/null || exit 1
+                # Wave D activation (ADR-0064, GO do owner 2026-09-27): um PID
+                # vivo pode estar funcionalmente morto (órfão: terminal morreu,
+                # sem heartbeat, sem TTY, CPU ~0). Nesse caso, OFERECEMOS o
+                # encerramento com evidência e confirmação humana — NUNCA
+                # automático. Sem TTY, mantém a recusa com instrução.
+                _orphan_rc=0
+                if [[ -n "${AGS_SEMANTICS_VERSION:-}" ]]; then
+                    _adopt_sess_file="$(_get_session_file "${ADOPT_IDENTITY}")"
+                    if ags_orphan_state "${_adopt_sess_file}" "${AG_ORPHAN_GRACE_MINUTES:-30}" >/dev/null 2>&1; then
+                        _orphan_rc=0
+                    else
+                        _orphan_rc=$?
+                    fi
+                fi
+                if [[ "${_orphan_rc}" -eq 1 && -t 0 && -t 1 ]]; then
+                    echo "" >&2
+                    echo "⚠️  SLOT ÓRFÃO — PID vivo mas funcionalmente morto" >&2
+                    echo "" >&2
+                    echo "   Identity '${ADOPT_IDENTITY}' está preso ao PID ${adopt_sess_pid}," >&2
+                    echo "   que sobreviveu sem sessão real: sem heartbeat há ≥${AG_ORPHAN_GRACE_MINUTES:-30}min, sem TTY, CPU ~0." >&2
+                    read -r -p "   Encerrar esse processo órfão e adotar o slot? [s/N] " _orphan_ans
+                    if [[ "${_orphan_ans}" == "s" || "${_orphan_ans}" == "S" ]]; then
+                        echo "🧹 Encerrando órfão PID ${adopt_sess_pid} (confirmação humana)..." >&2
+                        kill "${adopt_sess_pid}" 2>/dev/null || true
+                        sleep 1
+                        if _is_pid_alive "${adopt_sess_pid}"; then
+                            echo "❌ O processo não encerrou com SIGTERM; por segurança NÃO forço SIGKILL." >&2
+                            echo "   Mate manualmente (kill ${adopt_sess_pid}) e repita o adopt." >&2
+                            return 1 2>/dev/null || exit 1
+                        fi
+                        if command -v ag_decision_log >/dev/null 2>&1; then
+                            ag_decision_log "${ADOPT_IDENTITY}" "$(basename "${WORKTREE_PATH}")" "orphan-kill" "ags_orphan_state" "pid=${adopt_sess_pid}" || true
+                        fi
+                        echo "🧹 Clearing orphaned session for ${ADOPT_IDENTITY}." >&2
+                        _clear_session "${ADOPT_IDENTITY}"
+                    else
+                        echo "   Adoção cancelada pelo usuário." >&2
+                        return 1 2>/dev/null || exit 1
+                    fi
+                else
+                    echo "" >&2
+                    echo "❌❌❌ ERROR: SLOT STILL IN USE ❌❌❌" >&2
+                    echo "" >&2
+                    echo "   Identity '${ADOPT_IDENTITY}' is held by live PID ${adopt_sess_pid}." >&2
+                    if [[ "${_orphan_rc}" -eq 1 ]]; then
+                        echo "   O PID parece funcionalmente morto (órfão), mas o encerramento exige terminal interativo." >&2
+                        echo "   Rode o adopt em um terminal TTY para confirmar, ou mate o processo manualmente." >&2
+                    else
+                        echo "   Adopt only works on slots whose previous session is dead." >&2
+                    fi
+                    echo "" >&2
+                    return 1 2>/dev/null || exit 1
+                fi
             fi
         else
             echo "🧹 Clearing stale session for ${ADOPT_IDENTITY} (PID ${adopt_sess_pid} is dead)." >&2

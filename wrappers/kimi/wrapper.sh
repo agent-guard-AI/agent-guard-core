@@ -29,6 +29,13 @@ set -euo pipefail
 # 0. Emergency bypass (canonical env var + legacy alias)
 # ---------------------------------------------------------------------------
 if [[ "${AG_WRAPPER_BYPASS:-}" == "1" || "${AG_WRAPPER_BYPASS:-}" == "1" ]]; then
+    # Wave E (ADR-0064): every emergency bypass is logged (auditability of
+    # guard-disable events). Best effort — never block the bypass itself.
+    _AG_EARLY_REPO="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
+    mkdir -p "${_AG_EARLY_REPO}/.agent-guard/journal" 2>/dev/null || true
+    printf '{"ts":%s,"event":"early-bypass","cwd":"%s"}\n' \
+        "$(date +%s)" "$(basename "${_AG_EARLY_REPO}")" \
+        >> "${_AG_EARLY_REPO}/.agent-guard/journal/guard-home-bypass.jsonl" 2>/dev/null || true
     # REAL_KIMI is resolved later; bypass is handled after config load.
     # We need it now, so perform a minimal resolution.
     _AG_REAL_KIMI="${AG_KIMI_REAL:-${AG_KIMI_REAL:-}}"
@@ -188,6 +195,16 @@ _ag_load_config() {
     fi
 
     _AG_CONFIG_LOADED="true"
+
+    # Guard Semantics Kernel (ADR-0064): canonical tri-state predicates shared
+    # with init.sh. Sourcing is fail-open on purpose: if the lib is absent
+    # (main repo not updated yet), wrappers fall back to their built-in
+    # legacy checks below.
+    _AG_SEMANTICS_LIB="${_AG_MAIN_REPO}/${package_root}/src/guard-semantics.sh"
+    if [[ -r "${_AG_SEMANTICS_LIB}" ]]; then
+        # shellcheck disable=SC1090
+        . "${_AG_SEMANTICS_LIB}"
+    fi
     return 0
 }
 
@@ -244,6 +261,22 @@ if ! _ag_load_config; then
     fi
     echo "❌ AG WRAPPER: cannot locate real kimi binary." >&2
     exit 1
+fi
+
+# Wave E (ADR-0064): guard-home health check — fail-closed. Operating with a
+# sick guard-home (wrong branch, mid-operation, bad yaml) means deciding on
+# wrong config/code; the legacy fail-open is replaced by a refusal with an
+# actionable diagnosis. Disable explicitly with AG_GUARD_HOME_CHECK=0
+# (AG_WRAPPER_BYPASS=1 is intercepted earlier and logged there).
+if [[ -n "${AGS_SEMANTICS_VERSION:-}" && "${AG_GUARD_HOME_CHECK:-1}" == "1" ]]; then
+    _AG_GH_STATE="$(ags_guard_home_state "${_AG_MAIN_REPO}")" && _AG_GH_RC=0 || _AG_GH_RC=$?
+    if [[ "${_AG_GH_RC}" -ne 0 ]]; then
+        echo "❌ AG WRAPPER: guard-home is not in a healthy state: ${_AG_GH_STATE}" >&2
+        echo "   Repo: ${_AG_MAIN_REPO}" >&2
+        echo "   Fix: return the guard-home to '${AG_GUARD_HOME_REF:-develop}' with a clean git state," >&2
+        echo "   or set AG_GUARD_HOME_CHECK=0 / AG_WRAPPER_BYPASS=1 for explicit recovery (logged)." >&2
+        exit 1
+    fi
 fi
 
 # ---------------------------------------------------------------------------
@@ -338,8 +371,46 @@ _ag_check_worktree_clean() {
         return 1
     fi
 
+    if [[ -n "${AGS_SEMANTICS_VERSION:-}" ]]; then
+        local _ag_state _ag_rc _ag_reason
+        _ag_state="$(ag_worktree_state "${worktree}" "${identity}")"
+        _ag_rc=$?
+        case "${_ag_rc}" in
+            0)
+                return 0
+                ;;
+            2)
+                echo "❌ AG WRAPPER: could not VERIFY worktree ${worktree} (git unreachable after retries)." >&2
+                echo "   Identity: ${identity}" >&2
+                echo "   Fix: check disk/.git health, then run 'git -C \"${worktree}\" status' manually." >&2
+                return 1
+                ;;
+        esac
+        # rc=1 → dirty_work or mid_operation (both block; bypass only covers dirty_work)
+        _ag_reason="$(printf '%s\n' "${_ag_state}" | sed -n '2p')"
+        if [[ "${_ag_state}" == mid_operation* ]]; then
+            echo "❌ AG WRAPPER: worktree ${worktree} has a Git operation in progress (${_ag_reason})." >&2
+            echo "   Finish or abort it first — 'git -C \"${worktree}\" status' shows how." >&2
+            return 1
+        fi
+        if [[ "${AG_ALLOW_DIRTY_WORKTREE:-}" == "1" ]]; then
+            return 0
+        fi
+        echo "❌ AG WRAPPER: worktree ${worktree} has uncommitted changes." >&2
+        echo "   Identity: ${identity}" >&2
+        echo "   Resolve before starting a new session (commit, stash, or run with AG_ALLOW_DIRTY_WORKTREE=1 for recovery)." >&2
+        echo "" >&2
+        echo "   git status:" >&2
+        git -C "${worktree}" status --short >&2 || true
+        return 1
+    fi
+
+    # Legacy fallback (lib absent): slot-note exemption only.
     local status_output
     status_output="$(git -C "${worktree}" status --porcelain=v1 2>/dev/null || true)"
+    if [[ -n "${status_output}" && -n "${identity}" ]]; then
+        status_output="$(printf '%s\n' "${status_output}" | grep -vE "^.. \\.agent-guard/tasks/${identity}\\.md\$" || true)"
+    fi
 
     if [[ -z "${status_output}" ]]; then
         return 0
@@ -363,8 +434,21 @@ _ag_check_worktree_clean() {
 # ---------------------------------------------------------------------------
 _ag_worktree_is_dirty() {
     local worktree="$1"
+    local identity="${2:-}"
+    if [[ -n "${AGS_SEMANTICS_VERSION:-}" && -n "${identity}" ]]; then
+        ag_worktree_state "${worktree}" "${identity}" >/dev/null
+        local _ag_rc=$?
+        # fail-closed: indeterminate (2) counts as dirty — never acquire or
+        # adopt over an unverifiable worktree state.
+        [[ "${_ag_rc}" -ne 0 ]]
+        return
+    fi
+    # Legacy fallback (lib absent): slot-note exemption only.
     local output
     output="$(git -C "${worktree}" status --porcelain=v1 2>/dev/null || true)"
+    if [[ -n "${output}" && -n "${identity}" ]]; then
+        output="$(printf '%s\n' "${output}" | grep -vE "^.. \\.agent-guard/tasks/${identity}\\.md\$" || true)"
+    fi
     [[ -n "${output}" ]]
 }
 
@@ -699,10 +783,22 @@ for e in events:
     if not worktree or not branch or not os.path.isdir(worktree):
         continue
     # Never resume a worktree parked on its neutral post-release branch.
+    # Trust the on-disk HEAD, not the historical journal branch: a slot
+    # released after init must be treated as free (auto-allocated), not
+    # dead-ended in init.sh's neutral-branch guard.
     if branch.startswith('_released/'):
         continue
     if not os.path.isdir(os.path.join(worktree, '.git')) and \
        not os.path.isfile(os.path.join(worktree, '.git')):
+        continue
+    try:
+        _cur_branch = subprocess.run(
+            ['git', '-C', worktree, 'rev-parse', '--abbrev-ref', 'HEAD'],
+            capture_output=True, text=True, encoding='utf-8', errors='replace'
+        ).stdout.strip()
+    except Exception:
+        _cur_branch = ''
+    if _cur_branch.startswith('_released/') or _cur_branch in ('', 'develop', 'HEAD'):
         continue
 
     # Verify the branch still exists locally.
@@ -782,7 +878,7 @@ _ag_find_free_kimi_worktree() {
                 fi
             fi
 
-            if [[ "${is_free}" == "true" ]] && _ag_worktree_is_dirty "${worktree}"; then
+            if [[ "${is_free}" == "true" ]] && _ag_worktree_is_dirty "${worktree}" "${identity}"; then
                 is_free=false
             fi
 
@@ -870,7 +966,7 @@ if ! _ag_have_lease; then
                 # dead session; a clean stale worktree is handled by the normal
                 # acquire path (init clears the stale lease).
                 echo "🧹 AG WRAPPER: slot '${_AG_SLOT}' has a stale lease (PID ${_ag_sess_pid} is dead); clearing..." >&2
-                if _ag_worktree_is_dirty "${_ag_slot_worktree}"; then
+                if _ag_worktree_is_dirty "${_ag_slot_worktree}" "${_AG_SLOT}"; then
                     _ag_slot_mode="adopt"
                 fi
             fi
@@ -880,7 +976,7 @@ if ! _ag_have_lease; then
         # can inspect and continue the previous session's work. Without this,
         # slots that were released with uncommitted changes (a drift condition
         # reported by --status) become unreachable via `hmvip go <slot>`.
-        if [[ "${_ag_slot_mode}" == "acquire" && -d "${_ag_slot_worktree}" ]] && _ag_worktree_is_dirty "${_ag_slot_worktree}"; then
+        if [[ "${_ag_slot_mode}" == "acquire" && -d "${_ag_slot_worktree}" ]] && _ag_worktree_is_dirty "${_ag_slot_worktree}" "${_AG_SLOT}"; then
             echo "🔄 AG WRAPPER: slot '${_AG_SLOT}' has uncommitted work; adopting for inspection..." >&2
             _ag_slot_mode="adopt"
         fi
@@ -917,9 +1013,47 @@ if ! _ag_have_lease; then
         _AG_SKIP_INIT="true"
     fi
 
+    # Wave C (ADR-0064): transactional resume — DEFAULT ON since owner GO
+    # 2026-09-27 (AG_RESUME_TX=0 reverts to the legacy path). AG_RESUME_SHADOW=1 records the
+    # atomic selector's pick for divergence analysis without changing
+    # behavior; AG_RESUME_TX=1 makes the atomic command the resume path.
+    _AG_RESUME_BIN="${_AG_MAIN_REPO}/${_AG_PACKAGE_ROOT}/bin/agent-guard-resume"
+    if [[ "${_AG_SKIP_INIT}" != "true" && "${CWD}" == "${_AG_MAIN_REPO}" && -x "${_AG_RESUME_BIN}" ]]; then
+        if [[ "${AG_RESUME_SHADOW:-0}" == "1" ]]; then
+            "${_AG_RESUME_BIN}" resume --prefix kimi --shadow >/dev/null 2>&1 || true
+        fi
+        if [[ "${AG_RESUME_TX:-1}" == "1" ]]; then
+            _AG_RESUME_ENV="$("${_AG_RESUME_BIN}" resume --prefix kimi --print-env 2>/dev/null || true)"
+            if [[ -n "${_AG_RESUME_ENV}" ]]; then
+                eval "${_AG_RESUME_ENV}"
+                cd "${AGENT_GUARD_WORKTREE_PATH}" || exit 1
+                CWD="$(pwd)"
+                export _AG_WORKTREE="${AGENT_GUARD_WORKTREE_PATH}"
+                export _AG_IDENTITY="${AGENT_GUARD_IDENTITY}"
+                export _AG_BRANCH="${AG_BRANCH}"
+                export _HMVIP_WORKTREE="${_AG_WORKTREE}"
+                export _HMVIP_IDENTITY="${_AG_IDENTITY}"
+                export _HMVIP_BRANCH="${_AG_BRANCH}"
+                _AG_SKIP_INIT="true"
+            fi
+        fi
+    fi
+
     if [[ "${CWD}" == "${_AG_MAIN_REPO}" ]]; then
         # Try to resume the most recent active session before allocating a new slot.
         _AG_RESUMABLE_WORKTREE="$(_ag_find_resumable_worktree "kimi" 2>/dev/null || true)"
+        if [[ "${AG_RESUME_SHADOW:-0}" == "1" ]]; then
+            AG_SHADOW_LOG="${_AG_MAIN_REPO}/.agent-guard/journal/resume-shadow.jsonl" \
+            AG_SHADOW_PICK="${_AG_RESUMABLE_WORKTREE:-}" \
+            ${AG_PYTHON} -c '
+import json, os, time
+path = os.environ["AG_SHADOW_LOG"]
+os.makedirs(os.path.dirname(path), exist_ok=True)
+rec = {"ts": time.time(), "selector": "legacy", "pick": os.environ.get("AG_SHADOW_PICK") or None}
+with open(path, "a", encoding="utf-8") as fh:
+    fh.write(json.dumps(rec) + "\n")
+' >/dev/null 2>&1 || true
+        fi
         if [[ -n "${_AG_RESUMABLE_WORKTREE}" ]]; then
             echo "🔄 AG WRAPPER: resuming last active session at ${_AG_RESUMABLE_WORKTREE}" >&2
             cd "${_AG_RESUMABLE_WORKTREE}" || exit 1

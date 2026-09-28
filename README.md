@@ -31,10 +31,20 @@ agent-guard-core/
 ├── bin/
 │   ├── agent-guard              # CLI principal
 │   ├── agent-guard-config       # Leitor de agent-guard.yaml (SSOT)
-│   └── agent-guard-status       # Atalho para status
+│   ├── agent-guard-status       # Atalho para status
+│   ├── agent-guard-slots        # Facade RAW read-only sobre o session storage (F5B)
+│   ├── agent-guard-slot-by-pid  # Resolve slot a partir de PID (F5C, hooks de tab)
+│   ├── agent-guard-lease-probe  # Primitiva de leitura de lease (F5D, lease-owner-check)
+│   ├── agent-guard-python       # Helper python versionado do pacote
+│   └── wakeup-daemon            # Daemon de wakeup de slots
 ├── src/
 │   ├── init.sh                  # Aluguel de identidade e worktree
 │   ├── journal.sh               # Session journal para recuperação de contexto
+│   ├── shadow.sh                # Session Shadow / Liveness API (F4)
+│   ├── safe-squash.sh           # Squash seguro com git note de provenance
+│   ├── release-safety.sh        # Fronteira de release (forense F6A, ADR-0058)
+│   ├── release-safety-shadow.sh # Shadow observacional do release-safety (F6A)
+│   ├── boot-cache.sh            # Cache de boot do kernel
 │   └── Config.php               # Loader PHP para agent-guard.yaml
 ├── hooks/
 │   ├── install.sh               # Instala hooks no repo consumidor
@@ -42,7 +52,9 @@ agent-guard-core/
 │   ├── pre-push                 # Valida push e envia notes
 │   ├── pre-commit               # Valida autor e branch
 │   ├── pre-checkout             # Bloqueia checkout com working tree dirty
-│   └── commit-msg               # Valida mensagem de commit
+│   ├── commit-msg               # Valida mensagem de commit
+│   ├── lease-owner-check.sh     # Guard de posse de lease por PID (consome lease-probe, F5D)
+│   └── pas-sensitive-scan.sh    # Scan de ação sensível (anota, nunca bloqueia)
 ├── ci/
 │   ├── worktree-origin-audit.php # Audita origem dos commits no CI
 │   ├── add-worktree-note.sh     # Cria git note de origem
@@ -54,8 +66,11 @@ agent-guard-core/
 │   ├── amp/
 │   │   ├── wrapper.sh           # Wrapper do Amp CLI (Sourcegraph)
 │   │   └── recovery.sh          # Restaura wrapper após updates
-│   └── kilo/
-│       ├── wrapper.sh           # Wrapper do Kilo CLI
+│   ├── kilo/
+│   │   ├── wrapper.sh           # Wrapper do Kilo CLI
+│   │   └── recovery.sh          # Restaura wrapper após updates
+│   └── codewhale/
+│       ├── wrapper.sh           # Wrapper do CodeWhale CLI
 │       └── recovery.sh          # Restaura wrapper após updates
 ├── tests/
 │   └── run-all.sh               # Testes funcionais básicos
@@ -63,7 +78,16 @@ agent-guard-core/
     └── agent-guard.json         # Configuração de exemplo
 ```
 
-> **Estado atual:** Fase 3 — pacote independente e instalável em qualquer repositório Git. Todos os componentes leem a configuração de `agent-guard.yaml` (SSOT) via `agent-guard-config`. Não há hardcodes de projeto no núcleo.
+> **Estado atual:** kernel ativo em produção multi-IA — Machine API v3
+> (`status --json` + `shadows[]`, F4), read decoupling do session storage
+> **fechado** (facades `slots` / `slot-by-pid` / `lease-probe`, F5B/C/D —
+> **0 leitores externos diretos** no session storage) e fronteira de
+> **Release Safety em modo forense** (`release-safety.sh` +
+> `release-safety-shadow.sh`, F6A — implementação F6B ainda não autorizada).
+> Todos os componentes leem a configuração de `agent-guard.yaml` (SSOT) via
+> `agent-guard-config`. Não há hardcodes de projeto no núcleo. Sync com o
+> repositório de origem (HMVIP) ocorre em **lotes manuais por milestone**,
+> sem trigger de push (ver seção "Sync com o repositório HMVIP").
 
 ## Instalação rápida
 
@@ -521,15 +545,27 @@ bash tests/run-all.sh
 
 ## Sync com o repositório HMVIP
 
-O `agent-guard-core` é desenvolvido e endurecido no monorepo HMVIP (`packages/agent-guard-core/`) e sincronizado automaticamente com este repositório upstream.
+O `agent-guard-core` é desenvolvido e endurecido no monorepo HMVIP (`packages/agent-guard-core/`) e sincronizado com este repositório upstream em **lotes manuais por milestone**.
 
-- O workflow `.github/workflows/agent-guard-core-sync-upstream.yml` dispara em todo push para `develop` que altere `packages/agent-guard-core/`.
-- Ele executa `git subtree split`, cria uma branch `sync/from-hmvip-<sha>-<timestamp>` e abre um PR no upstream.
-- Todo merge no upstream exige revisão humana — nunca ocorre automaticamente.
+- **Política vigente desde 2026-09-04:** o sync é **manual/batch**, disparado por
+  **`workflow_dispatch`** no workflow `.github/workflows/agent-guard-core-sync-upstream.yml`.
+  O trigger automático de push foi **removido** (reversão deliberada da decisão
+  anterior: 37 runs em 14 dias, 19 falhas e amplificação de custo de CI — ver
+  ADR-0059 no repositório HMVIP). Não há sync automático em nenhum push.
+- **Modelo por milestone:** as mudanças estáveis do pacote acumulam no HMVIP e
+  são sincronizadas em lote consolidado quando um milestone fecha (ex: F5B
+  concluído). O upstream está sincronizado até **F5B** (`hmvip@1f1b3b4`); o
+  delta pendente é F5C/F5D.
+- **Sem auto-merge:** todo merge consolidado no upstream exige **revisão
+  humana**. Os gates automáticos do workflow (subtree split, testes do pacote,
+  validação de `agent-guard.yaml.example`, scan de arquivos sensíveis) seguem
+  como pré-condição do lote.
+- O workflow executa `git subtree split`, cria uma branch
+  `sync/from-hmvip-<sha>-<timestamp>` e abre um PR no upstream — o PR antigo
+  #77 (era do trigger de push) está obsoleto e foi substituído por esse modelo.
 - Commits espúrios podem ser filtrados via `.agent-guard-sync-config.json` no HMVIP.
-- Workflow ativado em produção em 2026-07-31 (teste inicial).
 
-Se você mantém um fork do `agent-guard-core`, pode reutilizar a mesma mecânica apontando o workflow para o seu repo.
+Se você mantém um fork do `agent-guard-core`, pode reutilizar a mesma mecânica apontando o workflow para o seu repo — recomenda-se o mesmo modo manual/batch por milestone.
 
 ## Origem
 
