@@ -66,11 +66,45 @@ fire working "" PermissionResult
 fire error "" StopFailure
 [[ "$(last_title)" == "🔴 kimi9 | "* ]] && ok "stop failure => vermelho" || bad "stop failure" "$(last_title)"
 
+EXPECTED_NEW_TITLE="$(python3 "${HMVIP_TAB_SUMMARIZER}" 'outra coisa' 2>/dev/null | jq -r '.title')"
 fire working ',"prompt":"outra coisa"' UserPromptSubmit
 T2="$(last_title)"
-[[ "${T2}" == "🟢 kimi9 | ${EXPECTED_AUTO_TITLE}" ]] \
-    && ok "novo prompt limpa erro e MANTEM titulo original (estavel)" \
-    || bad "titulo estavel" "${T2}"
+[[ "${T2}" == "🟢 kimi9 | ${EXPECTED_NEW_TITLE}" && -n "${EXPECTED_NEW_TITLE}" ]] \
+    && ok "novo prompt significativo SUBSTITUI o titulo anterior" \
+    || bad "titulo substituido" "${T2}"
+# A partir daqui o titulo automatico da sessao passa a ser o novo.
+EXPECTED_AUTO_TITLE="${EXPECTED_NEW_TITLE}"
+
+echo "== continuacao curta mantem titulo =="
+
+SID="session_continuacao"
+fire working ',"prompt":"corrigir fluxo de saque do hmvip-pay"' UserPromptSubmit
+EXPECTED_KEEP_TITLE="$(last_title)"
+[[ "${EXPECTED_KEEP_TITLE}" == *"fix"* ]] || bad "setup continuacao" "${EXPECTED_KEEP_TITLE}"
+
+fire working ',"prompt":"sim"' UserPromptSubmit
+[[ "$(last_title)" == "${EXPECTED_KEEP_TITLE}" ]] \
+    && ok "resposta curta ('sim') mantem o titulo atual" \
+    || bad "continuacao 'sim'" "$(last_title)"
+
+fire working ',"prompt":"prossiga"' UserPromptSubmit
+[[ "$(last_title)" == "${EXPECTED_KEEP_TITLE}" ]] \
+    && ok "'prossiga' mantem o titulo atual" \
+    || bad "continuacao 'prossiga'" "$(last_title)"
+
+# Override manual sobrevive a continuacoes curtas...
+printf 'fix saque manual\n' > "${HMVIP_TAB_DIR}/${SID}.title"
+fire working ',"prompt":"ok"' UserPromptSubmit
+[[ "$(last_title)" == "🟢 kimi9 | fix saque manual" ]] \
+    && ok "override /tab sobrevive a continuacao curta" \
+    || bad "override sobrevive continuacao" "$(last_title)"
+
+# ...mas cede na proxima ordem significativa.
+fire working ',"prompt":"renomear handler de webhook do SozoPay"' UserPromptSubmit
+[[ "$(last_title)" == *"rename"* && "$(last_title)" != *"fix saque manual"* ]] \
+    && ok "override /tab cede na proxima ordem significativa" \
+    || bad "override cede a ordem real" "$(last_title)"
+SID="session_teste_123"
 
 echo "== background tasks =="
 

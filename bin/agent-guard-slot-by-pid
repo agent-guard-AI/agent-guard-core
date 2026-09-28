@@ -1,0 +1,99 @@
+#!/usr/bin/env bash
+#
+# agent-guard-slot-by-pid — helper fino e read-only de matching PID → identity.
+#
+# Uso:
+#   agent-guard-slot-by-pid <pid>
+#
+# Saida (stdout): a `identity` do PRIMEIRO slot com status=="active" e
+# pid == <pid>, ou vazio quando nao ha match. Exit 0 sempre.
+#
+# Contrato (F5C):
+#   - READ-ONLY via facade publica `agent-guard-slots` (nunca le
+#     .kiro/locks/agent-sessions/*.json diretamente).
+#   - FAIL-OPEN: facade indisponivel, storage ausente ou malformed produzem
+#     saida vazia — equivalente ao antigo loop jq que nao encontrava match.
+#   - Sem match nunca produz identidade (nao ha hijack por arquivo malformado:
+#     a facade marca malformed como status "unknown", que nao casa "active").
+#   - Sem estado proprio, sem cache persistente, sem network.
+#
+# Substitui o padrao legado em tab hooks:
+#   for f in .kiro/locks/agent-sessions/*.json; do
+#       jq -r 'select(.status=="active") | "\(.pid // 0) \(.identity // "")"' ...
+#   done
+
+# Preserve caller shell options; never leak set -euo pipefail.
+_AG_SB_PID_OLD_FLAGS="$(set +o)"
+_ag_sb_pid_restore_flags() {
+    eval "${_AG_SB_PID_OLD_FLAGS}" 2>/dev/null || true
+}
+
+set -euo pipefail
+
+QUERY_PID="${1:-}"
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+AG_PYTHON="$(bash "${SCRIPT_DIR}/agent-guard-python" 2>/dev/null || echo "python3")"
+export AG_PYTHON
+
+if [[ -z "${QUERY_PID}" ]]; then
+    _ag_sb_pid_restore_flags
+    exit 0
+fi
+
+export _AG_SB_PID_QUERY="${QUERY_PID}"
+export _AG_SB_PID_BIN_DIR="${SCRIPT_DIR}"
+
+# A facade resolve o repo pelo CWD (git toplevel) quando o env nao carrega
+# agent-guard.yaml. Herdar o CWD do repo alvo reproduz o glob legado, que era
+# relativo ao toplevel do CWD do payload — inclusive em fixtures hermeticas
+# sem yaml.
+if [[ -n "${AGENT_GUARD_REPO_ROOT:-}" && -d "${AGENT_GUARD_REPO_ROOT}" ]]; then
+    cd "${AGENT_GUARD_REPO_ROOT}" 2>/dev/null || true
+fi
+
+"${AG_PYTHON}" <<'PY'
+import json, os, subprocess, sys
+
+query = os.environ.get("_AG_SB_PID_QUERY", "")
+bin_dir = os.environ.get("_AG_SB_PID_BIN_DIR", "")
+if not query or not bin_dir:
+    sys.exit(0)
+
+slots_bin = os.path.join(bin_dir, "agent-guard-slots")
+
+try:
+    raw = subprocess.run(
+        ["bash", slots_bin],
+        capture_output=True, text=True, timeout=30,
+    ).stdout or ""
+except Exception:
+    sys.exit(0)
+
+try:
+    slots = json.loads(raw).get("slots", [])
+except Exception:
+    sys.exit(0)
+
+if not isinstance(slots, list):
+    sys.exit(0)
+
+for slot in slots:
+    if not isinstance(slot, dict):
+        continue
+    if slot.get("status") != "active":
+        continue
+    pid = slot.get("pid", "")
+    # Normaliza numero vs string, como fazia o jq -r 'tostring' do leitor legado.
+    if str(pid) == query and pid != "" and str(pid) != "0":
+        ident = slot.get("identity", "")
+        if isinstance(ident, str) and ident:
+            print(ident)
+        sys.exit(0)
+
+sys.exit(0)
+PY
+
+_ag_sb_pid_restore_flags
+exit 0

@@ -1,0 +1,97 @@
+#!/usr/bin/env bash
+#
+# agent-guard-lease-probe — primitiva pública READ-ONLY de posse de lease (ADR-0057).
+#
+# Única fronteira de leitura do session storage para consumidores externos de
+# baixa latência (hooks Git). Bash puro: sem Python, sem jq, sem reconcile,
+# sem network, sem estado, sem writes. Nunca modifica session state.
+#
+# Uso:
+#   agent-guard-lease-probe [--identity <id>] [--worktree <path>]
+#
+# Saída (stdout), uma linha por session:
+#   <identity>\t<status>\t<pid>\t<worktree_path>
+# Lista vazia = nenhum session relevante. Exit 0 sempre que a derivação
+# funcionar (mesmo com lista vazia); exit 1 apenas quando nem o storage pode
+# ser localizado — callers tratam como fail-open (sem leases).
+#
+# Override de teste: AGENT_GUARD_SESSION_DIR=<dir com JSONs>
+#
+# Contrato semântico (congelado — suíte L186):
+#   - parse tolerante (mesma gramática sed do guard legado): campo ausente ou
+#     malformado produz valor vazio, nunca erro;
+#   - "pid" só é emitido quando numérico (espelha o regex legado);
+#   - não consulta vivacidade de PID, não compara worktree, não decide
+#     bloqueio — isso é POLÍTICA do caller (lease-owner-check.sh).
+
+# Preserve caller shell options; never leak set -euo pipefail.
+_AG_PROBE_OLD_FLAGS="$(set +o)"
+_ag_probe_restore_flags() {
+    eval "${_AG_PROBE_OLD_FLAGS}" 2>/dev/null || true
+}
+
+set -uo pipefail
+
+IDENTITY=""
+WORKTREE=""
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --identity) IDENTITY="${2:-}"; shift 2 ;;
+        --worktree) WORKTREE="${2:-}"; shift 2 ;;
+        *) shift ;;
+    esac
+done
+
+WORKTREE="${WORKTREE:-$(pwd)}"
+
+emit_session() {
+    local file="$1" ident status pid wt
+    ident="$(basename "${file}" .json)"
+    status="$(sed -n 's/.*"status": *"\([^"]*\)".*/\1/p' "${file}" 2>/dev/null | head -1)"
+    wt="$(sed -n 's/.*"worktree_path": *"\([^"]*\)".*/\1/p' "${file}" 2>/dev/null | head -1)"
+    pid="$(sed -n 's/.*"pid": *\([0-9][0-9]*\).*/\1/p' "${file}" 2>/dev/null | head -1)"
+    [[ "${pid}" =~ ^[0-9]+$ ]] || pid=""
+    printf '%s\t%s\t%s\t%s\n' "${ident}" "${status}" "${pid}" "${wt}"
+}
+
+_session_dir_from_env() {
+    # Override de teste vence tudo.
+    if [[ -n "${AGENT_GUARD_SESSION_DIR:-}" ]]; then
+        echo "${AGENT_GUARD_SESSION_DIR}"
+        return 0
+    fi
+    # Mesma derivação do kernel (init.sh): worktrees compartilham o .git
+    # comum; os session files vivem no repo principal.
+    local common_dir main_root rel
+    common_dir="$(cd "$(git -C "${WORKTREE}" rev-parse --git-common-dir 2>/dev/null)" 2>/dev/null && pwd)" || return 1
+    [[ -n "${common_dir}" ]] || return 1
+    main_root="$(dirname "${common_dir}")"
+    rel=""
+    local cfg="${main_root}/packages/agent-guard-core/bin/agent-guard-config"
+    if [[ -f "${cfg}" ]]; then
+        rel="$(bash "${cfg}" get paths.session_storage '' 2>/dev/null)"
+    fi
+    echo "${main_root}/${rel:-.kiro/locks/agent-sessions}"
+}
+
+SESSION_DIR="$(_session_dir_from_env 2>/dev/null)" || {
+    _ag_probe_restore_flags
+    exit 1
+}
+[[ -d "${SESSION_DIR}" ]] || {
+    _ag_probe_restore_flags
+    exit 0
+}
+
+if [[ -n "${IDENTITY}" ]]; then
+    [[ -f "${SESSION_DIR}/${IDENTITY}.json" ]] && emit_session "${SESSION_DIR}/${IDENTITY}.json"
+else
+    for f in "${SESSION_DIR}"/*.json; do
+        [[ -f "${f}" ]] || continue
+        emit_session "${f}"
+    done
+fi
+
+_ag_probe_restore_flags
+exit 0

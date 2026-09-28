@@ -95,6 +95,11 @@ _note_slot_event() {
 #   - no task notes are dirty;
 #   - task notes were the only dirty files and were auto-committed;
 # Returns 1 only when task notes need committing but the commit failed.
+#
+# CLASSIFICACAO (ADR-0058): COMPATIBILITY_SAFETY_SHIM — participa
+# temporariamente do caminho safety porque evita work loss (notes left
+# behind como drift), mas NAO e responsabilidade permanente do Kernel;
+# sera extraido junto com o Agent Ops task lifecycle. Nao mover nesta fase.
 # ---------------------------------------------------------------------------
 _auto_commit_task_notes_if_only_drift() {
     local worktree_path="$1"
@@ -262,6 +267,54 @@ _pr_cache_invalidate() {
 #   0 = data obtained (cache hit or successful API call), even if the list is empty
 #   1 = could not obtain data (gh missing, timeout, query failed)
 # ---------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# PR PROVIDER BOUNDARY (ADR-0058) — único ponto onde o release core toca
+# `gh`/GitHub. Contrato reusado de task-lifecycle.sh: o provider injetável
+# AGENT_GUARD_PR_PROVIDER recebe <identity> <repo_slug> e imprime linhas
+# "number branch — title" (ou vazio); sem provider, fallback `gh pr list`.
+# Semântica preservada byte-a-byte: timeout bounded, stderr suprimido,
+# rc!=0 em falha/ausência. Anti-regressão: nenhuma outra chamada a `gh`
+# pode existir em release-helpers.sh.
+# ---------------------------------------------------------------------------
+_pr_provider_query() {
+    local identity="$1"
+    local worktree_path="${2:-$(pwd)}"
+    local repo_slug="${AGENT_GUARD_REPO_SLUG:-hmvip-org/hmvip}"
+
+    local provider="${AGENT_GUARD_PR_PROVIDER:-}"
+    if [[ -n "${provider}" ]]; then
+        (cd "${worktree_path}" 2>/dev/null && ${provider} "${identity}" "${repo_slug}" 2>/dev/null) || return 1
+        return 0
+    fi
+
+    if ! command -v gh >/dev/null 2>&1; then
+        return 1
+    fi
+
+    local timeout_seconds
+    timeout_seconds="$(_pr_api_timeout_seconds)"
+
+    # Use a bounded timeout so a slow GitHub API cannot stall the release.
+    # 'timeout' is part of coreutils on Linux and available on macOS via gtimeout.
+    local timeout_cmd=""
+    if command -v timeout >/dev/null 2>&1; then
+        timeout_cmd="timeout"
+    elif command -v gtimeout >/dev/null 2>&1; then
+        timeout_cmd="gtimeout"
+    fi
+
+    if [[ -n "${timeout_cmd}" ]]; then
+        (cd "${worktree_path}" 2>/dev/null && ${timeout_cmd} "${timeout_seconds}" gh pr list --state open --limit 100 \
+            --json number,title,headRefName \
+            --jq ".[] | select(.headRefName | startswith(\"ia-${identity}/\")) | \"#\\(.number) \\(.headRefName) — \\(.title)\"" 2>/dev/null) || return 1
+    else
+        (cd "${worktree_path}" 2>/dev/null && gh pr list --state open --limit 100 \
+            --json number,title,headRefName \
+            --jq ".[] | select(.headRefName | startswith(\"ia-${identity}/\")) | \"#\\(.number) \\(.headRefName) — \\(.title)\"" 2>/dev/null) || return 1
+    fi
+    return 0
+}
+
 _pr_list_open_for_identity() {
     local identity="$1"
     local worktree_path="${2:-$(pwd)}"
@@ -274,34 +327,9 @@ _pr_list_open_for_identity() {
         return 0
     fi
 
-    # 2. gh not available: nothing to list, cache stays absent.
-    if ! command -v gh >/dev/null 2>&1; then
-        return 1
-    fi
-
-    local timeout_seconds
-    timeout_seconds="$(_pr_api_timeout_seconds)"
-
     local pr_lines=""
     local query_rc=0
-    # Use a bounded timeout so a slow GitHub API cannot stall the release.
-    # 'timeout' is part of coreutils on Linux and available on macOS via gtimeout.
-    local timeout_cmd=""
-    if command -v timeout >/dev/null 2>&1; then
-        timeout_cmd="timeout"
-    elif command -v gtimeout >/dev/null 2>&1; then
-        timeout_cmd="gtimeout"
-    fi
-
-    if [[ -n "${timeout_cmd}" ]]; then
-        pr_lines="$(cd "${worktree_path}" 2>/dev/null && ${timeout_cmd} "${timeout_seconds}" gh pr list --state open --limit 100 \
-            --json number,title,headRefName \
-            --jq ".[] | select(.headRefName | startswith(\"ia-${identity}/\")) | \"#\\(.number) \\(.headRefName) — \\(.title)\"" 2>/dev/null)" || query_rc=$?
-    else
-        pr_lines="$(cd "${worktree_path}" 2>/dev/null && gh pr list --state open --limit 100 \
-            --json number,title,headRefName \
-            --jq ".[] | select(.headRefName | startswith(\"ia-${identity}/\")) | \"#\\(.number) \\(.headRefName) — \\(.title)\"" 2>/dev/null)" || query_rc=$?
-    fi
+    pr_lines="$(_pr_provider_query "${identity}" "${worktree_path}")" || query_rc=$?
 
     # 3. Persist to cache only on a real successful fetch, so a slow/failed API
     #    is not retried on every blocker check within the TTL window.
@@ -351,13 +379,13 @@ _release_task_state_blocker() {
     esac
 }
 
-# Helper: return a list of release blockers for a worktree.
-# Prints one blocker per line (empty output means releasable).
-# Reuses the same logic as _validate_worktree_release_ready and the PR guard.
+# Helper: SAFETY blockers (kernel — ADR-0058): branch ownership, dirty
+# worktree, own stashes. Imprime um blocker por linha; vazio = seguro.
 # ---------------------------------------------------------------------------
-_worktree_release_blockers() {
+_release_safety_blockers() {
     local worktree_path="$1"
     local identity="${2:-}"
+    local current_branch="${3:-}"
 
     if [[ -z "${worktree_path}" ]]; then
         echo "worktree_path_unknown"
@@ -369,8 +397,6 @@ _worktree_release_blockers() {
         return 0
     fi
 
-    local current_branch
-    current_branch="$(git -C "${worktree_path}" branch --show-current 2>/dev/null || echo "")"
     if [[ "${current_branch}" != "develop" ]] && ! _branch_is_current_agent_task "${worktree_path}" && ! _branch_is_neutral_released "${worktree_path}"; then
         echo "branch_not_releasable:${current_branch:-<detached>}"
     fi
@@ -394,6 +420,15 @@ _worktree_release_blockers() {
     if [[ "${stash_count}" -gt 0 ]]; then
         echo "own_stashes"
     fi
+}
+
+# ---------------------------------------------------------------------------
+# Helper: POLICY blockers (Agent Ops — ADR-0058): open PRs, task lifecycle
+# state. Imprime um blocker por linha; vazio = liberado pela policy.
+# ---------------------------------------------------------------------------
+_release_policy_blockers() {
+    local worktree_path="$1"
+    local identity="${2:-}"
 
     # PR guard: list open PRs from this identity (cached + bounded timeout).
     if [[ -n "${identity}" ]]; then
@@ -414,6 +449,23 @@ _worktree_release_blockers() {
     if [[ -n "${task_blocker}" ]]; then
         echo "${task_blocker}"
     fi
+}
+
+# Helper: return a list of release blockers for a worktree.
+# Prints one blocker per line (empty output means releasable).
+# COMPATIBILITY ORCHESTRATOR (ADR-0058): executa a MESMA cadeia e MESMA
+# ordem do baseline — safety (branch/dirty/stash) seguido de policy
+# (PR/task). Não alterar a ordem nem adicionar gates sem parity tests.
+# ---------------------------------------------------------------------------
+_worktree_release_blockers() {
+    local worktree_path="$1"
+    local identity="${2:-}"
+
+    local current_branch
+    current_branch="$(git -C "${worktree_path}" branch --show-current 2>/dev/null || echo "")"
+
+    _release_safety_blockers "${worktree_path}" "${identity}" "${current_branch}"
+    _release_policy_blockers "${worktree_path}" "${identity}"
 }
 
 # ---------------------------------------------------------------------------
@@ -649,10 +701,29 @@ _auto_release_if_safe() {
     local reason="${3:-stale}"
     local event_action="${4:-auto_release_blocked}"
 
+    # F6B3A shadow: captura PRE-SHIM/PRE-blockers da candidata (no-op quando
+    # a flag AGENT_GUARD_RELEASE_SAFETY_SHADOW está OFF).
+    if command -v _ag_rshadow_begin >/dev/null 2>&1; then
+        _ag_rshadow_begin "auto" "${worktree_path}" "${identity}" "${MAIN_REPO:-${_AG_REPO_ROOT:-}}"
+    fi
+
     local blockers
     blockers="$(_worktree_release_blockers "${worktree_path}" "${identity}")"
 
     if [[ -n "${blockers}" ]]; then
+        # F6B3A shadow: separar SAFETY de POLICY para a comparação (§7) —
+        # a comparação usa _release_safety_blockers, nunca o orchestrator.
+        if command -v _ag_rshadow_report >/dev/null 2>&1; then
+            local rshadow_branch rshadow_safety
+            rshadow_branch="$(git -C "${worktree_path}" branch --show-current 2>/dev/null || echo "")"
+            rshadow_safety="$(_release_safety_blockers "${worktree_path}" "${identity}" "${rshadow_branch}" 2>/dev/null || true)"
+            if [[ -z "${rshadow_safety}" ]]; then
+                _ag_rshadow_report ALLOW NONE policy note=policy_block
+            else
+                _ag_rshadow_report BLOCK SAFETY_BLOCKERS safety
+            fi
+        fi
+
         # Build a compact JSON payload of blockers.
         local payload
         payload="$(${AG_PYTHON} -c "
@@ -681,6 +752,9 @@ print(json.dumps({'reason': '${reason}', 'blockers': lines, 'worktree': '${workt
     # task note becomes "drift" after the worktree moves to _released/<id>.
     # Auto-commit it now when it is the only remaining change.
     if ! _auto_commit_task_notes_if_only_drift "${worktree_path}"; then
+        if command -v _ag_rshadow_report >/dev/null 2>&1; then
+            _ag_rshadow_report BLOCK SAFETY_SHIM_FAILED safety note=shim_failed
+        fi
         return 1
     fi
 
@@ -719,6 +793,9 @@ print(json.dumps({'reason': '${reason}', 'blockers': ['${atomic_blocker}'], 'wor
     fi
 
     echo "🔓 Auto-released ${identity} (${reason})"
+    if command -v _ag_rshadow_report >/dev/null 2>&1; then
+        _ag_rshadow_report ALLOW NONE safety
+    fi
     return 0
 }
 

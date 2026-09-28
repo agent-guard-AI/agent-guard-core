@@ -178,6 +178,15 @@ result = {
     "next_step": str(task.get("next_step", "")),
     "alerts": task.get("alerts", []),
     "blocked_reason": str(task.get("blocked_reason", "")),
+    "task_id": str(task.get("task_id", "")),
+    "run_seq": str(task.get("run_seq", "")),
+    "slot": str(task.get("slot", "")),
+    "claimed_at": str(task.get("claimed_at", "")),
+    "confidence": str(task.get("confidence", "")),
+    "owner": str(task.get("owner", "")),
+    "objective": str(task.get("objective", "")),
+    "risk_class": str(task.get("risk_class", "")),
+    "base_ref": str(task.get("base_ref", "")),
     "created_at": str(task.get("created_at", "")),
     "updated_at": str(task.get("updated_at", "")),
     "body": body,
@@ -347,10 +356,15 @@ try:
     data = json.loads(sys.argv[1]) if sys.argv[1] else {}
 except Exception:
     data = {}
-# Garante ordem estável de chaves.
+# Garante ordem estável de chaves. Inclui todos os campos que o parser
+# reconhece como persistentes (round-trip: nada desaparece silenciosamente
+# após _task_write_note) — incl. campos F0-F S2 (task_id/run_seq na nota do
+# slot; slot/claimed_at/confidence em claim.md).
 ordered = {k: data.get(k, "") for k in [
     "id", "state", "mode", "topic", "goal", "branch",
     "prs", "next_step", "alerts", "blocked_reason",
+    "task_id", "run_seq", "slot", "claimed_at", "confidence",
+    "owner", "objective", "risk_class", "base_ref",
     "created_at", "updated_at"
 ]}
 # Remove campos vazios por padrão, exceto state.

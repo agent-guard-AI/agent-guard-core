@@ -9,6 +9,8 @@ Retorna JSON com:
   reset      : True se deve descartar o titulo anterior
   compact    : True se deve compactar/resumir o titulo existente
   manual     : True se o usuario quer fixar o titulo manualmente
+  keep       : True para continuacoes curtas ("ok", "prossiga", "faça isso")
+               que devem MANTER o titulo atual (sem novo titulo)
 
 Uso:
   python3 summarize-prompt.py "prompt aqui" [titulo_atual]
@@ -348,6 +350,33 @@ GREETINGS = re.compile(
     re.IGNORECASE,
 )
 
+# ---------------------------------------------------------------------------
+# Continuacoes curtas: nao sao ordens novas, so mantem o titulo atual.
+# Casa no prompt INTEIRO (normalizado, minusculo, sem pontuacao) — se couber
+# inteiro no conjunto, nao ha assunto novo para titular.
+# ---------------------------------------------------------------------------
+CONTINUATION_PHRASES = {
+    "sim", "ok", "okay", "yes", "yeah", "yep", "blz", "beleza", "show",
+    "bora", "vai", "vá", "pode", "pode ser", "pode fazer", "pode fazer isso",
+    "faça isso", "faca isso", "faz isso", "faz assim", "faz favor",
+    "continue", "continuar", "continua", "continuem", "ok continua", "prossiga", "prossigue",
+    "prossiga assim", "prossiga com isso", "siga", "sigam", "segue", "seguir",
+    "anda", "vamos", "go ahead", "continue assim", "mantenha", "mantém", "mantem",
+    "entendido", "perfeito", "ótimo", "otimo", "excelente", "isso mesmo",
+    "exato", "certo", "correto", "confirmo", "confirmado",
+    "pode commitar", "pode subir", "pode mergear", "pode deployar",
+    "termina", "finaliza", "conclui", "concluir", "conclua",
+}
+
+
+def _is_continuation(text: str) -> bool:
+    """True se o prompt inteiro e uma continuacao curta (sem assunto novo)."""
+    t = _normalize(text).lower()
+    t = re.sub(r"[\s,!?.;:]+", " ", t).strip()
+    if not t or len(t) > 48:
+        return False
+    return t in CONTINUATION_PHRASES
+
 
 # ---------------------------------------------------------------------------
 # Utilitarios
@@ -638,6 +667,7 @@ def main() -> int:
         "reset": False,
         "compact": False,
         "manual": False,
+        "keep": False,
         "title": "",
     }
 
@@ -686,7 +716,13 @@ def main() -> int:
             else:
                 result["title"] = prefix or command.lstrip("/")
     else:
-        result["title"] = _summarize_text(prompt)
+        if _is_continuation(prompt):
+            # "ok", "prossiga", "faça isso"... => sem assunto novo: o hook
+            # mantem o titulo atual (e preserva override manual, se houver).
+            result["keep"] = True
+            result["title"] = current_title or "livre"
+        else:
+            result["title"] = _summarize_text(prompt)
 
     # sanitizacao final contra escape sequences (defesa em profundidade)
     result["title"] = re.sub(r"[\x00-\x1f\x7f]", "", result["title"])

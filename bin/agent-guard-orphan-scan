@@ -1,0 +1,113 @@
+#!/usr/bin/env bash
+# agent-guard-orphan-scan — classificador READ-ONLY de órfãos funcionais (Wave D)
+#
+# Varre o session storage e classifica cada sessão ACTIVE com PID vivo:
+#   functionally_dead — vivo + sem heartbeat ≥ grace + sem TTY + ΔCPU≈0
+#                       (3 sinais independentes; sobreviveu ao fechamento do
+#                       terminal sem sessão real)
+#   active              — qualquer sinal contradiz (sessão real)
+#   indeterminate       — storage ilegível
+#
+# REGRA DURA (C7): este comando NUNCA mata processos e NUNCA altera estado —
+# é diagnóstico puro. Ação sobre órfão exige confirmação humana no caminho
+# interativo (adopt), após o GO do owner pós-shadow.
+#
+# Uso:
+#   agent-guard-orphan-scan [--grace <minutos>] [--shadow] [--repo <path>]
+#
+# Saída: JSON {"generated_at":..., "slots":[{identity,pid,state,...}]}
+# --shadow: adicionalmente append em .agent-guard/journal/orphan-shadow.jsonl
+#           (cruzamento posterior vs predicado binário; padrão ADR-0058).
+
+set -euo pipefail
+
+GRACE=30
+SHADOW=0
+REPO_ROOT="${AGENT_GUARD_REPO_ROOT:-}"
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --grace) GRACE="${2:-}"; shift 2 ;;
+        --shadow) SHADOW=1; shift ;;
+        --repo) REPO_ROOT="${2:-}"; shift 2 ;;
+        -h|--help) sed -n '2,20p' "${BASH_SOURCE[0]}"; exit 0 ;;
+        *) echo "❌ argumento desconhecido: $1" >&2; exit 2 ;;
+    esac
+done
+if [[ -z "${REPO_ROOT}" ]]; then
+    REPO_ROOT="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
+fi
+
+PKG="${REPO_ROOT}/packages/agent-guard-core"
+LIB="${PKG}/src/guard-semantics.sh"
+if [[ -r "${LIB}" ]]; then
+    # shellcheck disable=SC1090
+    . "${LIB}"
+fi
+if ! command -v ags_orphan_state >/dev/null 2>&1; then
+    echo '❌ lib guard-semantics.sh ausente ou sem ags_orphan_state' >&2
+    exit 2
+fi
+
+STORAGE="${REPO_ROOT}/.kiro/locks/agent-sessions"
+export ORPHAN_STORAGE="${STORAGE}" ORPHAN_GRACE="${GRACE}" ORPHAN_SHADOW="${SHADOW}" ORPHAN_REPO="${REPO_ROOT}"
+
+python3 - <<'PY'
+import json, os, sys, time
+
+storage = os.environ["ORPHAN_STORAGE"]
+grace = os.environ["ORPHAN_GRACE"]
+shadow = os.environ.get("ORPHAN_SHADOW") == "1"
+repo = os.environ["ORPHAN_REPO"]
+lib = os.path.join(repo, "packages", "agent-guard-core", "src", "guard-semantics.sh")
+
+def sh(cmd):
+    p = os.popen(cmd)
+    out = p.read()
+    rc = p.close()
+    return (0 if rc is None else (rc >> 8)), out
+
+# Fonte a lib no python? Não — a classificação roda em bash por processo.
+# Aqui apenas orquestramos: para cada session, chamamos ags_orphan_state via
+# subprocess bash (a lib é shell).
+results = []
+if os.path.isdir(storage):
+    for name in sorted(os.listdir(storage)):
+        if not name.endswith(".json"):
+            continue
+        path = os.path.join(storage, name)
+        identity = name[:-5]
+        try:
+            with open(path, encoding="utf-8", errors="replace") as fh:
+                d = json.load(fh)
+        except Exception:
+            results.append({"identity": identity, "state": "indeterminate",
+                            "reason": "unreadable-storage"})
+            continue
+        if d.get("status") != "active" or not d.get("pid"):
+            continue  # apenas leases active com PID interessam ao órfão scan
+        pid = d.get("pid")
+        try:
+            os.kill(int(pid), 0)
+        except Exception:
+            continue  # PID morto: caminho claimable normal trata
+        cmd = (f"bash -c '. \"{lib}\"; ags_orphan_state \"{path}\" \"{grace}\"'")
+        rc, _ = sh(cmd)
+        state = {0: "active", 1: "functionally_dead", 2: "indeterminate"}.get(rc, "indeterminate")
+        entry = {"identity": identity, "pid": pid, "state": state,
+                 "last_activity": d.get("last_activity")}
+        results.append(entry)
+
+out = {"generated_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"), "grace_minutes": float(grace), "slots": results}
+print(json.dumps(out, ensure_ascii=False))
+
+if shadow:
+    log = os.path.join(repo, ".agent-guard", "journal", "orphan-shadow.jsonl")
+    try:
+        os.makedirs(os.path.dirname(log), exist_ok=True)
+        with open(log, "a", encoding="utf-8") as fh:
+            for r in results:
+                fh.write(json.dumps({"ts": time.time(), **r}, ensure_ascii=False) + "\n")
+    except Exception:
+        pass  # observabilidade fail-open
+PY
